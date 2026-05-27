@@ -1,0 +1,203 @@
+{
+  "gemm": {
+    "gemm/128x64x512": {
+      "numpy_us": 62.88150052569108,
+      "symplex_us": 251.46149982901989,
+      "numpy_gflops": 133.403432327012,
+      "symplex_gflops": 33.359412895030836,
+      "speedup": "4.00x slower"
+    },
+    "gemm/256x256x256": {
+      "numpy_us": 106.15800056257285,
+      "symplex_us": 1114.5769994982402,
+      "numpy_gflops": 316.080105335273,
+      "symplex_gflops": 30.105082031215,
+      "speedup": "10.50x slower"
+    },
+    "gemm/512x256x1024": {
+      "numpy_us": 592.7530000917614,
+      "symplex_us": 9559.186000842601,
+      "numpy_gflops": 452.86224778017953,
+      "symplex_gflops": 28.081413624166174,
+      "speedup": "16.13x slower"
+    },
+    "gemm/1024x512x2048": {
+      "numpy_us": 3928.6855007958366,
+      "symplex_us": 190728.46850031056,
+      "numpy_gflops": 546.6163294478479,
+      "symplex_gflops": 11.259376562322176,
+      "speedup": "48.55x slower"
+    },
+    "gemm/64x768x768": {
+      "numpy_us": 284.99149993876927,
+      "symplex_us": 4465.384999093658,
+      "numpy_gflops": 264.9113114469053,
+      "symplex_gflops": 16.907270485148263,
+      "speedup": "15.67x slower"
+    },
+    "gemm/1x768x768": {
+      "numpy_us": 18.046000150206964,
+      "symplex_us": 247.0345007168362,
+      "numpy_gflops": 65.368945482718,
+      "symplex_gflops": 4.7752358337679075,
+      "speedup": "13.69x slower"
+    },
+    "gemm/32x512x512": {
+      "numpy_us": 91.54400049737887,
+      "symplex_us": 691.4985006005736,
+      "numpy_gflops": 183.26942135853426,
+      "symplex_gflops": 24.26211479190311,
+      "speedup": "7.55x slower"
+    }
+  },
+  "attention": {
+    "attention/BERT-base: 12 heads, 128 tokens": {
+      "numpy_us": 1910.9644999844022,
+      "symplex_us": null,
+      "numpy_gflops": 26.85276885071326,
+      "speedup": "N/A"
+    },
+    "attention/GPT-2: 16 heads, 512 tokens": {
+      "numpy_us": 57668.8755008945,
+      "symplex_us": null,
+      "numpy_gflops": 18.982741287941707,
+      "speedup": "N/A"
+    },
+    "attention/LLaMA-7B: 32 heads, 1024 tokens": {
+      "numpy_us": 446499.84650004626,
+      "symplex_us": null,
+      "numpy_gflops": 38.85251356743345,
+      "speedup": "N/A"
+    },
+    "attention/LLaMA-7B: 32 heads, 2048 tokens": {
+      "numpy_us": 1567500.443499739,
+      "symplex_us": null,
+      "numpy_gflops": 44.26829074515126,
+      "speedup": "N/A"
+    }
+  },
+  "ffn": {
+    "ffn/BERT-base FFN": {
+      "numpy_us": 29209.35250040202,
+      "symplex_us": null,
+      "numpy_gflops": 41.35523209504128,
+      "symplex_gflops": 0,
+      "speedup": "N/A"
+    },
+    "ffn/GPT-2 FFN": {
+      "numpy_us": 163976.91699876304,
+      "symplex_us": null,
+      "numpy_gflops": 52.385023143622085,
+      "symplex_gflops": 0,
+      "speedup": "N/A"
+    },
+    "ffn/LLaMA-7B FFN": {
+      "numpy_us": 1309198.4780003258,
+      "symplex_us": null,
+      "numpy_gflops": 141.06615370504122,
+      "symplex_gflops": 0,
+      "speedup": "N/A"
+    }
+  },
+  "embedding": {
+    "embedding/BERT-base embedding": {
+      "numpy_us": 466.4939997383044,
+      "symplex_us": 7903.648001047259,
+      "speedup": "16.94x slower"
+    },
+    "embedding/GPT-2 embedding": {
+      "numpy_us": 2343.112999369623,
+      "symplex_us": 110841.8994999738,
+      "speedup": "47.31x slower"
+    }
+  },
+  "loss": {
+    "loss/Cross-entropy: 1K tokens, 30K vocab": {
+      "numpy_us": 75525.56849987013,
+      "symplex_us": null,
+      "speedup": "N/A (not GEMM-bound)"
+    },
+    "loss/Cross-entropy: 128 tokens, 50K vocab": {
+      "numpy_us": 6553.4449995539035,
+      "symplex_us": null,
+      "speedup": "N/A (not GEMM-bound)"
+    },
+    "loss/MSE: 10K predictions, 1K features": {
+      "numpy_us": 11834.25850013009,
+      "symplex_us": null,
+      "speedup": "N/A (not GEMM-bound)"
+    }
+  },
+  "transformer": {
+    "transformer/BERT-base block": {
+      "numpy_us": 39313.43099975493,
+      "symplex_us": null,
+      "numpy_gflops": 47.36984100959311,
+      "symplex_gflops": 0,
+      "total_flops": 1862270976,
+      "speedup": "N/A"
+    },
+    "transformer/GPT-2 block": {
+      "numpy_us": 280338.4749986435,
+      "symplex_us": null,
+      "numpy_gflops": 49.79210831502006,
+      "symplex_gflops": 0,
+      "total_flops": 13958643712,
+      "speedup": "N/A"
+    }
+  },
+  "jit_overhead": {
+    "compile/matmul_16": {
+      "compile_us": 225.1070000056643,
+      "code_size": 289
+    },
+    "compile/matmul_64": {
+      "compile_us": 900.2129991131369,
+      "code_size": 289
+    },
+    "compile/matmul_128": {
+      "compile_us": 228.4299989696592,
+      "code_size": 289
+    },
+    "compile/matmul_256": {
+      "compile_us": 210.33700068073813,
+      "code_size": 289
+    },
+    "compile/matmul_512": {
+      "compile_us": 174.67100042267703,
+      "code_size": 289
+    },
+    "compile/add_n=100": {
+      "compile_us": 43.62300023785792,
+      "code_size": 149
+    },
+    "compile/mul_n=100": {
+      "compile_us": 165.3200015425682,
+      "code_size": 149
+    },
+    "compile/add_n=1000": {
+      "compile_us": 158.33299949008506,
+      "code_size": 105
+    },
+    "compile/mul_n=1000": {
+      "compile_us": 158.17299936315976,
+      "code_size": 105
+    },
+    "compile/add_n=10000": {
+      "compile_us": 172.26599993591662,
+      "code_size": 105
+    },
+    "compile/mul_n=10000": {
+      "compile_us": 166.3329985603923,
+      "code_size": 105
+    },
+    "compile/add_n=100000": {
+      "compile_us": 237.88500038790517,
+      "code_size": 105
+    },
+    "compile/mul_n=100000": {
+      "compile_us": 187.93500021274667,
+      "code_size": 105
+    }
+  }
+}

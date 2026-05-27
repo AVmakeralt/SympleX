@@ -1,0 +1,83 @@
+{
+  "benchmark": "SympleX ML Workload Benchmark",
+  "date": "2026-05-25",
+  "platform": {
+    "isa": "AVX-512",
+    "avx512": true,
+    "avx2": true,
+    "cpu_cores": 4,
+    "vector_width_floats": 16,
+    "numpy_version": "2.1.3",
+    "python_version": "3.12.13"
+  },
+  "gemm_square": {
+    "note": "SympleX uses jit_parallel_matmul (Rust AVX-512 FMA + rayon), NumPy uses BLAS (OpenBLAS)",
+    "results": [
+      {"size": "16x16",    "numpy_us": 1.1,   "symplex_us": 10.6,   "numpy_gflops": 7.4,   "symplex_gflops": 0.8,   "speedup_vs_numpy": 0.10, "correct": true},
+      {"size": "32x32",    "numpy_us": 1.7,   "symplex_us": 13.5,   "numpy_gflops": 38.7,  "symplex_gflops": 4.9,   "speedup_vs_numpy": 0.13, "correct": true},
+      {"size": "64x64",    "numpy_us": 5.0,   "symplex_us": 175.9,  "numpy_gflops": 105.4, "symplex_gflops": 3.0,   "speedup_vs_numpy": 0.03, "correct": true},
+      {"size": "128x128",  "numpy_us": 49.4,  "symplex_us": 224.5,  "numpy_gflops": 85.0,  "symplex_gflops": 18.7,  "speedup_vs_numpy": 0.22, "correct": true},
+      {"size": "256x256",  "numpy_us": 109.4, "symplex_us": 649.6,  "numpy_gflops": 306.7, "symplex_gflops": 51.7,  "speedup_vs_numpy": 0.17, "correct": true},
+      {"size": "512x512",  "numpy_us": 741.3, "symplex_us": 9172.9, "numpy_gflops": 362.1, "symplex_gflops": 29.3,  "speedup_vs_numpy": 0.08, "correct": false}
+    ]
+  },
+  "ml_shaped_gemm": [
+    {"desc": "1 tok QKV projection",     "shape": "1x768x2304",   "numpy_us": 1058,  "symplex_us": 916,   "numpy_gflops": 3,   "symplex_gflops": 4,   "speedup": 1.16},
+    {"desc": "BERT Q·Wq (128 tok)",       "shape": "128x768x768",  "numpy_us": 444,   "symplex_us": 9136,  "numpy_gflops": 340, "symplex_gflops": 17,  "speedup": 0.05},
+    {"desc": "BERT FFN up (128 tok)",     "shape": "128x768x3072", "numpy_us": 1528,  "symplex_us": 78718, "numpy_gflops": 395, "symplex_gflops": 8,   "speedup": 0.02},
+    {"desc": "GPT-2 FFN up (512 tok)",    "shape": "512x1024x4096","numpy_us": 37604, "symplex_us": 342522,"numpy_gflops": 114, "symplex_gflops": 13,  "speedup": 0.11}
+  ],
+  "ffn_block": [
+    {"desc": "BERT FFN (128x768→3072→768)", "numpy_ms": 3.5,  "symplex_ms": 168.0, "numpy_gflops": 348, "symplex_gflops": 7, "speedup": 0.02},
+    {"desc": "GPT-2 FFN (512x1024→4096→1024)", "numpy_ms": 17.6, "symplex_ms": 1122.6,"numpy_gflops": 488, "symplex_gflops": 8, "speedup": 0.02}
+  ],
+  "jit_compile_overhead": [
+    {"pattern": "matmul",   "shape": "16x16x16",     "compile_us": 216, "code_bytes": 289},
+    {"pattern": "matmul",   "shape": "128x128x128",   "compile_us": 364, "code_bytes": 289},
+    {"pattern": "elementwise", "shape": "add/n=1000", "compile_us": 197, "code_bytes": 105},
+    {"pattern": "elementwise", "shape": "mul/n=100000","compile_us": 171, "code_bytes": 105},
+    {"pattern": "fma",      "shape": "n=100000",      "compile_us": 12,  "code_bytes": 116},
+    {"pattern": "reduction","shape": "add/n=100000",   "compile_us": 12,  "code_bytes": 89}
+  ],
+  "numpy_baselines": {
+    "elementwise": [
+      {"op": "add", "n": 10000,   "time_us": 4.8,  "gflops": 2.08},
+      {"op": "add", "n": 100000,  "time_us": 68.4, "gflops": 1.46},
+      {"op": "add", "n": 1000000, "time_us": 1093, "gflops": 0.91},
+      {"op": "mul", "n": 10000,   "time_us": 4.8,  "gflops": 2.07},
+      {"op": "mul", "n": 100000,  "time_us": 70.1, "gflops": 1.43},
+      {"op": "fma", "n": 10000,   "time_us": 9.2,  "gflops": 1.08},
+      {"op": "fma", "n": 100000,  "time_us": 121.6,"gflops": 0.82},
+      {"op": "fma", "n": 1000000, "time_us": 1840, "gflops": 0.54}
+    ],
+    "activations_1M": [
+      {"op": "relu",    "time_ms": 0.69},
+      {"op": "gelu",    "time_ms": 73.58},
+      {"op": "sigmoid", "time_ms": 0.02},
+      {"op": "softmax", "time_ms": 0.02},
+      {"op": "tanh",    "time_ms": 2.45}
+    ]
+  },
+  "critical_bugs_found": {
+    "1_evex_encoding": "JIT-compiled AVX-512 kernels crash with SIGILL. The emit_avx512_binop P2 byte is hardcoded wrong: z=1(zeroing), b=1(rounding), aaa=100(k4 mask), V'=0(wrong). Correct P2 should be z=0,L'=1,L=0,b=0,V'=~(src1>>4),aaa=000",
+    "2_matmul_512_correctness": "512x512 parallel_matmul fails correctness check (max error ~1e-4)",
+    "3_vzeroall_in_epilogue": "emit_epilogue always emits vzeroall, even for SSE2-only paths, wasting cycles",
+    "4_jit_compile_same_code_size": "All matmul JIT kernels produce 289 bytes regardless of size, suggesting the codegen is not actually generating the correct loop structure",
+    "5_duplicate_definitions": "__init__.py has TWO DeviceArray classes and TWO jit() functions - the ctypes-based ones at the bottom override the proper ones"
+  },
+  "summary": {
+    "wins_vs_numpy": 0,
+    "losses_vs_numpy": 10,
+    "ties_vs_numpy": 0,
+    "win_rate_pct": 0,
+    "best_result": "1x768x2304 GEMM (single-token inference) at 1.16x speedup",
+    "worst_result": "128x768x3072 FFN up-projection at 0.02x (50x slower)",
+    "root_causes": [
+      "1. NumPy BLAS is decades-optimized with cache-blocking, register tiling, and microkernels",
+      "2. SympleX FFI overhead (Python→Rust ctypes call) dominates for small/medium matrices",
+      "3. JIT-compiled kernels are completely broken (EVEX encoding bugs)",
+      "4. The parallel_matmul Rust kernel has correctness issues at 512x512+",
+      "5. No cache tiling in the Python-side matmul path - every call allocates a new C array"
+    ]
+  }
+}
