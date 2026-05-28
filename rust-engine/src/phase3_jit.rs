@@ -3643,41 +3643,122 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize, float_slots: &[boo
 // changing the core linear_scan algorithm — we just feed it better-ordered
 // intervals.
 
-/// Compute the immediate dominator (idom) for each block using a simple
-/// iterative algorithm. Returns a map from BlockId → idom(BlockId).
-/// The entry block has no immediate dominator (absent from the map).
+/// Compute the immediate dominator (idom) for each block using the iterative
+/// dominator algorithm. Returns a map from block_id → idom(block_id).
+/// The entry block (block_id 0) has no immediate dominator (absent from the map).
+///
+/// Uses `block_starts` (pc → block_id) to build a proper CFG with predecessors,
+/// then runs the standard iterative dominator algorithm:
+///   idom(entry) = entry
+///   idom(b) = ∩ { idom(p) | p ∈ preds(b) }  (with intersect using dom tree)
 fn compute_idoms(instrs: &[Instr], block_starts: &FxHashMap<usize, usize>) -> FxHashMap<usize, usize> {
-    // Simplified: we don't have explicit block structure in the flat IR,
-    // so we use the PC-based approach. Block starts are the branch targets.
-    // For each block, its predecessors are the blocks that branch to it.
-    //
-    // We use the simple iterative dominator algorithm:
-    //   idom(entry) = entry
-    //   idom(b) = intersect(all predecessors of b that have idom)
-    //
-    // Since we don't have explicit blocks, we use a simplified version:
-    // identify loop headers (backward branch targets) and treat them as
-    // dominating their loop bodies.
+    if block_starts.is_empty() {
+        return FxHashMap::default();
+    }
 
-    let mut idom: FxHashMap<usize, usize> = FxHashMap::default();
+    let num_blocks = block_starts.values().copied().max().unwrap_or(0) + 1;
 
-    // Find all backward branch targets (loop headers)
+    // Build a sorted list of (pc, block_id) to determine block ranges
+    let mut sorted_blocks: Vec<(usize, usize)> = block_starts.iter()
+        .map(|(&pc, &bid)| (pc, bid))
+        .collect();
+    sorted_blocks.sort_by_key(|&(pc, _)| pc);
+
+    // Build predecessors map: block_id → set of predecessor block_ids
+    let mut preds: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); num_blocks];
+
+    // Helper: find the block_id for a given PC
+    let block_id_for_pc = |pc: usize| -> usize {
+        let idx = sorted_blocks.partition_point(|&(start_pc, _)| start_pc <= pc);
+        if idx == 0 { return 0; }
+        sorted_blocks[idx - 1].1
+    };
+
+    // Scan instructions to find edges
     for (pc, instr) in instrs.iter().enumerate() {
-        let target = match instr {
-            Instr::Jump(off) => Some(((pc as i32) + 1 + off) as usize),
-            Instr::JumpFalse(_, off) => Some(((pc as i32) + 1 + off) as usize),
-            Instr::JumpTrue(_, off) => Some(((pc as i32) + 1 + off) as usize),
-            _ => None,
-        };
-        if let Some(target) = target {
-            if target <= pc {
-                // Backward branch: target is a loop header, it dominates pc
-                idom.insert(pc, target);
+        let current_block = block_id_for_pc(pc);
+
+        match instr {
+            Instr::Jump(off) => {
+                let target = ((pc as i32) + 1 + off) as usize;
+                if let Some(&target_bid) = block_starts.get(&target) {
+                    preds[target_bid].insert(current_block);
+                } else {
+                    let target_bid = block_id_for_pc(target);
+                    preds[target_bid].insert(current_block);
+                }
+            }
+            Instr::JumpFalse(_, off) | Instr::JumpTrue(_, off) => {
+                // Branch target
+                let target = ((pc as i32) + 1 + off) as usize;
+                if let Some(&target_bid) = block_starts.get(&target) {
+                    preds[target_bid].insert(current_block);
+                } else {
+                    let target_bid = block_id_for_pc(target);
+                    preds[target_bid].insert(current_block);
+                }
+                // Fall-through: next instruction
+                let fall_pc = pc + 1;
+                if fall_pc < instrs.len() {
+                    let fall_bid = block_id_for_pc(fall_pc);
+                    if fall_bid != current_block {
+                        preds[fall_bid].insert(current_block);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Iterative dominator algorithm
+    // idom[entry] = entry; idom[others] = undefined initially
+    let entry = sorted_blocks.first().map(|&(_, bid)| bid).unwrap_or(0);
+    let mut idom: Vec<Option<usize>> = vec![None; num_blocks];
+    idom[entry] = Some(entry);
+
+    // Post-order traversal helper for intersect
+    fn intersect(idom: &[Option<usize>], mut b1: usize, mut b2: usize) -> usize {
+        while b1 != b2 {
+            while b1 > b2 { b1 = idom[b1].unwrap_or(b1); }
+            while b2 > b1 { b2 = idom[b2].unwrap_or(b2); }
+        }
+        b1
+    }
+
+    // Reverse post-order of blocks (excluding entry)
+    // Simple approach: iterate all non-entry blocks in order until fixpoint
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bid in 0..num_blocks {
+            if bid == entry { continue; }
+            // Find first predecessor with an idom
+            let mut new_idom: Option<usize> = None;
+            for &pred in &preds[bid] {
+                if let Some(pred_idom) = idom[pred] {
+                    match new_idom {
+                        None => new_idom = Some(pred_idom),
+                        Some(cur) => new_idom = Some(intersect(&idom, cur, pred_idom)),
+                    }
+                }
+            }
+            if new_idom != idom[bid] {
+                idom[bid] = new_idom;
+                changed = true;
             }
         }
     }
 
-    idom
+    // Convert to FxHashMap<usize, usize> (block_id → idom_block_id)
+    let mut result: FxHashMap<usize, usize> = FxHashMap::default();
+    for bid in 0..num_blocks {
+        if let Some(idom_val) = idom[bid] {
+            if bid != idom_val {
+                result.insert(bid, idom_val);
+            }
+        }
+    }
+    result
 }
 
 /// Reorder live intervals for dominance-based tree scan.
@@ -3737,8 +3818,44 @@ fn tree_scan_register_allocate(
     float_slots: &[bool],
     instrs: &[Instr],
 ) -> RegAlloc {
-    // Compute dominator information from the instruction stream
-    let block_starts: FxHashMap<usize, usize> = FxHashMap::default(); // simplified
+    // Compute block_starts from the instruction stream.
+    // A block start is any PC that is:
+    //   - PC 0 (entry block)
+    //   - A branch target (forward or backward)
+    //   - The instruction after a conditional branch (fall-through)
+    // The map is {pc -> block_id} where block_id is sequential.
+    let mut block_start_pcs: FxHashSet<usize> = FxHashSet::default();
+    block_start_pcs.insert(0); // entry block
+    for (pc, instr) in instrs.iter().enumerate() {
+        match instr {
+            Instr::Jump(off) => {
+                let target = ((pc as i32) + 1 + off) as usize;
+                if target < instrs.len() {
+                    block_start_pcs.insert(target);
+                }
+            }
+            Instr::JumpFalse(_, off) | Instr::JumpTrue(_, off) => {
+                let target = ((pc as i32) + 1 + off) as usize;
+                if target < instrs.len() {
+                    block_start_pcs.insert(target);
+                }
+                // Fall-through: instruction after conditional branch
+                let fall = pc + 1;
+                if fall < instrs.len() {
+                    block_start_pcs.insert(fall);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Sort PCs and assign sequential block_ids
+    let mut sorted_pcs: Vec<usize> = block_start_pcs.into_iter().collect();
+    sorted_pcs.sort();
+    let mut block_starts: FxHashMap<usize, usize> = FxHashMap::default();
+    for (bid, &pc) in sorted_pcs.iter().enumerate() {
+        block_starts.insert(pc, bid);
+    }
+
     let idom = compute_idoms(instrs, &block_starts);
 
     // Reorder intervals for tree-scan quality allocation

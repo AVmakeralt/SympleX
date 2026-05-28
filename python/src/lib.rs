@@ -1083,12 +1083,16 @@ fn phase3_execute_arrays(
     n_elements: usize,
     param_count: u16,
 ) -> PyResult<f64> {
-    let kernels = P3_KERNELS.lock().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    let native = kernels.get(kernel_id)
-        .and_then(|k| k.as_ref())
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(
-            format!("Invalid kernel_id: {}", kernel_id)
-        ))?;
+    // Acquire the lock, get the kernel's function pointer and code size, then release
+    let (func_ptr, code_size) = {
+        let kernels = P3_KERNELS.lock().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let native = kernels.get(kernel_id)
+            .and_then(|k| k.as_ref())
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(
+                format!("Invalid kernel_id: {}", kernel_id)
+            ))?;
+        (native.mem_entry(), native.code_size())
+    };
 
     let n_params = param_count as usize;
     if input_ptrs.len() < n_params {
@@ -1107,31 +1111,27 @@ fn phase3_execute_arrays(
     let start = std::time::Instant::now();
 
     unsafe {
+        // Build a NativeCode-like wrapper just for execution
+        // We have the function pointer, so we can call it directly
+        let f: extern "C" fn(*mut i64) -> i64 = std::mem::transmute(func_ptr);
+
         for i in 0..n_elements {
-            // Gather input values
-            let mut values: Vec<Value> = Vec::with_capacity(n_params);
+            // Gather input values into a slot array
+            let mut slots: Vec<i64> = vec![0i64; 256]; // generous slot buffer
             for p in 0..n_params {
                 let val = *input_slices[p].add(i);
-                values.push(Value::F64(val));
+                slots[p] = val.to_bits() as i64;
             }
 
             // Execute compiled kernel
-            match p3::execute(native, &values) {
-                Ok(result) => {
-                    let out_val = match result {
-                        Value::F64(v) => v,
-                        Value::I64(v) => f64::from_bits(v as u64),
-                        Value::I32(v) => v as f64,
-                        _ => 0.0,
-                    };
-                    *output_slice.add(i) = out_val;
-                }
-                Err(_) => {
-                    *output_slice.add(i) = 0.0;
-                }
-            }
+            let result_bits = f(slots.as_mut_ptr());
+            let out_val = f64::from_bits(result_bits as u64);
+            *output_slice.add(i) = out_val;
         }
     }
+
+    // Prevent code_size from being unused
+    let _ = code_size;
 
     let elapsed = start.elapsed().as_secs_f64();
     Ok(elapsed)
@@ -1298,9 +1298,38 @@ fn simd_elementwise_f64(op: &str, dst_ptr: usize, a_ptr: usize, b_ptr: usize, n:
 fn simd_elementwise_isa() -> String {
     let level = x86_emitter::detect_isa_level();
     match level {
-        x86_emitter::ISALevel::AVX2 | x86_emitter::ISALevel::AVX512 => format!("AVX2_f64_4wide"),
-        x86_emitter::ISALevel::SSE => format!("SSE2_f64_scalar"),
+        x86_emitter::ISALevel::AVX512 => format!("AVX512_f64_8wide/f32_16wide"),
+        x86_emitter::ISALevel::AVX2 => format!("AVX2_f64_4wide/f32_8wide"),
+        x86_emitter::ISALevel::SSE => format!("SSE2_f64_scalar/SSE_f32_scalar"),
     }
+}
+
+/// Execute a SIMD-accelerated elementwise operation on f32 arrays.
+/// op: "add"=0, "sub"=1, "mul"=2, "div"=3, "min"=4, "max"=5
+/// dst_ptr, a_ptr, b_ptr: raw pointers to contiguous f32 arrays
+/// n: number of elements
+/// Returns elapsed time in seconds.
+#[pyfunction]
+#[pyo3(signature = (op, dst_ptr, a_ptr, b_ptr, n))]
+fn simd_elementwise_f32(op: &str, dst_ptr: usize, a_ptr: usize, b_ptr: usize, n: usize) -> PyResult<f64> {
+    let op_code: u8 = match op {
+        "add" => 0,
+        "sub" => 1,
+        "mul" => 2,
+        "div" => 3,
+        "min" => 4,
+        "max" => 5,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unsupported elementwise op: {}. Supported: add, sub, mul, div, min, max", op)
+        )),
+    };
+    let elapsed = x86_emitter::simd_elementwise_f32(op_code, dst_ptr, a_ptr, b_ptr, n);
+    if elapsed < 0.0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "SIMD elementwise f32 kernel execution failed"
+        ));
+    }
+    Ok(elapsed)
 }
 
 // ── CUDA Backend — GPU execution functions ──────────────────────────────────
@@ -1669,6 +1698,8 @@ fn _symplex_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(trace_jit_execute, m)?)?;
     // SIMD elementwise f64
     m.add_function(wrap_pyfunction!(simd_elementwise_f64, m)?)?;
+    // SIMD elementwise f32
+    m.add_function(wrap_pyfunction!(simd_elementwise_f32, m)?)?;
     m.add_function(wrap_pyfunction!(simd_elementwise_isa, m)?)?;
     // CUDA backend
     m.add_function(wrap_pyfunction!(cuda_available, m)?)?;

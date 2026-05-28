@@ -239,7 +239,8 @@ impl CompiledKernel {
         Self::finalize(a, 0, 0, 0)
     }
 
-    /// Compile elementwise kernel (SSE scalar)
+    /// Compile elementwise kernel (SSE scalar f32, add/sub/mul/div/min/max)
+    /// op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
     pub fn compile_elementwise(op: u8) -> Self {
         let mut a = CodeAssembler::new(64).unwrap();
         a.push(rbp).unwrap(); a.mov(rbp, rsp).unwrap();
@@ -256,15 +257,16 @@ impl CompiledKernel {
         a.cmp(rcx, rax).unwrap(); a.jge(lp_out).unwrap();
         a.lea(rdx, qword_ptr(r11 + rcx)).unwrap();
         a.movss(xmm0, dword_ptr(rdx)).unwrap();
-        if op <= 2 {
-            a.lea(rdx, qword_ptr(r12 + rcx)).unwrap();
-            a.movss(xmm1, dword_ptr(rdx)).unwrap();
-            match op {
-                0 => { a.addss(xmm0, xmm1).unwrap(); }
-                1 => { a.subss(xmm0, xmm1).unwrap(); }
-                2 => { a.mulss(xmm0, xmm1).unwrap(); }
-                _ => {}
-            }
+        a.lea(rdx, qword_ptr(r12 + rcx)).unwrap();
+        a.movss(xmm1, dword_ptr(rdx)).unwrap();
+        match op {
+            0 => { a.addss(xmm0, xmm1).unwrap(); }
+            1 => { a.subss(xmm0, xmm1).unwrap(); }
+            2 => { a.mulss(xmm0, xmm1).unwrap(); }
+            3 => { a.divss(xmm0, xmm1).unwrap(); }
+            4 => { a.minss(xmm0, xmm1).unwrap(); }
+            5 => { a.maxss(xmm0, xmm1).unwrap(); }
+            _ => {}
         }
         a.lea(rdx, qword_ptr(r10 + rcx)).unwrap();
         a.movss(dword_ptr(rdx), xmm0).unwrap();
@@ -733,7 +735,8 @@ impl CompiledKernel {
         }
     }
 
-    /// Compile vectorized elementwise kernel with AVX2
+    /// Compile vectorized elementwise kernel with AVX2 (f32, add/sub/mul/div/min/max)
+    /// op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
     pub fn compile_elementwise_avx2(op: u8) -> Self {
         let mut a = CodeAssembler::new(64).unwrap();
         a.push(rbp).unwrap(); a.mov(rbp, rsp).unwrap();
@@ -752,10 +755,15 @@ impl CompiledKernel {
         a.vmovups(ymm0, ymmword_ptr(rdx)).unwrap();
         a.lea(rdx, qword_ptr(r12 + rcx)).unwrap();
         a.vmovups(ymm1, ymmword_ptr(rdx)).unwrap();
+        // Note: ymm0 = a (from r11), ymm1 = b (from r12)
+        // AVX2 3-operand: dst = src1 op src2, so dst=a, src1=a, src2=b
         match op {
-            0 => { a.vaddps(ymm0, ymm1, ymm0).unwrap(); }
-            1 => { a.vsubps(ymm0, ymm1, ymm0).unwrap(); }
-            2 => { a.vmulps(ymm0, ymm1, ymm0).unwrap(); }
+            0 => { a.vaddps(ymm0, ymm0, ymm1).unwrap(); }
+            1 => { a.vsubps(ymm0, ymm0, ymm1).unwrap(); }
+            2 => { a.vmulps(ymm0, ymm0, ymm1).unwrap(); }
+            3 => { a.vdivps(ymm0, ymm0, ymm1).unwrap(); }
+            4 => { a.vminps(ymm0, ymm0, ymm1).unwrap(); }
+            5 => { a.vmaxps(ymm0, ymm0, ymm1).unwrap(); }
             _ => {}
         }
         a.lea(rdx, qword_ptr(r10 + rcx)).unwrap();
@@ -777,6 +785,9 @@ impl CompiledKernel {
             0 => { a.addss(xmm0, xmm1).unwrap(); }
             1 => { a.subss(xmm0, xmm1).unwrap(); }
             2 => { a.mulss(xmm0, xmm1).unwrap(); }
+            3 => { a.divss(xmm0, xmm1).unwrap(); }
+            4 => { a.minss(xmm0, xmm1).unwrap(); }
+            5 => { a.maxss(xmm0, xmm1).unwrap(); }
             _ => {}
         }
         a.lea(rdx, qword_ptr(r10 + rcx)).unwrap();
@@ -817,8 +828,8 @@ impl CompiledKernel {
             1 => { a.subsd(xmm0, xmm1).unwrap(); }
             2 => { a.mulsd(xmm0, xmm1).unwrap(); }
             3 => { a.divsd(xmm0, xmm1).unwrap(); }
-            4 => { a.minpd(xmm0, xmm1).unwrap(); }  // minsd not available, minpd works on low qword
-            5 => { a.maxpd(xmm0, xmm1).unwrap(); }  // maxpd works on low qword
+            4 => { a.minsd(xmm0, xmm1).unwrap(); }  // scalar f64 min
+            5 => { a.maxsd(xmm0, xmm1).unwrap(); }  // scalar f64 max
             _ => {}
         }
         a.lea(rdx, qword_ptr(r10 + rcx)).unwrap();
@@ -882,8 +893,8 @@ impl CompiledKernel {
             1 => { a.subsd(xmm0, xmm1).unwrap(); }  // a - b
             2 => { a.mulsd(xmm0, xmm1).unwrap(); }  // a * b
             3 => { a.divsd(xmm0, xmm1).unwrap(); }  // a / b
-            4 => { a.minpd(xmm0, xmm1).unwrap(); }  // min(a, b)
-            5 => { a.maxpd(xmm0, xmm1).unwrap(); }  // max(a, b)
+            4 => { a.minsd(xmm0, xmm1).unwrap(); }  // scalar f64 min
+            5 => { a.maxsd(xmm0, xmm1).unwrap(); }  // scalar f64 max
             _ => {}
         }
         a.lea(rdx, qword_ptr(r10 + rcx)).unwrap();
@@ -901,9 +912,77 @@ impl CompiledKernel {
     /// Compile best available elementwise kernel for f64
     pub fn compile_elementwise_best_f64(op: u8) -> Self {
         match detect_isa_level() {
-            ISALevel::AVX2 | ISALevel::AVX512 => Self::compile_elementwise_avx2_f64(op),
+            ISALevel::AVX512 => Self::compile_elementwise_avx512_f64(op),
+            ISALevel::AVX2 => Self::compile_elementwise_avx2_f64(op),
             ISALevel::SSE => Self::compile_elementwise_f64(op),
         }
+    }
+
+    /// Compile AVX-512 vectorized elementwise kernel for f64 (add/sub/mul/div/min/max)
+    /// op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
+    /// Processes 8 f64 per vector iteration using ZMM registers.
+    /// Calling convention: rdi=dst, rsi=a, rdx=b, rcx=n
+    pub fn compile_elementwise_avx512_f64(op: u8) -> Self {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.push(rbp).unwrap(); a.mov(rbp, rsp).unwrap();
+        a.push(rbx).unwrap(); a.push(r12).unwrap();
+        a.mov(r10, rdi).unwrap(); a.mov(r11, rsi).unwrap();
+        a.mov(r12, rdx).unwrap(); a.mov(rbx, rcx).unwrap(); // RBX = n
+
+        // Vectorized loop: RCX = byte offset
+        a.xor(rcx, rcx).unwrap();
+        a.mov(rax, rbx).unwrap(); a.shl(rax, 3).unwrap(); a.sub(rax, 64).unwrap(); // n*8 - 64
+        let mut vec_loop = a.create_label();
+        let mut vec_exit = a.create_label();
+        a.set_label(&mut vec_loop).unwrap();
+        a.cmp(rcx, rax).unwrap(); a.jge(vec_exit).unwrap();
+        a.lea(rdx, qword_ptr(r11 + rcx)).unwrap();
+        a.vmovupd(zmm0, zmmword_ptr(rdx)).unwrap();
+        a.lea(rdx, qword_ptr(r12 + rcx)).unwrap();
+        a.vmovupd(zmm1, zmmword_ptr(rdx)).unwrap();
+        match op {
+            0 => { a.vaddpd(zmm0, zmm0, zmm1).unwrap(); }  // dst = a + b
+            1 => { a.vsubpd(zmm0, zmm0, zmm1).unwrap(); }  // dst = a - b
+            2 => { a.vmulpd(zmm0, zmm0, zmm1).unwrap(); }  // dst = a * b
+            3 => { a.vdivpd(zmm0, zmm0, zmm1).unwrap(); }  // dst = a / b
+            4 => { a.vminpd(zmm0, zmm0, zmm1).unwrap(); }  // dst = min(a, b)
+            5 => { a.vmaxpd(zmm0, zmm0, zmm1).unwrap(); }  // dst = max(a, b)
+            _ => {}
+        }
+        a.lea(rdx, qword_ptr(r10 + rcx)).unwrap();
+        a.vmovupd(zmmword_ptr(rdx), zmm0).unwrap();
+        a.add(rcx, 64).unwrap(); a.jmp(vec_loop).unwrap();
+        a.set_label(&mut vec_exit).unwrap();
+
+        // Scalar tail: RCX still byte offset
+        a.mov(rax, rbx).unwrap(); a.shl(rax, 3).unwrap(); // n*8
+        let mut sc_loop = a.create_label();
+        let mut sc_exit = a.create_label();
+        a.set_label(&mut sc_loop).unwrap();
+        a.cmp(rcx, rax).unwrap(); a.jge(sc_exit).unwrap();
+        a.lea(rdx, qword_ptr(r11 + rcx)).unwrap();
+        a.movsd_2(xmm0, qword_ptr(rdx)).unwrap();
+        a.lea(rdx, qword_ptr(r12 + rcx)).unwrap();
+        a.movsd_2(xmm1, qword_ptr(rdx)).unwrap();
+        match op {
+            0 => { a.addsd(xmm0, xmm1).unwrap(); }
+            1 => { a.subsd(xmm0, xmm1).unwrap(); }
+            2 => { a.mulsd(xmm0, xmm1).unwrap(); }
+            3 => { a.divsd(xmm0, xmm1).unwrap(); }
+            4 => { a.minsd(xmm0, xmm1).unwrap(); }
+            5 => { a.maxsd(xmm0, xmm1).unwrap(); }
+            _ => {}
+        }
+        a.lea(rdx, qword_ptr(r10 + rcx)).unwrap();
+        a.movsd_2(qword_ptr(rdx), xmm0).unwrap();
+        a.add(rcx, 8).unwrap(); a.jmp(sc_loop).unwrap();
+        a.set_label(&mut sc_exit).unwrap();
+
+        a.vzeroupper().unwrap();
+        a.xor(rax, rax).unwrap(); a.pop(r12).unwrap(); a.pop(rbx).unwrap();
+        a.pop(rbp).unwrap(); a.ret().unwrap();
+
+        Self::finalize(a, 0, 0, 0)
     }
 
     /// Execute elementwise f64 kernel: dst[i] = a[i] op b[i]
@@ -915,6 +994,14 @@ impl CompiledKernel {
             f(dst.as_mut_ptr(), a.as_ptr(), b.as_ptr(), n)
         }
     }
+
+    /// Compile best available elementwise kernel for f32
+    pub fn compile_elementwise_best_f32(op: u8) -> Self {
+        match detect_isa_level() {
+            ISALevel::AVX2 | ISALevel::AVX512 => Self::compile_elementwise_avx2(op),
+            ISALevel::SSE => Self::compile_elementwise(op),
+        }
+    }
 }
 
 // ── SIMD Elementwise Executor (cached kernels) ──────────────────────────────
@@ -923,6 +1010,9 @@ use std::sync::Mutex;
 
 /// Global cache for f64 elementwise kernels. Key = op byte (0-5).
 static F64_ELEM_KERNELS: Mutex<Vec<Option<CompiledKernel>>> = Mutex::new(Vec::new());
+
+/// Global cache for f32 elementwise kernels. Key = op byte (0-5).
+static F32_ELEM_KERNELS: Mutex<Vec<Option<CompiledKernel>>> = Mutex::new(Vec::new());
 
 /// Execute a cached f64 elementwise kernel over arrays.
 /// op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
@@ -953,6 +1043,39 @@ pub fn simd_elementwise_f64(op: u8, dst_ptr: usize, a_ptr: usize, b_ptr: usize, 
         let b = std::slice::from_raw_parts(b_ptr as *const f64, n);
         let start = std::time::Instant::now();
         kernel.exec_elementwise_f64(dst, a, b, n as i64);
+        start.elapsed().as_secs_f64()
+    }
+}
+
+/// Execute a cached f32 elementwise kernel over arrays.
+/// op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
+/// Returns the elapsed time in seconds, or -1.0 on error.
+pub fn simd_elementwise_f32(op: u8, dst_ptr: usize, a_ptr: usize, b_ptr: usize, n: usize) -> f64 {
+    if n == 0 { return 0.0; }
+
+    // Get or compile the kernel
+    let mut kernels = F32_ELEM_KERNELS.lock().unwrap();
+    let idx = op as usize;
+    while kernels.len() <= idx {
+        kernels.push(None);
+    }
+
+    if kernels[idx].is_none() {
+        let kernel = CompiledKernel::compile_elementwise_best_f32(op);
+        kernels[idx] = Some(kernel);
+    }
+
+    let kernel = kernels[idx].as_ref().unwrap();
+    if kernel.exec_ptr.is_null() {
+        return -1.0;
+    }
+
+    unsafe {
+        let dst = std::slice::from_raw_parts_mut(dst_ptr as *mut f32, n);
+        let a = std::slice::from_raw_parts(a_ptr as *const f32, n);
+        let b = std::slice::from_raw_parts(b_ptr as *const f32, n);
+        let start = std::time::Instant::now();
+        kernel.exec_elementwise(dst, a, b, n as i64);
         start.elapsed().as_secs_f64()
     }
 }
