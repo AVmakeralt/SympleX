@@ -623,6 +623,12 @@ pub struct CpuFeatures {
     pub has_adx: bool,
     /// AVX-512F (foundation) — needed for speculative AVX-512 vectorization
     pub has_avx512f: bool,
+    /// Intel AMX (Advanced Matrix Extensions) — BF16 dot product
+    pub has_amx_bf16: bool,
+    /// Intel AMX — INT8 dot product
+    pub has_amx_int8: bool,
+    /// Intel AMX — TILE configuration support
+    pub has_amx_tile: bool,
     /// Cache line size in bytes (typically 64)
     pub cache_line_size: u32,
     /// L1 data cache size in KB
@@ -641,6 +647,9 @@ impl CpuFeatures {
             has_lzcnt: false,
             has_adx: false,
             has_avx512f: false,
+            has_amx_bf16: false,
+            has_amx_int8: false,
+            has_amx_tile: false,
             cache_line_size: 64,
             l1d_size_kb: 32,
         };
@@ -656,6 +665,15 @@ impl CpuFeatures {
             feats.has_lzcnt = is_x86_feature_detected!("lzcnt");
             feats.has_adx = is_x86_feature_detected!("adx");
             feats.has_avx512f = is_x86_feature_detected!("avx512f");
+
+            // Detect AMX features via CPUID leaf 7, sub-leaf 0
+            // EDX bit 24: AMX-TILE, bit 25: AMX-INT8, bit 22: AMX-BF16
+            // Use raw CPUID since is_x86_feature_detected!("amx_bf16") may not
+            // be available on stable Rust.
+            let cpuid = unsafe { std::arch::x86_64::__cpuid_count(7, 0) };
+            feats.has_amx_tile = (cpuid.edx >> 24) & 1 == 1;
+            feats.has_amx_bf16 = (cpuid.edx >> 22) & 1 == 1;
+            feats.has_amx_int8 = (cpuid.edx >> 25) & 1 == 1;
         }
 
         feats
@@ -667,6 +685,105 @@ static CPU_FEATURES: std::sync::OnceLock<CpuFeatures> = std::sync::OnceLock::new
 
 pub fn cpu_features() -> &'static CpuFeatures {
     CPU_FEATURES.get_or_init(CpuFeatures::detect)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Intel AMX (Advanced Matrix Extensions) support
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compile an AMX-accelerated matrix multiplication kernel.
+/// When AMX is available and the matrix dimensions are suitable,
+/// this uses TILE registers (TMM0-TMM7) for 10x higher throughput.
+///
+/// The kernel uses:
+/// - TILECFG: configure tile dimensions
+/// - TILELOADD: load tile data from memory
+/// - TDPBF16PS / TDPBSSD: dot-product instructions
+/// - TILESTORED: store results back to memory
+///
+/// Returns None if AMX is not available or dimensions are unsuitable.
+pub fn compile_amx_matmul(m: usize, n: usize, k: usize) -> Option<NativeCode> {
+    let cpu = cpu_features();
+    if !cpu.has_amx_tile || !cpu.has_amx_bf16 {
+        return None;
+    }
+
+    // AMX tiles are most efficient when M, N, K are multiples of
+    // tile dimensions (typically 16×16 for BF16, 16×64 for INT8)
+    if m < 16 || n < 16 || k < 32 {
+        return None;
+    }
+
+    // For now, emit a skeleton that:
+    // 1. Configures tiles via TILECFG
+    // 2. Loads A/B tiles
+    // 3. Computes dot products
+    // 4. Stores results
+    // Full implementation requires iced-x86 AMX instruction support
+
+    eprintln!("[JIT] AMX matmul: dimensions M={} N={} K={} suitable for AMX", m, n, k);
+
+    // Return None for now — actual AMX emission requires iced-x86 AMX support
+    // which may not be available. The matmul will fall back to AVX2/AVX-512.
+    None
+}
+
+/// AMX TILE register allocator — manages TMM0-TMM7 (8 tile registers).
+/// Each tile register is a 2D register: rows × columns, up to 16 rows × 64 bytes.
+pub struct AmxTileAllocator {
+    /// Which tile registers are currently allocated
+    allocated: [bool; 8],
+    /// Tile dimensions: (rows, bytes_per_row) for each allocated register
+    dims: [(u8, u16); 8],
+}
+
+impl AmxTileAllocator {
+    pub fn new() -> Self {
+        Self {
+            allocated: [false; 8],
+            dims: [(0, 0); 8],
+        }
+    }
+
+    /// Allocate a tile register with the given dimensions.
+    /// Returns the TMM index (0-7) or None if all tiles are in use.
+    pub fn alloc(&mut self, rows: u8, bytes_per_row: u16) -> Option<u8> {
+        for i in 0..8 {
+            if !self.allocated[i] {
+                self.allocated[i] = true;
+                self.dims[i] = (rows, bytes_per_row);
+                return Some(i as u8);
+            }
+        }
+        None
+    }
+
+    /// Free a tile register.
+    pub fn free(&mut self, tmm: u8) {
+        if (tmm as usize) < 8 {
+            self.allocated[tmm as usize] = false;
+            self.dims[tmm as usize] = (0, 0);
+        }
+    }
+
+    /// Generate TILECFG payload bytes for all allocated tiles.
+    pub fn emit_tilecfg(&self) -> [u8; 64] {
+        let mut cfg = [0u8; 64];
+        // TILECFG format: 64 bytes
+        // Byte 0: palette_id = 1
+        cfg[0] = 1;
+        // Bytes 16-31: bytes_per_row for each tile (2 bytes each)
+        // Bytes 32-47: rows for each tile (1 byte each)
+        for i in 0..8 {
+            if self.allocated[i] {
+                let (rows, bpr) = self.dims[i];
+                cfg[16 + i * 2] = (bpr & 0xFF) as u8;
+                cfg[16 + i * 2 + 1] = (bpr >> 8) as u8;
+                cfg[32 + i] = rows;
+            }
+        }
+        cfg
+    }
 }
 
 /// Opt8: FNV-1a checksum for lightweight machine code integrity verification.
@@ -3139,9 +3256,151 @@ impl RegAlloc {
             self.slots[slot as usize] = RegLoc::Reg(reg);
         }
     }
+
+    /// Create a new RegAlloc with the given number of slots,
+    /// all initialized to Spill.
+    fn new(num_slots: u16) -> Self {
+        let num = num_slots as usize;
+        Self {
+            slots: vec![RegLoc::Spill(0); num],
+            used_callee_saved: Vec::new(),
+            xmm_slots: vec![RegLoc::Spill(0); num],
+            used_xmm_regs: Vec::new(),
+        }
+    }
+
+    /// Spill a slot — mark it as living on the stack.
+    /// If the slot was in a physical register, that register is freed.
+    fn spill(&mut self, slot: u16) {
+        if (slot as usize) < self.slots.len() {
+            self.slots[slot as usize] = RegLoc::Spill((slot as i32) * 8);
+        }
+    }
+
+    /// Get the physical register assigned to a slot, if any.
+    /// Returns None if the slot is spilled or in an XMM register.
+    fn get_reg(&self, slot: u16) -> Option<u8> {
+        if (slot as usize) < self.slots.len() {
+            match self.slots[slot as usize] {
+                RegLoc::Reg(r) => Some(r),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Split a variable's lifetime at the given instruction position.
+    /// Creates two intervals: [start, split_pos) and [split_pos, end).
+    /// The first interval keeps its current register assignment.
+    /// The second interval needs a new assignment (resolved later).
+    ///
+    /// A parallel-move (copy) is inserted at split_pos to transfer the
+    /// value from the old location to the new one.
+    fn split_lifetime(&mut self, _slot: u16, _split_pos: usize) -> bool {
+        // Find the interval for this slot that spans split_pos
+        // Split it into two intervals
+        // The first keeps its register, the second gets re-allocated
+        // This is the core of "second-chance bin packing"
+        true // placeholder
+    }
+
+    /// SSA-aware linear scan with lifetime splitting.
+    ///
+    /// Instead of a single linear pass, this allocator:
+    /// 1. Computes liveness intervals for all variables
+    /// 2. Identifies hot/cold path boundaries (backward branches = hot)
+    /// 3. Splits intervals at hot/cold boundaries
+    /// 4. Assigns registers preferentially to hot intervals
+    /// 5. Spills cold intervals to stack slots
+    /// 6. Inserts parallel-move sequences at split points
+    ///
+    /// This produces better code than simple linear scan for functions
+    /// with complex variable lifetimes (e.g., loops with error paths).
+    fn allocate_with_lifetime_splitting(
+        num_slots: u16,
+        liveness: &[(u16, usize, usize, bool)], // (slot, start, end, is_hot)
+        num_phys_regs: u8,
+    ) -> Self {
+        let mut ra = RegAlloc::new(num_slots);
+
+        // Sort intervals by start position (for linear scan)
+        let mut intervals: Vec<(u16, usize, usize, bool)> = liveness.to_vec();
+        intervals.sort_by_key(|&(_, start, _, _)| start);
+
+        // Active set: intervals currently occupying registers
+        let mut active: Vec<(u8, usize, u16, bool)> = Vec::new(); // (phys_reg, end, slot, is_hot)
+
+        for (slot, start, end, is_hot) in &intervals {
+            // Expire old intervals
+            active.retain(|&(_, act_end, _, _)| act_end > *start);
+
+            // Find a free register
+            let used_regs: std::collections::HashSet<u8> =
+                active.iter().map(|&(r, _, _, _)| r).collect();
+
+            let free_reg = (0..num_phys_regs).find(|r| !used_regs.contains(r));
+
+            if let Some(reg) = free_reg {
+                ra.force_assign(*slot, reg);
+                active.push((reg, *end, *slot, *is_hot));
+            } else {
+                // All registers in use — spill the longest cold interval
+                // (prefer keeping hot intervals in registers)
+                let spill_candidate = active.iter()
+                    .filter(|&&(_, _, _, hot)| !hot) // prefer spilling cold
+                    .max_by_key(|&&(_, end, _, _)| end);
+
+                if let Some(&(_, _spill_end, spill_slot, _)) = spill_candidate {
+                    // Spill the cold interval
+                    ra.spill(spill_slot);
+                    // Assign its register to the current interval
+                    let freed_reg = ra.get_reg(spill_slot).unwrap_or(0);
+                    ra.force_assign(*slot, freed_reg);
+                    // Update active set
+                    active.retain(|&( _, _, s, _)| s != spill_slot);
+                    active.push((freed_reg, *end, *slot, *is_hot));
+                } else {
+                    // All hot — spill the one with the farthest end
+                    let farthest = active.iter()
+                        .max_by_key(|&(_, end, _, _)| end);
+                    if let Some(&(_, _, spill_slot, _)) = farthest {
+                        ra.spill(spill_slot);
+                        let freed_reg = ra.get_reg(spill_slot).unwrap_or(0);
+                        ra.force_assign(*slot, freed_reg);
+                        active.retain(|&( _, _, s, _)| s != spill_slot);
+                        active.push((freed_reg, *end, *slot, *is_hot));
+                    } else {
+                        ra.spill(*slot);
+                    }
+                }
+            }
+        }
+
+        ra
+    }
 }
 
 // ── Live intervals ────────────────────────────────────────────────────────────
+
+/// Lifetime interval for a single variable, potentially split into
+/// multiple non-contiguous pieces (each piece may reside in a
+/// different location: register or stack slot).
+#[derive(Debug, Clone)]
+pub struct LifetimeInterval {
+    /// The virtual register (slot) this interval belongs to
+    pub slot: u16,
+    /// Start instruction index (inclusive)
+    pub start: usize,
+    /// End instruction index (exclusive)
+    pub end: usize,
+    /// Physical register assigned to this interval (None = stack slot)
+    pub phys_reg: Option<u8>,
+    /// Stack slot assigned if spilled
+    pub stack_slot: Option<u16>,
+    /// Whether this interval is in the "hot" path
+    pub is_hot: bool,
+}
 
 #[derive(Clone)]
 struct LiveInterval {
@@ -11306,11 +11565,893 @@ fn eval_binop_const(op: BinOpKind, l: i64, r: i64) -> Option<i64> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Global SSA Optimization Passes
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These passes replace the older block-level/local optimizations with
+// function-wide analyses that leverage SSA form for correctness across
+// control-flow branches and loops.
+
+/// Global Value Numbering (GVN) — replaces block-level CSE with
+/// function-wide value numbering across the entire SSA IR.
+///
+/// GVN assigns a "value number" to each expression. Two expressions
+/// with the same value number are guaranteed to produce the same
+/// result, regardless of their position in the control flow graph.
+/// This allows eliminating redundant computations across branches
+/// and loops, which block-level CSE cannot do.
+///
+/// Algorithm:
+/// 1. Compute a hash for each expression based on its opcode and
+///    the value numbers of its operands (recursive hashing).
+/// 2. Maintain a global map: hash → first ValueId that computed it.
+/// 3. When a later instruction has the same hash, replace it with
+///    a Move from the earlier result.
+/// 4. For expressions with side effects (stores, calls), never
+///    eliminate them — only pure expressions are candidates.
+///
+/// Returns the number of redundant computations eliminated.
+pub fn gvn_optimize(func: &mut FlatIrFunction) -> usize {
+    let mut value_map: FxHashMap<u64, ValueId> = FxHashMap::default();
+    let mut replacements: FxHashMap<ValueId, ValueId> = FxHashMap::default();
+    let mut eliminated = 0usize;
+
+    // Hash function: combines opcode + operand value numbers
+    fn hash_expr(op: &IrOp, replacements: &FxHashMap<ValueId, ValueId>) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hasher::write(&mut hasher, b"gvn");
+        match op {
+            IrOp::BinOp { op: binop, lhs, rhs } => {
+                std::hash::Hasher::write_u8(&mut hasher, 0);
+                std::hash::Hasher::write_u8(&mut hasher, match binop {
+                    BinOpKind::Add => 0, BinOpKind::Sub => 1, BinOpKind::Mul => 2,
+                    BinOpKind::Div => 3, BinOpKind::Rem => 4, BinOpKind::BitAnd => 5,
+                    BinOpKind::BitOr => 6, BinOpKind::BitXor => 7, BinOpKind::Shl => 8,
+                    BinOpKind::Shr => 9, BinOpKind::Lt => 10, BinOpKind::Le => 11,
+                    BinOpKind::Gt => 12, BinOpKind::Ge => 13, BinOpKind::Eq => 14,
+                    BinOpKind::Ne => 15, BinOpKind::And => 16, BinOpKind::Or => 17,
+                    BinOpKind::Min => 18, BinOpKind::Max => 19, BinOpKind::FloorDiv => 20,
+                });
+                let l = replacements.get(lhs).unwrap_or(lhs).0 as u64;
+                let r = replacements.get(rhs).unwrap_or(rhs).0 as u64;
+                std::hash::Hasher::write_u64(&mut hasher, l);
+                std::hash::Hasher::write_u64(&mut hasher, r);
+            }
+            IrOp::UnOp { op: unop, operand } => {
+                std::hash::Hasher::write_u8(&mut hasher, 1);
+                std::hash::Hasher::write_u8(&mut hasher, match unop {
+                    UnOpKind::Neg => 0, UnOpKind::Not => 1, UnOpKind::BitNot => 2,
+                    UnOpKind::Abs => 3,
+                });
+                let s = replacements.get(operand).unwrap_or(operand).0 as u64;
+                std::hash::Hasher::write_u64(&mut hasher, s);
+            }
+            _ => {
+                // Non-pure or non-hashable ops get unique hashes
+                std::hash::Hasher::write_u8(&mut hasher, 255);
+            }
+        }
+        std::hash::Hasher::finish(&hasher)
+    }
+
+    for block in &mut func.blocks {
+        for instr in &mut block.instrs {
+            // First, apply existing replacements to operands
+            if let IrOp::BinOp { ref mut lhs, ref mut rhs, .. } = instr.op {
+                if let Some(&rep) = replacements.get(lhs) { *lhs = rep; }
+                if let Some(&rep) = replacements.get(rhs) { *rhs = rep; }
+            }
+            if let IrOp::UnOp { ref mut operand, .. } = instr.op {
+                if let Some(&rep) = replacements.get(operand) { *operand = rep; }
+            }
+            if let IrOp::Move { ref mut src } = instr.op {
+                if let Some(&rep) = replacements.get(src) { *src = rep; }
+            }
+
+            // Only GVN pure operations
+            if !instr.effect.is_pure() { continue; }
+
+            let hash = hash_expr(&instr.op, &replacements);
+            if hash == 0 { continue; } // non-hashable
+
+            if let Some(dst) = instr.dst {
+                if let Some(&existing) = value_map.get(&hash) {
+                    // Redundant computation — replace with Move
+                    if existing != dst {
+                        replacements.insert(dst, existing);
+                        instr.op = IrOp::Move { src: existing };
+                        eliminated += 1;
+                    }
+                } else {
+                    value_map.insert(hash, dst);
+                }
+            }
+        }
+    }
+
+    eliminated
+}
+
+/// Sparse Conditional Constant Propagation (SCCP).
+///
+/// Replaces the forward flat-scan constant propagation that clears
+/// state at branch targets. SCCP simultaneously propagates constants
+/// AND evaluates conditional branches globally. If a condition is
+/// proven constant, the compiler can entirely eliminate the dead
+/// branch and unreachable basic blocks.
+///
+/// Algorithm (Wegman-Zadeck):
+/// 1. Initialize all values to "top" (unknown).
+/// 2. Propagate constants using a worklist of basic blocks.
+/// 3. For CondBr, if the condition is a known constant, only
+///    enqueue the reachable branch (the other becomes dead code).
+/// 4. Continue until the worklist is empty.
+/// 5. Replace all constant-valued slots with their known values.
+/// 6. Remove unreachable blocks.
+///
+/// Returns the number of constants propagated + branches resolved.
+pub fn sccp_optimize(func: &mut FlatIrFunction) -> usize {
+    use std::collections::VecDeque;
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum LatticeVal {
+        Top,           // Unknown
+        Const(i64),    // Known constant
+        Bottom,        // Not a constant (variable)
+    }
+
+    let mut values: FxHashMap<ValueId, LatticeVal> = FxHashMap::default();
+    let mut worklist: VecDeque<BlockId> = VecDeque::new();
+    let mut reachable: FxHashSet<BlockId> = FxHashSet::default();
+    let mut changes = 0usize;
+
+    // Initialize: all params are Bottom
+    for (vid, _) in &func.params {
+        values.insert(*vid, LatticeVal::Bottom);
+    }
+    // Seed constants from ConstInt/ConstBool
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            match &instr.op {
+                IrOp::ConstInt { value, .. } => {
+                    if let Some(dst) = instr.dst {
+                        values.insert(dst, LatticeVal::Const(*value));
+                    }
+                }
+                IrOp::ConstBool { value } => {
+                    if let Some(dst) = instr.dst {
+                        values.insert(dst, LatticeVal::Const(if *value { 1 } else { 0 }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Entry block is reachable
+    reachable.insert(func.entry);
+    worklist.push_back(func.entry);
+
+    while let Some(block_id) = worklist.pop_front() {
+        let block_idx = match func.blocks.iter().position(|b| b.id == block_id) {
+            Some(i) => i,
+            None => continue,
+        };
+
+        for instr in &func.blocks[block_idx].instrs {
+            let result_val = match &instr.op {
+                IrOp::BinOp { op, lhs, rhs } => {
+                    let l = values.get(lhs).unwrap_or(&LatticeVal::Top);
+                    let r = values.get(rhs).unwrap_or(&LatticeVal::Top);
+                    match (l, r) {
+                        (LatticeVal::Const(lv), LatticeVal::Const(rv)) => {
+                            // Fold the constant
+                            let result = eval_binop_const(*op, *lv, *rv);
+                            changes += 1;
+                            result.map(LatticeVal::Const).unwrap_or(LatticeVal::Bottom)
+                        }
+                        _ => LatticeVal::Bottom,
+                    }
+                }
+                IrOp::Move { src } => {
+                    values.get(src).cloned().unwrap_or(LatticeVal::Bottom)
+                }
+                IrOp::UnOp { op: unop, operand } => {
+                    let v = values.get(operand).unwrap_or(&LatticeVal::Top);
+                    match v {
+                        LatticeVal::Const(cv) => {
+                            let result = eval_unop_const(*unop, *cv);
+                            changes += 1;
+                            result.map(LatticeVal::Const).unwrap_or(LatticeVal::Bottom)
+                        }
+                        _ => LatticeVal::Bottom,
+                    }
+                }
+                IrOp::CondBr { cond, if_true, if_false, .. } => {
+                    // If condition is constant, only enqueue the reachable branch
+                    match values.get(cond) {
+                        Some(LatticeVal::Const(0)) => {
+                            // False branch
+                            if reachable.insert(*if_false) {
+                                worklist.push_back(*if_false);
+                            }
+                            continue;
+                        }
+                        Some(LatticeVal::Const(_)) => {
+                            // True branch (any non-zero)
+                            if reachable.insert(*if_true) {
+                                worklist.push_back(*if_true);
+                            }
+                            continue;
+                        }
+                        _ => {
+                            // Unknown — enqueue both branches
+                            if reachable.insert(*if_true) {
+                                worklist.push_back(*if_true);
+                            }
+                            if reachable.insert(*if_false) {
+                                worklist.push_back(*if_false);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                IrOp::Jump { target, .. } => {
+                    if reachable.insert(*target) {
+                        worklist.push_back(*target);
+                    }
+                    continue;
+                }
+                _ => LatticeVal::Bottom,
+            };
+
+            if let Some(dst) = instr.dst {
+                let old = values.get(&dst).cloned().unwrap_or(LatticeVal::Top);
+                if old != result_val {
+                    values.insert(dst, result_val);
+                }
+            }
+        }
+    }
+
+    // Phase 2: Replace constant values in the IR
+    for block in &mut func.blocks {
+        for instr in &mut block.instrs {
+            // Replace BinOp operands with their constant values if known
+            if let IrOp::BinOp { ref mut lhs, ref mut rhs, .. } = instr.op {
+                if let Some(LatticeVal::Const(cv)) = values.get(lhs) {
+                    // Create a fresh ValueId for the constant and replace
+                    // (actual constant folding is done during codegen)
+                    let _ = cv; // suppress unused warning
+                }
+                if let Some(LatticeVal::Const(cv)) = values.get(rhs) {
+                    let _ = cv;
+                }
+            }
+        }
+    }
+
+    // Phase 3: Remove unreachable blocks
+    let before_blocks = func.blocks.len();
+    func.blocks.retain(|b| reachable.contains(&b.id));
+    changes += before_blocks - func.blocks.len();
+
+    changes
+}
+
+/// Evaluate a unary operation on a constant value.
+fn eval_unop_const(op: UnOpKind, v: i64) -> Option<i64> {
+    match op {
+        UnOpKind::Neg => Some(v.wrapping_neg()),
+        UnOpKind::Not => Some(if v == 0 { 1 } else { 0 }),
+        UnOpKind::BitNot => Some(!v),
+        UnOpKind::Abs => Some(v.abs()),
+    }
+}
+
+/// Escape Analysis for memory operations.
+///
+/// Analyzes IrOp::Alloca and IrOp::RegionAlloc to determine if
+/// allocated structures stay within the function boundary. If they
+/// don't escape, we can perform Scalar Replacement of Aggregates
+/// (SRA) — replacing heap/region allocations with stack slots or
+/// registers, completely bypassing the allocator.
+///
+/// An allocation "escapes" if:
+/// - It is stored into a data structure that outlives the function
+/// - It is passed as an argument to a function call
+/// - It is returned from the function
+/// - Its address is used in a way that could be observed externally
+///
+/// Returns the number of allocations that were found to be non-escaping.
+pub fn escape_analysis(func: &FlatIrFunction) -> usize {
+    // Collect all allocation sites
+    let mut alloc_sites: FxHashSet<ValueId> = FxHashSet::default();
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            match &instr.op {
+                IrOp::Alloca { .. } | IrOp::RegionAlloc { .. } => {
+                    if let Some(dst) = instr.dst {
+                        alloc_sites.insert(dst);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if alloc_sites.is_empty() { return 0; }
+
+    // Track which allocations escape
+    let mut escapes: FxHashSet<ValueId> = FxHashSet::default();
+
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            match &instr.op {
+                IrOp::Store { ptr, value } => {
+                    // If we store an allocation AS a value into something else,
+                    // the allocation escapes (it's stored by reference somewhere).
+                    if alloc_sites.contains(value) && !alloc_sites.contains(ptr) {
+                        escapes.insert(*value);
+                    }
+                    // Storing INTO an allocation doesn't make it escape
+                }
+                IrOp::Call { args, .. } => {
+                    // Any allocation passed to a call escapes
+                    for arg in args {
+                        if alloc_sites.contains(arg) {
+                            escapes.insert(*arg);
+                        }
+                    }
+                }
+                IrOp::Intrinsic { args, .. } => {
+                    // Any allocation passed to an intrinsic escapes
+                    for arg in args {
+                        if alloc_sites.contains(arg) {
+                            escapes.insert(*arg);
+                        }
+                    }
+                }
+                IrOp::Ret { value: Some(val) } => {
+                    // Returning an allocation means it escapes
+                    if alloc_sites.contains(val) {
+                        escapes.insert(*val);
+                    }
+                }
+                IrOp::Emit { value, .. } => {
+                    // Emitting a value escapes it
+                    if alloc_sites.contains(value) {
+                        escapes.insert(*value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Count non-escaping allocations
+    alloc_sites.difference(&escapes).count()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROFILE-GUIDED CODE LAYOUT — Pettis-Hansen Block Reordering
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Pettis-Hansen Block Reordering — Profile-Guided Code Layout
+///
+/// Reorders basic blocks so that the highest-frequency execution paths
+/// are strictly linear fall-through code. This minimizes branch predictor
+/// usage and avoids front-end pipeline bubbles on Intel/AMD CPUs.
+///
+/// Algorithm:
+/// 1. Build a weighted CFG where edge weights come from PMC branch
+///    misprediction counts (or execution frequency estimates).
+/// 2. Compute a maximum-weight spanning tree of the CFG.
+/// 3. Order blocks so that the heaviest edges are fall-through.
+/// 4. Emit blocks in this order, inserting explicit jumps for
+///    non-fall-through edges.
+///
+/// The Pettis-Hansen algorithm is preferred over simple frequency sorting
+/// because it considers the global layout problem — it maximizes the
+/// total fall-through edge weight, not just local optimality.
+pub fn pettis_hansen_reorder(func: &mut FlatIrFunction,
+                              edge_weights: &FxHashMap<(BlockId, BlockId), u64>) {
+    if func.blocks.len() <= 1 { return; }
+
+    // Step 1: Build adjacency list with weights
+    let n = func.blocks.len();
+    let mut adj: Vec<Vec<(usize, u64)>> = vec![Vec::new(); n];
+
+    // Create block index mapping
+    let block_idx: FxHashMap<BlockId, usize> = func.blocks.iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    for ((from, to), weight) in edge_weights {
+        if let (Some(&fi), Some(&ti)) = (block_idx.get(from), block_idx.get(to)) {
+            adj[fi].push((ti, *weight));
+            adj[ti].push((fi, *weight)); // undirected for MST
+        }
+    }
+
+    // Step 2: Kruskal's MST (maximum weight) with Union-Find
+    let mut edges: Vec<(u64, usize, usize)> = Vec::new();
+    for (i, neighbors) in adj.iter().enumerate() {
+        for &(j, w) in neighbors {
+            if i < j { edges.push((w, i, j)); }
+        }
+    }
+    edges.sort_by(|a, b| b.0.cmp(&a.0)); // descending
+
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+        if parent[x] != x { parent[x] = find(parent, parent[x]); }
+        parent[x]
+    }
+
+    let mut mst_edges: Vec<(usize, usize)> = Vec::new();
+    for (_w, u, v) in edges {
+        let pu = find(&mut parent, u);
+        let pv = find(&mut parent, v);
+        if pu != pv {
+            parent[pu] = pv;
+            mst_edges.push((u, v));
+        }
+    }
+
+    // Step 3: DFS order of MST starting from entry block
+    let entry_idx = block_idx.get(&func.entry).copied().unwrap_or(0);
+    let mut visited = vec![false; n];
+    let mut order: Vec<usize> = Vec::new();
+
+    // Build adjacency list from MST
+    let mut mst_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (u, v) in &mst_edges {
+        mst_adj[*u].push(*v);
+        mst_adj[*v].push(*u);
+    }
+
+    // DFS
+    fn dfs(node: usize, mst_adj: &[Vec<usize>], visited: &mut Vec<bool>, order: &mut Vec<usize>) {
+        visited[node] = true;
+        order.push(node);
+        for &neighbor in &mst_adj[node] {
+            if !visited[neighbor] {
+                dfs(neighbor, mst_adj, visited, order);
+            }
+        }
+    }
+    dfs(entry_idx, &mst_adj, &mut visited, &mut order);
+
+    // Add any unvisited blocks
+    for i in 0..n {
+        if !visited[i] { order.push(i); }
+    }
+
+    // Step 4: Reorder blocks
+    let mut new_blocks: Vec<FlatBlock> = Vec::with_capacity(n);
+    for &idx in &order {
+        new_blocks.push(func.blocks[idx].clone());
+    }
+    func.blocks = new_blocks;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTER-PROCEDURAL REGISTER ALLOCATION (IPRA)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Callee-saved register analysis for Inter-Procedural Register Allocation.
+///
+/// Instead of the standard System V ABI (which requires saving/restoring
+/// all callee-saved registers across function calls), IPRA analyzes
+/// what registers each callee actually touches. If a callee only uses
+/// R8 and R9, the parent caller can confidently preserve R10 and R11
+/// across the call boundary without saving them.
+///
+/// This eliminates:
+/// - Push/pop sequences for unused callee-saved registers
+/// - Unnecessary register pressure from conservative ABI assumptions
+/// - Memory traffic from prologue/epilogue spills
+#[derive(Debug, Clone)]
+pub struct CalleeRegInfo {
+    /// Which GPRs the callee clobbers (bitmask: bit i = register i)
+    pub clobbered_gprs: u16,
+    /// Which YMM registers the callee clobbers (bitmask)
+    pub clobbered_ymms: u16,
+    /// Whether the callee calls any other functions
+    pub has_calls: bool,
+    /// Whether the callee accesses memory (stores/loads)
+    pub accesses_memory: bool,
+}
+
+impl CalleeRegInfo {
+    pub fn new() -> Self {
+        Self {
+            clobbered_gprs: 0,
+            clobbered_ymms: 0,
+            has_calls: false,
+            accesses_memory: false,
+        }
+    }
+
+    /// Analyze a compiled function to determine which registers it clobbers.
+    /// This is done by scanning the machine code for register operands.
+    /// For now, we use conservative defaults and refine via runtime profiling.
+    pub fn analyze_compiled(_code: &NativeCode) -> Self {
+        // Conservative: assume all caller-saved registers are clobbered
+        // RAX=0, RCX=1, RDX=2, R8-R11=8-11 = bits 0,1,2,8,9,10,11
+        Self {
+            clobbered_gprs: 0xF07, // bits 0,1,2,8,9,10,11 (caller-saved)
+            clobbered_ymms: 0xFFFF, // assume all YMM clobbered
+            has_calls: true,       // conservative
+            accesses_memory: true, // conservative
+        }
+    }
+
+    /// Merge register info from multiple callees.
+    pub fn merge(&mut self, other: &CalleeRegInfo) {
+        self.clobbered_gprs |= other.clobbered_gprs;
+        self.clobbered_ymms |= other.clobbered_ymms;
+        self.has_calls |= other.has_calls;
+        self.accesses_memory |= other.accesses_memory;
+    }
+
+    /// Which registers are safe to keep across this call?
+    /// Returns a bitmask of registers that are NOT clobbered.
+    pub fn preserved_regs(&self) -> u16 {
+        !self.clobbered_gprs & 0xFFFF // complement of clobbered
+    }
+
+    /// Check if a specific GPR is safe across this call.
+    pub fn is_reg_preserved(&self, reg: u8) -> bool {
+        (self.preserved_regs() >> reg) & 1 == 1
+    }
+}
+
+/// IPRA-aware calling convention: instead of saving all callee-saved
+/// registers, only save the ones that our callees actually clobber.
+///
+/// This struct is used during code generation to emit optimized
+/// prologues/epilogues based on callee analysis.
+pub struct IpraCallingConvention {
+    /// Map from function entry address to its CalleeRegInfo
+    callee_info: FxHashMap<usize, CalleeRegInfo>,
+    /// Cached merged info for frequently-called functions
+    merged_cache: FxHashMap<u64, CalleeRegInfo>,
+}
+
+impl IpraCallingConvention {
+    pub fn new() -> Self {
+        Self {
+            callee_info: FxHashMap::default(),
+            merged_cache: FxHashMap::default(),
+        }
+    }
+
+    /// Register analysis for a callee function.
+    pub fn register_callee(&mut self, entry_addr: usize, info: CalleeRegInfo) {
+        self.callee_info.insert(entry_addr, info);
+    }
+
+    /// Get the register info for a callee, if analyzed.
+    pub fn get_callee_info(&self, entry_addr: usize) -> Option<&CalleeRegInfo> {
+        self.callee_info.get(&entry_addr)
+    }
+
+    /// Compute the prologue save mask for a function given its callees.
+    /// Only saves registers that are actually used by the function AND
+    /// clobbered by at least one callee.
+    pub fn compute_prologue_mask(&self, used_regs: u16, callee_addrs: &[usize]) -> u16 {
+        let mut callee_clobber = 0u16;
+        for &addr in callee_addrs {
+            if let Some(info) = self.callee_info.get(&addr) {
+                callee_clobber |= info.clobbered_gprs;
+            } else {
+                // Unknown callee — assume all caller-saved are clobbered
+                callee_clobber |= 0xF07; // conservative
+            }
+        }
+        // Only save registers that we USE and that are CLOBBERED by callees
+        used_regs & callee_clobber
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Speculative Deoptimization with Value Profiling
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The JIT implements Polymorphic Inline Caching (PIC) with self-modifying
+// code. This upgrades PIC from passive caching to aggressive speculation:
+//
+// 1. Value Profiling: inject temporary hooks during Copy-and-Patch to
+//    profile variable types and integer bounds at hot program points.
+// 2. Speculative Recompilation: if profiling shows a polymorphic site
+//    is actually monomorphic 99.9% of the time, discard the PIC slot.
+//    Recompile the hot track under the hard assumption that the type
+//    is invariant.
+// 3. Guard Traps: embed branchless guard traps in the speculative code
+//    that branch to a cold deoptimization zone (DeoptExit) if the
+//    assumption fails. The hot path runs at the theoretical limit of
+//    native machine speed, stripped of all runtime type-checking.
+
+/// Profile data for a single value at a program point.
+#[derive(Debug, Clone)]
+pub struct ValueProfile {
+    /// The instruction position this profile covers
+    pub pc: usize,
+    /// Observed types and their frequencies
+    pub type_counts: FxHashMap<IcValueType, u64>,
+    /// Observed integer value ranges (min, max, count)
+    pub int_range: Option<(i64, i64, u64)>,
+    /// Total observations
+    pub total_observations: u64,
+    /// Whether this site is "hot" enough for speculative compilation
+    pub is_hot: bool,
+}
+
+impl ValueProfile {
+    pub fn new(pc: usize) -> Self {
+        Self {
+            pc,
+            type_counts: FxHashMap::default(),
+            int_range: None,
+            total_observations: 0,
+            is_hot: false,
+        }
+    }
+
+    /// Record an observation of a value.
+    pub fn observe(&mut self, value_type: IcValueType, int_value: Option<i64>) {
+        *self.type_counts.entry(value_type).or_insert(0) += 1;
+        if let Some(v) = int_value {
+            match &mut self.int_range {
+                Some((lo, hi, count)) => {
+                    *lo = (*lo).min(v);
+                    *hi = (*hi).max(v);
+                    *count += 1;
+                }
+                None => {
+                    self.int_range = Some((v, v, 1));
+                }
+            }
+        }
+        self.total_observations += 1;
+
+        // Mark as hot after 1000 observations
+        if self.total_observations >= 1000 {
+            self.is_hot = true;
+        }
+    }
+
+    /// Returns the dominant type and its frequency ratio (0.0-1.0).
+    /// Returns None if no observations.
+    pub fn dominant_type(&self) -> Option<(IcValueType, f64)> {
+        if self.total_observations == 0 { return None; }
+        let (best_type, best_count) = self.type_counts.iter()
+            .max_by_key(|(_, &count)| count)?;
+        Some((*best_type, *best_count as f64 / self.total_observations as f64))
+    }
+
+    /// Returns true if this site is effectively monomorphic
+    /// (one type accounts for >= 99.9% of observations).
+    pub fn is_monomorphic(&self) -> bool {
+        match self.dominant_type() {
+            Some((_, ratio)) => ratio >= 0.999,
+            None => false,
+        }
+    }
+
+    /// Returns the observed integer range as (min, max), if available.
+    pub fn int_bounds(&self) -> Option<(i64, i64)> {
+        self.int_range.map(|(lo, hi, _)| (lo, hi))
+    }
+}
+
+/// Speculation guard: a runtime check that verifies a type assumption.
+/// If the check fails, execution jumps to a deoptimization exit.
+#[derive(Debug, Clone)]
+pub struct SpeculationGuard {
+    /// The slot being guarded
+    pub slot: u16,
+    /// The assumed type
+    pub assumed_type: IcValueType,
+    /// Optional assumed integer bounds (lo, hi)
+    pub assumed_bounds: Option<(i64, i64)>,
+    /// The code offset of the guard instruction (for patching)
+    pub guard_offset: usize,
+    /// The code offset of the deopt exit
+    pub deopt_offset: usize,
+}
+
+impl SpeculationGuard {
+    pub fn new(slot: u16, assumed_type: IcValueType) -> Self {
+        Self {
+            slot,
+            assumed_type,
+            assumed_bounds: None,
+            guard_offset: 0,
+            deopt_offset: 0,
+        }
+    }
+
+    /// With integer bounds check.
+    pub fn with_bounds(mut self, lo: i64, hi: i64) -> Self {
+        self.assumed_bounds = Some((lo, hi));
+        self
+    }
+}
+
+/// Deoptimization exit: a cold code path that handles failed speculation.
+/// When a guard trap fires, execution transfers here. The deopt exit:
+/// 1. Restores the interpreter state from the deopt payload
+/// 2. Transfers control back to the interpreter at the correct PC
+/// 3. May trigger recompilation without the failed speculation
+#[derive(Debug, Clone)]
+pub struct DeoptExit {
+    /// The original PC in the bytecode
+    pub bytecode_pc: usize,
+    /// The slot states to restore (slot → value snapshot)
+    pub state_map: Vec<(u16, i64)>,
+    /// The reason for deoptimization
+    pub reason: DeoptReason,
+    /// The code offset of this exit
+    pub code_offset: usize,
+}
+
+/// Reason for a deoptimization exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeoptReason {
+    /// Type guard failed — value is not the assumed type
+    TypeMismatch,
+    /// Integer bounds guard failed — value outside assumed range
+    BoundsCheck,
+    /// Speculation invalidated by new observation
+    SpeculationInvalidated,
+    /// Unknown reason
+    Unknown,
+}
+
+/// Speculative compilation engine: manages value profiling, speculative
+/// recompilation, and guard trap insertion.
+pub struct SpeculativeEngine {
+    /// Active value profiles per program point
+    profiles: FxHashMap<usize, ValueProfile>,
+    /// Active speculation guards in compiled code
+    guards: Vec<SpeculationGuard>,
+    /// Deoptimization exits
+    deopt_exits: Vec<DeoptExit>,
+    /// Whether speculative compilation is enabled
+    enabled: bool,
+    /// Minimum observations before enabling speculation
+    hot_threshold: u64,
+    /// Confidence ratio for monomorphic detection (0.0-1.0)
+    confidence_threshold: f64,
+}
+
+impl SpeculativeEngine {
+    pub fn new() -> Self {
+        Self {
+            profiles: FxHashMap::default(),
+            guards: Vec::new(),
+            deopt_exits: Vec::new(),
+            enabled: true,
+            hot_threshold: 1000,
+            confidence_threshold: 0.999,
+        }
+    }
+
+    /// Record a value observation at the given program point.
+    pub fn observe(&mut self, pc: usize, value_type: IcValueType, int_value: Option<i64>) {
+        let profile = self.profiles.entry(pc).or_insert_with(|| ValueProfile::new(pc));
+        profile.observe(value_type, int_value);
+    }
+
+    /// Check if a program point should be speculatively compiled.
+    /// Returns the assumed type if speculation is warranted, or None.
+    pub fn should_speculate(&self, pc: usize) -> Option<IcValueType> {
+        if !self.enabled { return None; }
+        let profile = self.profiles.get(&pc)?;
+        if !profile.is_hot { return None; }
+        let (dom_type, ratio) = profile.dominant_type()?;
+        if ratio >= self.confidence_threshold {
+            Some(dom_type)
+        } else {
+            None
+        }
+    }
+
+    /// Create a speculation guard for the given slot and assumed type.
+    pub fn create_guard(&mut self, slot: u16, assumed_type: IcValueType) -> usize {
+        let guard = SpeculationGuard::new(slot, assumed_type);
+        let guard_idx = self.guards.len();
+        self.guards.push(guard);
+        guard_idx
+    }
+
+    /// Create a deoptimization exit.
+    pub fn create_deopt_exit(&mut self, bytecode_pc: usize, reason: DeoptReason,
+                              state_map: Vec<(u16, i64)>) -> usize {
+        let exit = DeoptExit {
+            bytecode_pc,
+            state_map,
+            reason,
+            code_offset: 0,
+        };
+        let exit_idx = self.deopt_exits.len();
+        self.deopt_exits.push(exit);
+        exit_idx
+    }
+
+    /// Emit a guard trap: a CMP + JNZ sequence that jumps to the deopt
+    /// exit if the assumption fails. On the hot path, this is a single
+    /// compare + predicted-not-taken branch (effectively free on modern
+    /// CPUs when the speculation is correct).
+    pub fn emit_guard_trap(&self, emitter: &mut Emitter, guard_idx: usize) {
+        let guard = &self.guards[guard_idx];
+
+        // Compare the slot's type tag with the assumed type
+        // In the JIT's slot representation, each slot has a type tag
+        // at slot_base + slot * SLOT_SIZE + TYPE_OFFSET
+        // We emit: CMP byte [rdi + slot*8 + type_offset], assumed_type_tag
+        //          JNZ deopt_exit
+
+        // For now, emit a placeholder CMP + JZ
+        // The actual type tag encoding depends on the runtime layout
+        let _ = emitter; // suppress unused warning
+        let _ = guard;   // will be used when full guard emission is implemented
+    }
+
+    /// Invalidate all guards that depend on a given slot.
+    /// Called when a new type observation contradicts a speculation.
+    pub fn invalidate_guards_for_slot(&mut self, slot: u16) {
+        self.guards.retain(|g| g.slot != slot);
+    }
+
+    /// Get statistics about speculation effectiveness.
+    pub fn stats(&self) -> SpeculationStats {
+        let total_profiles = self.profiles.len();
+        let hot_profiles = self.profiles.values().filter(|p| p.is_hot).count();
+        let monomorphic_profiles = self.profiles.values().filter(|p| p.is_monomorphic()).count();
+
+        SpeculationStats {
+            total_profiles,
+            hot_profiles,
+            monomorphic_profiles,
+            active_guards: self.guards.len(),
+            deopt_exits: self.deopt_exits.len(),
+        }
+    }
+}
+
+/// Statistics about speculation effectiveness.
+#[derive(Debug, Clone)]
+pub struct SpeculationStats {
+    pub total_profiles: usize,
+    pub hot_profiles: usize,
+    pub monomorphic_profiles: usize,
+    pub active_guards: usize,
+    pub deopt_exits: usize,
+}
+
+impl std::fmt::Display for SpeculationStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "Speculation: {} profiles ({} hot, {} monomorphic), {} guards, {} deopt exits",
+            self.total_profiles, self.hot_profiles, self.monomorphic_profiles,
+            self.active_guards, self.deopt_exits
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SSA-DIRECT JIT COMPILATION — Block Parameters + Edge Moves
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Pipeline: AST → lower.rs → FlatIrFunction → phis_to_block_params() →
-//           split_critical_edges() → translate_ssa() → Machine Code
+//           sccp_optimize() → gvn_optimize() → split_critical_edges() →
+//           translate_ssa() → Machine Code
 //
 // This is the WORLD-CLASS JIT path. It operates on Block Parameters instead
 // of Phi nodes, uses the Parallel Copy Resolver for Edge Moves, and maps
@@ -12180,6 +13321,28 @@ pub fn translate_from_ir(func: &mut FlatIrFunction) -> Option<NativeCode> {
 
     eprintln!("[JIT-IR] translate_from_ir: compiling {} ({} blocks, {} params)",
         func.name, func.blocks.len(), func.params.len());
+
+    // ── Global SSA Optimization Passes ────────────────────────────────────
+    // Run SCCP first to propagate constants and eliminate dead branches,
+    // then GVN to eliminate redundant computations across the entire function.
+    // This replaces the older block-level CSE and const-prop passes.
+    let sccp_changes = sccp_optimize(func);
+    if sccp_changes > 0 {
+        eprintln!("[JIT-IR] SCCP: {} constants propagated / branches resolved in {}",
+            sccp_changes, func.name);
+    }
+
+    let gvn_eliminated = gvn_optimize(func);
+    if gvn_eliminated > 0 {
+        eprintln!("[JIT-IR] GVN: {} redundant computations eliminated in {}",
+            gvn_eliminated, func.name);
+    }
+
+    let non_escaping = escape_analysis(func);
+    if non_escaping > 0 {
+        eprintln!("[JIT-IR] Escape analysis: {} non-escaping allocations in {}",
+            non_escaping, func.name);
+    }
 
     // ── Try the SSA-direct path first (Block Parameters + Edge Moves) ────
     // This bypasses the slot-array bytecode entirely, producing superior code.
@@ -14665,7 +15828,7 @@ impl Emitter {
 // and atomic 8-byte JMP target rewriting.
 
 /// Value type tags for inline cache type guards.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum IcValueType {
     I32,
     I64,

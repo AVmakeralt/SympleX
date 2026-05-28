@@ -1488,6 +1488,48 @@ fn simd_reduce_f64(op: &str, data_ptr: usize, n: usize) -> PyResult<f64> {
     Ok(result)
 }
 
+/// Execute a fused chain of elementwise operations in a single pass for f32 arrays.
+///
+/// This is the key performance optimization: instead of writing intermediate
+/// results to memory and reading them back, all ops are computed per-element
+/// in SIMD registers. For a chain like x*2.0+1.0 -> sum:
+///   Old: 3 passes x 800MB = 2.4GB traffic + 2 temp arrays
+///   New: 1 pass x 800MB = 800MB traffic, 0 temp arrays
+///
+/// ops: list of (op, lhs_src, lhs_idx, rhs_src, rhs_idx) tuples
+///   op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
+///   lhs_src/rhs_src: 0=input_array, 1=constant, 2=previous_op_result
+/// input_ptrs: raw pointers to input f32 arrays
+/// constants: f32 constant values
+/// n: element count
+/// reduce_op: 0=sum, 1=max, 2=min, 255=no reduce (write to dst)
+/// dst_ptr: output array pointer (used when reduce_op == 255)
+#[pyfunction]
+fn simd_fused_elementwise_f32(
+    ops: Vec<(u8, u8, u8, u8, u8)>,
+    input_ptrs: Vec<usize>,
+    constants: Vec<f32>,
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: usize,
+) -> f64 {
+    x86_emitter::simd_fused_elementwise_f32(ops, input_ptrs, constants, n, reduce_op, dst_ptr)
+}
+
+/// Execute a fused chain of elementwise operations in a single pass for f64 arrays.
+/// Same as simd_fused_elementwise_f32 but for double-precision data.
+#[pyfunction]
+fn simd_fused_elementwise_f64(
+    ops: Vec<(u8, u8, u8, u8, u8)>,
+    input_ptrs: Vec<usize>,
+    constants: Vec<f64>,
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: usize,
+) -> f64 {
+    x86_emitter::simd_fused_elementwise_f64(ops, input_ptrs, constants, n, reduce_op, dst_ptr)
+}
+
 // ── CUDA Backend — GPU execution functions ──────────────────────────────────
 
 /// Check if CUDA is available on this system.
@@ -1861,6 +1903,9 @@ fn _symplex_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // SIMD reduction
     m.add_function(wrap_pyfunction!(simd_reduce_f32, m)?)?;
     m.add_function(wrap_pyfunction!(simd_reduce_f64, m)?)?;
+    // Fused SIMD elementwise (single-pass multi-op chains)
+    m.add_function(wrap_pyfunction!(simd_fused_elementwise_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(simd_fused_elementwise_f64, m)?)?;
     // CUDA backend
     m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_device_info, m)?)?;

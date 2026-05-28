@@ -1492,3 +1492,753 @@ pub fn jit_parallel_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usi
     }
     parallel_matmul(a, b, c, m, n, k);
 }
+
+// ── Fused Multi-Op SIMD Elementwise + Reduce Kernels ─────────────────────────
+//
+// These kernels execute a chain of elementwise operations in a SINGLE PASS
+// over memory, keeping intermediate results in SIMD registers. This eliminates
+// the catastrophic multi-pass pattern where each op creates a temporary array
+// and reads/writes the entire dataset again.
+//
+// For a chain like x * 2.0 + 1.0 → sum:
+//   Old: read x(800MB), mul, write temp(800MB), read temp, add, write temp2,
+//        read temp2, reduce = ~4.8GB traffic
+//   New: read x(800MB), mul in regs, add in regs, accumulate = 800MB traffic
+//
+// Up to 8 ops can be fused (limited by YMM register count for intermediates).
+// The kernel auto-selects AVX2 when available, falls back to scalar.
+
+/// Fused elementwise operation descriptor.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct FusedOpDesc {
+    /// Operation: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
+    pub op: u8,
+    /// Left operand source: 0=input_array, 1=constant, 2=result_of_previous_op
+    pub lhs_src: u8,
+    /// Index into the source (input array index, constant index, or previous op result index)
+    pub lhs_idx: u8,
+    /// Right operand source: same encoding as lhs_src
+    pub rhs_src: u8,
+    /// Index into the source
+    pub rhs_idx: u8,
+}
+
+/// Maximum number of ops in a fused chain (limited by YMM register count)
+pub const MAX_FUSED_OPS: usize = 8;
+
+/// Reduce operation codes
+const REDUCE_SUM: u8 = 0;
+const REDUCE_MAX: u8 = 1;
+const REDUCE_MIN: u8 = 2;
+const REDUCE_NONE: u8 = 255;
+
+// ── f32 AVX2 core ──
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fused_elem_f32_avx2_core(
+    ops: &[FusedOpDesc],
+    input_ptrs: &[*const f32],
+    constants: &[f32],
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: *mut f32,
+) -> f64 {
+    use std::arch::x86_64::*;
+
+    let num_ops = ops.len().min(MAX_FUSED_OPS);
+    if num_ops == 0 || n == 0 { return 0.0; }
+
+    let has_reduce = reduce_op != REDUCE_NONE;
+
+    // 4 YMM accumulators for 4x-unrolled reduce
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    // Process 32 f32 per iteration (4 × 8-wide YMM)
+    let n_vec4 = n & !31;
+    let mut i = 0usize;
+
+    while i < n_vec4 {
+        for u in 0..4usize {
+            let base = i + u * 8;
+            let mut intermediates: [__m256; MAX_FUSED_OPS] = [_mm256_setzero_ps(); MAX_FUSED_OPS];
+
+            for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+                let lhs = match desc.lhs_src {
+                    0 => {
+                        let idx = desc.lhs_idx as usize;
+                        if idx < input_ptrs.len() {
+                            _mm256_loadu_ps(input_ptrs[idx].add(base))
+                        } else {
+                            _mm256_setzero_ps()
+                        }
+                    }
+                    1 => {
+                        let idx = desc.lhs_idx as usize;
+                        if idx < constants.len() {
+                            _mm256_set1_ps(*constants.get_unchecked(idx))
+                        } else {
+                            _mm256_setzero_ps()
+                        }
+                    }
+                    2 => {
+                        let idx = desc.lhs_idx as usize;
+                        if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_ps() }
+                    }
+                    _ => _mm256_setzero_ps(),
+                };
+                let rhs = match desc.rhs_src {
+                    0 => {
+                        let idx = desc.rhs_idx as usize;
+                        if idx < input_ptrs.len() {
+                            _mm256_loadu_ps(input_ptrs[idx].add(base))
+                        } else {
+                            _mm256_setzero_ps()
+                        }
+                    }
+                    1 => {
+                        let idx = desc.rhs_idx as usize;
+                        if idx < constants.len() {
+                            _mm256_set1_ps(*constants.get_unchecked(idx))
+                        } else {
+                            _mm256_setzero_ps()
+                        }
+                    }
+                    2 => {
+                        let idx = desc.rhs_idx as usize;
+                        if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_ps() }
+                    }
+                    _ => _mm256_setzero_ps(),
+                };
+
+                intermediates[op_idx] = match desc.op {
+                    0 => _mm256_add_ps(lhs, rhs),
+                    1 => _mm256_sub_ps(lhs, rhs),
+                    2 => _mm256_mul_ps(lhs, rhs),
+                    3 => _mm256_div_ps(lhs, rhs),
+                    4 => _mm256_min_ps(lhs, rhs),
+                    5 => _mm256_max_ps(lhs, rhs),
+                    _ => lhs,
+                };
+            }
+
+            let final_val = intermediates[num_ops - 1];
+
+            if has_reduce {
+                match reduce_op {
+                    REDUCE_SUM => match u {
+                        0 => acc0 = _mm256_add_ps(acc0, final_val),
+                        1 => acc1 = _mm256_add_ps(acc1, final_val),
+                        2 => acc2 = _mm256_add_ps(acc2, final_val),
+                        _ => acc3 = _mm256_add_ps(acc3, final_val),
+                    },
+                    REDUCE_MAX => match u {
+                        0 => acc0 = _mm256_max_ps(acc0, final_val),
+                        1 => acc1 = _mm256_max_ps(acc1, final_val),
+                        2 => acc2 = _mm256_max_ps(acc2, final_val),
+                        _ => acc3 = _mm256_max_ps(acc3, final_val),
+                    },
+                    REDUCE_MIN => match u {
+                        0 => acc0 = _mm256_min_ps(acc0, final_val),
+                        1 => acc1 = _mm256_min_ps(acc1, final_val),
+                        2 => acc2 = _mm256_min_ps(acc2, final_val),
+                        _ => acc3 = _mm256_min_ps(acc3, final_val),
+                    },
+                    _ => {}
+                }
+            } else {
+                _mm256_storeu_ps(dst_ptr.add(base), final_val);
+            }
+        }
+        i += 32;
+    }
+
+    // Process remaining 8-element chunks
+    let n_vec = n & !7;
+    while i < n_vec {
+        let mut intermediates: [__m256; MAX_FUSED_OPS] = [_mm256_setzero_ps(); MAX_FUSED_OPS];
+
+        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+            let lhs = match desc.lhs_src {
+                0 => {
+                    let idx = desc.lhs_idx as usize;
+                    if idx < input_ptrs.len() { _mm256_loadu_ps(input_ptrs[idx].add(i)) } else { _mm256_setzero_ps() }
+                }
+                1 => {
+                    let idx = desc.lhs_idx as usize;
+                    if idx < constants.len() { _mm256_set1_ps(*constants.get_unchecked(idx)) } else { _mm256_setzero_ps() }
+                }
+                2 => {
+                    let idx = desc.lhs_idx as usize;
+                    if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_ps() }
+                }
+                _ => _mm256_setzero_ps(),
+            };
+            let rhs = match desc.rhs_src {
+                0 => {
+                    let idx = desc.rhs_idx as usize;
+                    if idx < input_ptrs.len() { _mm256_loadu_ps(input_ptrs[idx].add(i)) } else { _mm256_setzero_ps() }
+                }
+                1 => {
+                    let idx = desc.rhs_idx as usize;
+                    if idx < constants.len() { _mm256_set1_ps(*constants.get_unchecked(idx)) } else { _mm256_setzero_ps() }
+                }
+                2 => {
+                    let idx = desc.rhs_idx as usize;
+                    if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_ps() }
+                }
+                _ => _mm256_setzero_ps(),
+            };
+
+            intermediates[op_idx] = match desc.op {
+                0 => _mm256_add_ps(lhs, rhs),
+                1 => _mm256_sub_ps(lhs, rhs),
+                2 => _mm256_mul_ps(lhs, rhs),
+                3 => _mm256_div_ps(lhs, rhs),
+                4 => _mm256_min_ps(lhs, rhs),
+                5 => _mm256_max_ps(lhs, rhs),
+                _ => lhs,
+            };
+        }
+
+        let final_val = intermediates[num_ops - 1];
+
+        if has_reduce {
+            match reduce_op {
+                REDUCE_SUM => acc0 = _mm256_add_ps(acc0, final_val),
+                REDUCE_MAX => acc0 = _mm256_max_ps(acc0, final_val),
+                REDUCE_MIN => acc0 = _mm256_min_ps(acc0, final_val),
+                _ => {}
+            }
+        } else {
+            _mm256_storeu_ps(dst_ptr.add(i), final_val);
+        }
+
+        i += 8;
+    }
+
+    // Scalar tail
+    let mut scalar_acc: f64 = 0.0;
+    let mut first_scalar = true;
+    while i < n {
+        let mut intermediates: [f32; MAX_FUSED_OPS] = [0.0; MAX_FUSED_OPS];
+
+        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+            let lhs: f32 = match desc.lhs_src {
+                0 => {
+                    let idx = desc.lhs_idx as usize;
+                    if idx < input_ptrs.len() { *input_ptrs[idx].add(i) } else { 0.0 }
+                }
+                1 => *constants.get(desc.lhs_idx as usize).unwrap_or(&0.0),
+                2 => {
+                    let idx = desc.lhs_idx as usize;
+                    if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 }
+                }
+                _ => 0.0,
+            };
+            let rhs: f32 = match desc.rhs_src {
+                0 => {
+                    let idx = desc.rhs_idx as usize;
+                    if idx < input_ptrs.len() { *input_ptrs[idx].add(i) } else { 0.0 }
+                }
+                1 => *constants.get(desc.rhs_idx as usize).unwrap_or(&0.0),
+                2 => {
+                    let idx = desc.rhs_idx as usize;
+                    if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 }
+                }
+                _ => 0.0,
+            };
+
+            intermediates[op_idx] = match desc.op {
+                0 => lhs + rhs,
+                1 => lhs - rhs,
+                2 => lhs * rhs,
+                3 => lhs / rhs,
+                4 => lhs.min(rhs),
+                5 => lhs.max(rhs),
+                _ => lhs,
+            };
+        }
+
+        let final_val = intermediates[num_ops - 1];
+
+        if has_reduce {
+            match reduce_op {
+                REDUCE_SUM => scalar_acc += final_val as f64,
+                REDUCE_MAX => scalar_acc = if first_scalar { final_val as f64 } else { scalar_acc.max(final_val as f64) },
+                REDUCE_MIN => scalar_acc = if first_scalar { final_val as f64 } else { scalar_acc.min(final_val as f64) },
+                _ => {}
+            }
+            first_scalar = false;
+        } else {
+            *dst_ptr.add(i) = final_val;
+        }
+
+        i += 1;
+    }
+
+    // Horizontal reduction of the 4 accumulators
+    if has_reduce {
+        // Combine acc0-acc3
+        match reduce_op {
+            REDUCE_SUM => {
+                acc0 = _mm256_add_ps(acc0, acc1);
+                acc0 = _mm256_add_ps(acc0, acc2);
+                acc0 = _mm256_add_ps(acc0, acc3);
+            }
+            REDUCE_MAX => {
+                acc0 = _mm256_max_ps(acc0, acc1);
+                acc0 = _mm256_max_ps(acc0, acc2);
+                acc0 = _mm256_max_ps(acc0, acc3);
+            }
+            REDUCE_MIN => {
+                acc0 = _mm256_min_ps(acc0, acc1);
+                acc0 = _mm256_min_ps(acc0, acc2);
+                acc0 = _mm256_min_ps(acc0, acc3);
+            }
+            _ => {}
+        }
+
+        // Horizontal reduction within ymm0:
+        // Step 1: swap high/low 128-bit lanes
+        let hi = _mm256_permute2f128_ps(acc0, acc0, 0x01);
+        acc0 = match reduce_op {
+            REDUCE_SUM => _mm256_add_ps(acc0, hi),
+            REDUCE_MAX => _mm256_max_ps(acc0, hi),
+            REDUCE_MIN => _mm256_min_ps(acc0, hi),
+            _ => acc0,
+        };
+        // Step 2: shuffle 64-bit halves within each lane
+        let shuf = _mm256_shuffle_ps(acc0, acc0, 0x4E); // swap positions 0↔1, 2↔3
+        acc0 = match reduce_op {
+            REDUCE_SUM => _mm256_add_ps(acc0, shuf),
+            REDUCE_MAX => _mm256_max_ps(acc0, shuf),
+            REDUCE_MIN => _mm256_min_ps(acc0, shuf),
+            _ => acc0,
+        };
+        // Step 3: shuffle 32-bit halves
+        let shuf2 = _mm256_shuffle_ps(acc0, acc0, 0xB1); // swap positions 0↔1 within each 64-bit
+        acc0 = match reduce_op {
+            REDUCE_SUM => _mm256_add_ps(acc0, shuf2),
+            REDUCE_MAX => _mm256_max_ps(acc0, shuf2),
+            REDUCE_MIN => _mm256_min_ps(acc0, shuf2),
+            _ => acc0,
+        };
+
+        // Extract the scalar from the low element of the low 128-bit lane
+        let result = _mm_cvtss_f32(_mm256_castps256_ps128(acc0));
+        return result as f64 + scalar_acc;
+    }
+
+    0.0
+}
+
+/// Scalar fallback for f32 fused elementwise
+unsafe fn fused_elem_f32_scalar(
+    ops: &[FusedOpDesc],
+    input_ptrs: &[*const f32],
+    constants: &[f32],
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: *mut f32,
+) -> f64 {
+    let num_ops = ops.len().min(MAX_FUSED_OPS);
+    let has_reduce = reduce_op != REDUCE_NONE;
+    let mut acc: f64 = 0.0;
+    let mut first = true;
+
+    for i in 0..n {
+        let mut intermediates: [f32; MAX_FUSED_OPS] = [0.0; MAX_FUSED_OPS];
+
+        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+            let lhs: f32 = match desc.lhs_src {
+                0 => if (desc.lhs_idx as usize) < input_ptrs.len() { *input_ptrs[desc.lhs_idx as usize].add(i) } else { 0.0 },
+                1 => *constants.get(desc.lhs_idx as usize).unwrap_or(&0.0),
+                2 => if (desc.lhs_idx as usize) < MAX_FUSED_OPS { intermediates[desc.lhs_idx as usize] } else { 0.0 },
+                _ => 0.0,
+            };
+            let rhs: f32 = match desc.rhs_src {
+                0 => if (desc.rhs_idx as usize) < input_ptrs.len() { *input_ptrs[desc.rhs_idx as usize].add(i) } else { 0.0 },
+                1 => *constants.get(desc.rhs_idx as usize).unwrap_or(&0.0),
+                2 => if (desc.rhs_idx as usize) < MAX_FUSED_OPS { intermediates[desc.rhs_idx as usize] } else { 0.0 },
+                _ => 0.0,
+            };
+            intermediates[op_idx] = match desc.op {
+                0 => lhs + rhs,
+                1 => lhs - rhs,
+                2 => lhs * rhs,
+                3 => lhs / rhs,
+                4 => lhs.min(rhs),
+                5 => lhs.max(rhs),
+                _ => lhs,
+            };
+        }
+
+        let val = intermediates[num_ops - 1];
+        if has_reduce {
+            match reduce_op {
+                REDUCE_SUM => acc += val as f64,
+                REDUCE_MAX => acc = if first { val as f64 } else { acc.max(val as f64) },
+                REDUCE_MIN => acc = if first { val as f64 } else { acc.min(val as f64) },
+                _ => {}
+            }
+            first = false;
+        } else {
+            *dst_ptr.add(i) = val;
+        }
+    }
+
+    acc
+}
+
+/// Execute a fused chain of elementwise operations in a single pass for f32 arrays.
+///
+/// This is the key performance optimization: instead of writing intermediate
+/// results to memory and reading them back, all ops are computed per-element
+/// in SIMD registers.
+///
+/// # Arguments
+/// * `ops` - Vec of (op, lhs_src, lhs_idx, rhs_src, rhs_idx) tuples
+///   - op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
+///   - lhs_src/rhs_src: 0=input_array, 1=constant, 2=previous_op_result
+///   - lhs_idx/rhs_idx: index into the respective source
+/// * `input_ptrs` - Raw pointers to input f32 arrays
+/// * `constants` - f32 constant values
+/// * `n` - Number of elements
+/// * `reduce_op` - 0=sum, 1=max, 2=min, 255=no reduce (write to dst)
+/// * `dst_ptr` - Output array pointer (used when reduce_op == 255)
+///
+/// # Returns
+/// Reduced scalar value (if reduce) or 0.0 (if writing to dst)
+pub fn simd_fused_elementwise_f32(
+    ops: Vec<(u8, u8, u8, u8, u8)>,
+    input_ptrs: Vec<usize>,
+    constants: Vec<f32>,
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: usize,
+) -> f64 {
+    if n == 0 || ops.is_empty() { return 0.0; }
+
+    let descs: Vec<FusedOpDesc> = ops.iter().map(|&(op, ls, li, rs, ri)| FusedOpDesc {
+        op, lhs_src: ls, lhs_idx: li, rhs_src: rs, rhs_idx: ri,
+    }).collect();
+    let ptrs: Vec<*const f32> = input_ptrs.iter().map(|&p| p as *const f32).collect();
+    let dst = dst_ptr as *mut f32;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe {
+                fused_elem_f32_avx2_core(&descs, &ptrs, &constants, n, reduce_op, dst)
+            };
+        }
+    }
+
+    // Scalar fallback
+    unsafe { fused_elem_f32_scalar(&descs, &ptrs, &constants, n, reduce_op, dst) }
+}
+
+// ── f64 AVX2 core ──
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fused_elem_f64_avx2_core(
+    ops: &[FusedOpDesc],
+    input_ptrs: &[*const f64],
+    constants: &[f64],
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: *mut f64,
+) -> f64 {
+    use std::arch::x86_64::*;
+
+    let num_ops = ops.len().min(MAX_FUSED_OPS);
+    if num_ops == 0 || n == 0 { return 0.0; }
+
+    let has_reduce = reduce_op != REDUCE_NONE;
+    let mut acc0 = _mm256_setzero_pd();
+    let mut acc1 = _mm256_setzero_pd();
+    let mut acc2 = _mm256_setzero_pd();
+    let mut acc3 = _mm256_setzero_pd();
+
+    // Process 16 f64 per iteration (4 × 4-wide YMM)
+    let n_vec4 = n & !15;
+    let mut i = 0usize;
+
+    while i < n_vec4 {
+        for u in 0..4usize {
+            let base = i + u * 4;
+            let mut intermediates: [__m256d; MAX_FUSED_OPS] = [_mm256_setzero_pd(); MAX_FUSED_OPS];
+
+            for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+                let lhs = match desc.lhs_src {
+                    0 => {
+                        let idx = desc.lhs_idx as usize;
+                        if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(base)) } else { _mm256_setzero_pd() }
+                    }
+                    1 => {
+                        let idx = desc.lhs_idx as usize;
+                        if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { _mm256_setzero_pd() }
+                    }
+                    2 => {
+                        let idx = desc.lhs_idx as usize;
+                        if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_pd() }
+                    }
+                    _ => _mm256_setzero_pd(),
+                };
+                let rhs = match desc.rhs_src {
+                    0 => {
+                        let idx = desc.rhs_idx as usize;
+                        if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(base)) } else { _mm256_setzero_pd() }
+                    }
+                    1 => {
+                        let idx = desc.rhs_idx as usize;
+                        if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { _mm256_setzero_pd() }
+                    }
+                    2 => {
+                        let idx = desc.rhs_idx as usize;
+                        if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_pd() }
+                    }
+                    _ => _mm256_setzero_pd(),
+                };
+
+                intermediates[op_idx] = match desc.op {
+                    0 => _mm256_add_pd(lhs, rhs),
+                    1 => _mm256_sub_pd(lhs, rhs),
+                    2 => _mm256_mul_pd(lhs, rhs),
+                    3 => _mm256_div_pd(lhs, rhs),
+                    4 => _mm256_min_pd(lhs, rhs),
+                    5 => _mm256_max_pd(lhs, rhs),
+                    _ => lhs,
+                };
+            }
+
+            let final_val = intermediates[num_ops - 1];
+
+            if has_reduce {
+                match reduce_op {
+                    REDUCE_SUM => match u {
+                        0 => acc0 = _mm256_add_pd(acc0, final_val),
+                        1 => acc1 = _mm256_add_pd(acc1, final_val),
+                        2 => acc2 = _mm256_add_pd(acc2, final_val),
+                        _ => acc3 = _mm256_add_pd(acc3, final_val),
+                    },
+                    REDUCE_MAX => match u {
+                        0 => acc0 = _mm256_max_pd(acc0, final_val),
+                        1 => acc1 = _mm256_max_pd(acc1, final_val),
+                        2 => acc2 = _mm256_max_pd(acc2, final_val),
+                        _ => acc3 = _mm256_max_pd(acc3, final_val),
+                    },
+                    REDUCE_MIN => match u {
+                        0 => acc0 = _mm256_min_pd(acc0, final_val),
+                        1 => acc1 = _mm256_min_pd(acc1, final_val),
+                        2 => acc2 = _mm256_min_pd(acc2, final_val),
+                        _ => acc3 = _mm256_min_pd(acc3, final_val),
+                    },
+                    _ => {}
+                }
+            } else {
+                _mm256_storeu_pd(dst_ptr.add(base), final_val);
+            }
+        }
+        i += 16;
+    }
+
+    // Remaining 4-element chunks
+    let n_vec = n & !3;
+    while i < n_vec {
+        let mut intermediates: [__m256d; MAX_FUSED_OPS] = [_mm256_setzero_pd(); MAX_FUSED_OPS];
+
+        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+            let lhs = match desc.lhs_src {
+                0 => { let idx = desc.lhs_idx as usize; if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(i)) } else { _mm256_setzero_pd() } }
+                1 => { let idx = desc.lhs_idx as usize; if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { _mm256_setzero_pd() } }
+                2 => { let idx = desc.lhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_pd() } }
+                _ => _mm256_setzero_pd(),
+            };
+            let rhs = match desc.rhs_src {
+                0 => { let idx = desc.rhs_idx as usize; if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(i)) } else { _mm256_setzero_pd() } }
+                1 => { let idx = desc.rhs_idx as usize; if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { _mm256_setzero_pd() } }
+                2 => { let idx = desc.rhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_pd() } }
+                _ => _mm256_setzero_pd(),
+            };
+
+            intermediates[op_idx] = match desc.op {
+                0 => _mm256_add_pd(lhs, rhs),
+                1 => _mm256_sub_pd(lhs, rhs),
+                2 => _mm256_mul_pd(lhs, rhs),
+                3 => _mm256_div_pd(lhs, rhs),
+                4 => _mm256_min_pd(lhs, rhs),
+                5 => _mm256_max_pd(lhs, rhs),
+                _ => lhs,
+            };
+        }
+
+        let final_val = intermediates[num_ops - 1];
+        if has_reduce {
+            match reduce_op {
+                REDUCE_SUM => acc0 = _mm256_add_pd(acc0, final_val),
+                REDUCE_MAX => acc0 = _mm256_max_pd(acc0, final_val),
+                REDUCE_MIN => acc0 = _mm256_min_pd(acc0, final_val),
+                _ => {}
+            }
+        } else {
+            _mm256_storeu_pd(dst_ptr.add(i), final_val);
+        }
+        i += 4;
+    }
+
+    // Scalar tail for f64
+    let mut scalar_acc: f64 = 0.0;
+    let mut first_scalar = true;
+    while i < n {
+        let mut intermediates: [f64; MAX_FUSED_OPS] = [0.0; MAX_FUSED_OPS];
+        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+            let lhs: f64 = match desc.lhs_src {
+                0 => { let idx = desc.lhs_idx as usize; if idx < input_ptrs.len() { *input_ptrs[idx].add(i) } else { 0.0 } }
+                1 => *constants.get(desc.lhs_idx as usize).unwrap_or(&0.0),
+                2 => { let idx = desc.lhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 } }
+                _ => 0.0,
+            };
+            let rhs: f64 = match desc.rhs_src {
+                0 => { let idx = desc.rhs_idx as usize; if idx < input_ptrs.len() { *input_ptrs[idx].add(i) } else { 0.0 } }
+                1 => *constants.get(desc.rhs_idx as usize).unwrap_or(&0.0),
+                2 => { let idx = desc.rhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 } }
+                _ => 0.0,
+            };
+            intermediates[op_idx] = match desc.op {
+                0 => lhs + rhs, 1 => lhs - rhs, 2 => lhs * rhs, 3 => lhs / rhs,
+                4 => lhs.min(rhs), 5 => lhs.max(rhs), _ => lhs,
+            };
+        }
+        let val = intermediates[num_ops - 1];
+        if has_reduce {
+            match reduce_op {
+                REDUCE_SUM => scalar_acc += val,
+                REDUCE_MAX => scalar_acc = if first_scalar { val } else { scalar_acc.max(val) },
+                REDUCE_MIN => scalar_acc = if first_scalar { val } else { scalar_acc.min(val) },
+                _ => {}
+            }
+            first_scalar = false;
+        } else {
+            *dst_ptr.add(i) = val;
+        }
+        i += 1;
+    }
+
+    // Horizontal reduction
+    if has_reduce {
+        match reduce_op {
+            REDUCE_SUM => {
+                acc0 = _mm256_add_pd(acc0, acc1);
+                acc0 = _mm256_add_pd(acc0, acc2);
+                acc0 = _mm256_add_pd(acc0, acc3);
+            }
+            REDUCE_MAX => {
+                acc0 = _mm256_max_pd(acc0, acc1);
+                acc0 = _mm256_max_pd(acc0, acc2);
+                acc0 = _mm256_max_pd(acc0, acc3);
+            }
+            REDUCE_MIN => {
+                acc0 = _mm256_min_pd(acc0, acc1);
+                acc0 = _mm256_min_pd(acc0, acc2);
+                acc0 = _mm256_min_pd(acc0, acc3);
+            }
+            _ => {}
+        }
+        let hi = _mm256_permute2f128_pd(acc0, acc0, 0x01);
+        acc0 = match reduce_op {
+            REDUCE_SUM => _mm256_add_pd(acc0, hi),
+            REDUCE_MAX => _mm256_max_pd(acc0, hi),
+            REDUCE_MIN => _mm256_min_pd(acc0, hi),
+            _ => acc0,
+        };
+        let shuf = _mm256_shuffle_pd(acc0, acc0, 0x05);
+        acc0 = match reduce_op {
+            REDUCE_SUM => _mm256_add_pd(acc0, shuf),
+            REDUCE_MAX => _mm256_max_pd(acc0, shuf),
+            REDUCE_MIN => _mm256_min_pd(acc0, shuf),
+            _ => acc0,
+        };
+        // Extract low f64 from the 128-bit low half
+        let low128 = _mm256_castpd256_pd128(acc0);
+        let result = _mm_cvtsd_f64(low128);
+        return result + scalar_acc;
+    }
+
+    0.0
+}
+
+/// Execute a fused chain of elementwise operations in a single pass for f64 arrays.
+pub fn simd_fused_elementwise_f64(
+    ops: Vec<(u8, u8, u8, u8, u8)>,
+    input_ptrs: Vec<usize>,
+    constants: Vec<f64>,
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: usize,
+) -> f64 {
+    if n == 0 || ops.is_empty() { return 0.0; }
+
+    let descs: Vec<FusedOpDesc> = ops.iter().map(|&(op, ls, li, rs, ri)| FusedOpDesc {
+        op, lhs_src: ls, lhs_idx: li, rhs_src: rs, rhs_idx: ri,
+    }).collect();
+    let ptrs: Vec<*const f64> = input_ptrs.iter().map(|&p| p as *const f64).collect();
+    let dst = dst_ptr as *mut f64;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe {
+                fused_elem_f64_avx2_core(&descs, &ptrs, &constants, n, reduce_op, dst)
+            };
+        }
+    }
+
+    // Scalar fallback for f64
+    unsafe {
+        let num_ops = descs.len().min(MAX_FUSED_OPS);
+        let has_reduce = reduce_op != REDUCE_NONE;
+        let mut acc: f64 = 0.0;
+        let mut first = true;
+        for i in 0..n {
+            let mut intermediates: [f64; MAX_FUSED_OPS] = [0.0; MAX_FUSED_OPS];
+            for (op_idx, desc) in descs.iter().enumerate().take(MAX_FUSED_OPS) {
+                let lhs: f64 = match desc.lhs_src {
+                    0 => { let idx = desc.lhs_idx as usize; if idx < ptrs.len() { *ptrs[idx].add(i) } else { 0.0 } }
+                    1 => *constants.get(desc.lhs_idx as usize).unwrap_or(&0.0),
+                    2 => { let idx = desc.lhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 } }
+                    _ => 0.0,
+                };
+                let rhs: f64 = match desc.rhs_src {
+                    0 => { let idx = desc.rhs_idx as usize; if idx < ptrs.len() { *ptrs[idx].add(i) } else { 0.0 } }
+                    1 => *constants.get(desc.rhs_idx as usize).unwrap_or(&0.0),
+                    2 => { let idx = desc.rhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 } }
+                    _ => 0.0,
+                };
+                intermediates[op_idx] = match desc.op {
+                    0 => lhs + rhs, 1 => lhs - rhs, 2 => lhs * rhs, 3 => lhs / rhs,
+                    4 => lhs.min(rhs), 5 => lhs.max(rhs), _ => lhs,
+                };
+            }
+            let val = intermediates[num_ops - 1];
+            if has_reduce {
+                match reduce_op {
+                    REDUCE_SUM => acc += val,
+                    REDUCE_MAX => acc = if first { val } else { acc.max(val) },
+                    REDUCE_MIN => acc = if first { val } else { acc.min(val) },
+                    _ => {}
+                }
+                first = false;
+            } else {
+                *dst.add(i) = val;
+            }
+        }
+        acc
+    }
+}

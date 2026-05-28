@@ -396,6 +396,47 @@ fn discover_fusions(ops: Vec<(String, Vec<i64>, String)>) -> String {
     result
 }
 
+/// Execute a fused chain of elementwise operations in a single pass for f32 arrays.
+/// This eliminates intermediate array allocations and memory traffic.
+///
+/// ops: list of (op, lhs_src, lhs_idx, rhs_src, rhs_idx) tuples
+///   op: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
+///   lhs_src: 0=input_array, 1=constant, 2=previous_op_result
+///   rhs_src: same as lhs_src
+///   lhs_idx/rhs_idx: index into the source
+/// input_ptrs: raw pointers to input f32 arrays
+/// constants: f32 constant values
+/// n: element count
+/// reduce_op: 0=sum, 1=max, 2=min, 255=no reduce (write to dst)
+/// dst_ptr: output array pointer (used when reduce_op == 255)
+#[pyfunction]
+fn simd_fused_elementwise_f32(
+    ops: Vec<(u8, u8, u8, u8, u8)>,
+    input_ptrs: Vec<usize>,
+    constants: Vec<f32>,
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: usize,
+) -> f64 {
+    x86_emitter::simd_fused_elementwise_f32(ops, input_ptrs, constants, n, reduce_op, dst_ptr)
+}
+
+/// Execute a fused chain of elementwise operations in a single pass for f64 arrays.
+/// This eliminates intermediate array allocations and memory traffic.
+///
+/// Same parameter encoding as simd_fused_elementwise_f32 but for f64 arrays.
+#[pyfunction]
+fn simd_fused_elementwise_f64(
+    ops: Vec<(u8, u8, u8, u8, u8)>,
+    input_ptrs: Vec<usize>,
+    constants: Vec<f64>,
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: usize,
+) -> f64 {
+    x86_emitter::simd_fused_elementwise_f64(ops, input_ptrs, constants, n, reduce_op, dst_ptr)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase3 JIT Kernel — JIT-compiled integer arithmetic via phase3_jit backend
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1502,6 +1543,8 @@ fn symplex_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parallel_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(jit_parallel_matmul, m)?)?;
     m.add_function(wrap_pyfunction!(discover_fusions, m)?)?;
+    m.add_function(wrap_pyfunction!(simd_fused_elementwise_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(simd_fused_elementwise_f64, m)?)?;
     m.add_function(wrap_pyfunction!(jit_bench_int, m)?)?;
     m.add_function(wrap_pyfunction!(jit_bench_loop, m)?)?;
     m.add_function(wrap_pyfunction!(jit_compile_info, m)?)?;

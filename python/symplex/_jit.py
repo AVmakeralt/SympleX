@@ -1448,6 +1448,119 @@ def _create_fused_elementwise_executor(trace, allocator):
     return _fused_exec
 
 
+def _simd_elem_fallback_unfused(inputs, info, allocator, use_f32, target_dtype):
+    """Fallback: unfused multi-pass SIMD execution (original slow path).
+
+    Used when the fused single-pass kernel is not available or fails.
+    This is the old behavior where each op creates a temporary array.
+    """
+    reduce_info = info.get("reduce")
+
+    if use_f32:
+        from ._symplex_core import simd_elementwise_f32, simd_reduce_f32
+        simd_elem_fn = simd_elementwise_f32
+        simd_reduce_fn = simd_reduce_f32
+    else:
+        from ._symplex_core import simd_elementwise_f64, simd_reduce_f64
+        simd_elem_fn = simd_elementwise_f64
+        simd_reduce_fn = simd_reduce_f64
+
+    ops = info["ops"]
+    raw_instrs = info["raw_instrs"]
+    arg_slot_map = _build_slot_for_arg_map(allocator)
+
+    slots = {}
+    for i, arr in enumerate(inputs):
+        if isinstance(arr, DeviceArray):
+            arr = arr._data
+        elif not isinstance(arr, np.ndarray):
+            arr = np.asarray(arr, dtype=target_dtype)
+        s = arg_slot_map.get(i)
+        if s is not None:
+            slots[s] = arr
+
+    for instr in raw_instrs:
+        if instr[0] in ("load_f64", "load_f32"):
+            _, slot, val = instr
+            slots[slot] = float(val)
+
+    for op_str, lhs_slot, rhs_slot, dst_slot in ops:
+        lhs_val = slots.get(lhs_slot, 0)
+        rhs_val = slots.get(rhs_slot, 0)
+
+        if isinstance(lhs_val, DeviceArray):
+            lhs_val = lhs_val._data
+        if isinstance(rhs_val, DeviceArray):
+            rhs_val = rhs_val._data
+
+        lhs_is_scalar = not isinstance(lhs_val, np.ndarray) or lhs_val.ndim == 0
+        rhs_is_scalar = not isinstance(rhs_val, np.ndarray) or rhs_val.ndim == 0
+
+        if lhs_is_scalar:
+            lhs_val = np.asarray(lhs_val, dtype=target_dtype)
+        if rhs_is_scalar:
+            rhs_val = np.asarray(rhs_val, dtype=target_dtype)
+
+        lhs_bcast, rhs_bcast = np.broadcast_arrays(lhs_val, rhs_val)
+        out_shape = lhs_bcast.shape
+
+        lhs_arr = np.ascontiguousarray(lhs_bcast, dtype=target_dtype).ravel()
+        rhs_arr = np.ascontiguousarray(rhs_bcast, dtype=target_dtype).ravel()
+        n = lhs_arr.size
+
+        dst_arr = np.empty(n, dtype=target_dtype)
+
+        simd_elem_fn(
+            op_str,
+            dst_arr.ctypes.data,
+            lhs_arr.ctypes.data,
+            rhs_arr.ctypes.data,
+            n,
+        )
+
+        if out_shape != (n,):
+            dst_arr = dst_arr.reshape(out_shape)
+
+        slots[dst_slot] = dst_arr
+
+    if reduce_info is not None:
+        reduce_op, reduce_src_slot, reduce_dst_slot = reduce_info
+        src_val = slots.get(reduce_src_slot, 0)
+        if isinstance(src_val, DeviceArray):
+            src_val = src_val._data
+        if not isinstance(src_val, np.ndarray) or src_val.ndim == 0:
+            src_val = np.asarray(src_val, dtype=target_dtype)
+
+        src_flat = np.ascontiguousarray(src_val, dtype=target_dtype).ravel()
+        n = src_flat.size
+
+        reduce_result = simd_reduce_fn(
+            reduce_op,
+            src_flat.ctypes.data,
+            n,
+        )
+
+        slots[reduce_dst_slot] = float(reduce_result)
+
+    output_slot = info["output_slot"]
+    if reduce_info is not None:
+        _, _, reduce_dst_slot = reduce_info
+        if output_slot != reduce_dst_slot:
+            slots[output_slot] = slots.get(reduce_dst_slot)
+    elif ops:
+        last_binop_dst = ops[-1][3]
+        result = slots.get(last_binop_dst)
+        if output_slot != last_binop_dst and result is not None:
+            slots[output_slot] = result
+
+    result = slots.get(output_slot)
+    if result is not None:
+        if isinstance(result, np.ndarray):
+            return DeviceArray._wrap(result)
+        return result
+    return None
+
+
 # ── JIT decorator ────────────────────────────────────────────────────────────
 
 class JitFunction:
@@ -1678,9 +1791,17 @@ class JitFunction:
             allocator = self._allocator
 
             def _simd_elem_fast_path(inputs, _info=simd_info, _alloc=allocator):
-                """Execute via AVX2/SSE2 SIMD elementwise kernels (f32 or f64)."""
+                """Execute via fused single-pass SIMD kernel (AVX2/SSE2).
+
+                KEY OPTIMIZATION: Instead of executing each binop as a separate
+                pass over memory (which creates temporary arrays and wastes
+                memory bandwidth), we build a fused op schedule and execute
+                ALL ops in a single pass. For a chain like x*2.0+1.0 → sum:
+                  Old: 3 passes × 800MB = 2.4GB traffic + 2 temp arrays
+                  New: 1 pass × 800MB = 800MB traffic, 0 temp arrays
+                This eliminates the catastrophic multi-pass pattern.
+                """
                 reduce_info = _info.get("reduce")
-                use_f32 = reduce_info is None  # Will be re-evaluated below
 
                 # Detect if all input arrays are f32 — if so, use f32 kernels
                 all_f32 = True
@@ -1690,37 +1811,31 @@ class JitFunction:
                     elif isinstance(arr, np.ndarray):
                         dt = arr.dtype
                     else:
-                        dt = None  # scalar → doesn't affect decision
+                        dt = None
                     if dt is not None and dt != np.float32:
                         all_f32 = False
                         break
                 use_f32 = all_f32
 
-                # Import the appropriate SIMD kernels
                 if use_f32:
-                    from ._symplex_core import simd_elementwise_f32
-                    simd_elem_fn = simd_elementwise_f32
                     target_dtype = np.float32
                 else:
-                    from ._symplex_core import simd_elementwise_f64
-                    simd_elem_fn = simd_elementwise_f64
                     target_dtype = np.float64
-
-                # Import reduce kernel if needed
-                simd_reduce_fn = None
-                if reduce_info is not None:
-                    if use_f32:
-                        from ._symplex_core import simd_reduce_f32
-                        simd_reduce_fn = simd_reduce_f32
-                    else:
-                        from ._symplex_core import simd_reduce_f64
-                        simd_reduce_fn = simd_reduce_f64
 
                 ops = _info["ops"]
                 raw_instrs = _info["raw_instrs"]
-                arg_slot_map = _build_slot_for_arg_map(_alloc)
+                arg_slot_map = _build_arg_slot_map(_alloc)
 
-                # Load input arrays into slot dict
+                # ── Build fused op schedule ─────────────────────────────────
+                # Classify each slot as: input_array, constant, or op_result.
+                # Then build the FusedOpDesc tuples for the Rust kernel.
+                input_slot_to_idx = {}  # slot → index into input_ptrs
+                const_list = []        # list of constant values
+                const_slot_to_idx = {} # slot → index into const_list
+                op_dst_to_idx = {}     # dst_slot → op index (result of which op)
+
+                # First pass: load input arrays and constants
+                input_arrays = []  # list of (contiguous_array, slot)
                 slots = {}
                 for i, arr in enumerate(inputs):
                     if isinstance(arr, DeviceArray):
@@ -1731,86 +1846,149 @@ class JitFunction:
                     if s is not None:
                         slots[s] = arr
 
-                # Process load instructions (constants) from the trace
                 for instr in raw_instrs:
-                    if instr[0] == "load_f64":
-                        _, slot, val = instr
-                        slots[slot] = float(val)
-                    elif instr[0] == "load_f32":
+                    if instr[0] in ("load_f64", "load_f32"):
                         _, slot, val = instr
                         slots[slot] = float(val)
 
-                # Execute each binop in the chain using SIMD
-                for op_str, lhs_slot, rhs_slot, dst_slot in ops:
-                    lhs_val = slots.get(lhs_slot, 0)
-                    rhs_val = slots.get(rhs_slot, 0)
+                # Second pass: build the fused op schedule
+                fused_ops = []  # list of (op_code, lhs_src, lhs_idx, rhs_src, rhs_idx)
+                _OP_MAP = {"add": 0, "sub": 1, "mul": 2, "div": 3, "min": 4, "max": 5}
 
-                    if isinstance(lhs_val, DeviceArray):
-                        lhs_val = lhs_val._data
-                    if isinstance(rhs_val, DeviceArray):
-                        rhs_val = rhs_val._data
+                for op_idx, (op_str, lhs_slot, rhs_slot, dst_slot) in enumerate(ops):
+                    op_code = _OP_MAP.get(op_str, 0)
 
-                    # Handle scalars vs arrays and broadcasting
-                    lhs_is_scalar = not isinstance(lhs_val, np.ndarray) or lhs_val.ndim == 0
-                    rhs_is_scalar = not isinstance(rhs_val, np.ndarray) or rhs_val.ndim == 0
+                    # Classify lhs
+                    if lhs_slot in input_slot_to_idx:
+                        lhs_src, lhs_idx = 0, input_slot_to_idx[lhs_slot]
+                    elif lhs_slot in const_slot_to_idx:
+                        lhs_src, lhs_idx = 1, const_slot_to_idx[lhs_slot]
+                    elif lhs_slot in op_dst_to_idx:
+                        lhs_src, lhs_idx = 2, op_dst_to_idx[lhs_slot]
+                    else:
+                        # First encounter: figure out if it's an input or constant
+                        lhs_val = slots.get(lhs_slot, 0)
+                        if isinstance(lhs_val, np.ndarray) and lhs_val.ndim > 0:
+                            # Input array
+                            arr_idx = len(input_arrays)
+                            input_arrays.append(lhs_val)
+                            input_slot_to_idx[lhs_slot] = arr_idx
+                            lhs_src, lhs_idx = 0, arr_idx
+                        else:
+                            # Constant scalar
+                            cidx = len(const_list)
+                            const_list.append(float(lhs_val))
+                            const_slot_to_idx[lhs_slot] = cidx
+                            lhs_src, lhs_idx = 1, cidx
 
-                    if lhs_is_scalar:
-                        lhs_val = np.asarray(lhs_val, dtype=target_dtype)
-                    if rhs_is_scalar:
-                        rhs_val = np.asarray(rhs_val, dtype=target_dtype)
+                    # Classify rhs
+                    if rhs_slot in input_slot_to_idx:
+                        rhs_src, rhs_idx = 0, input_slot_to_idx[rhs_slot]
+                    elif rhs_slot in const_slot_to_idx:
+                        rhs_src, rhs_idx = 1, const_slot_to_idx[rhs_slot]
+                    elif rhs_slot in op_dst_to_idx:
+                        rhs_src, rhs_idx = 2, op_dst_to_idx[rhs_slot]
+                    else:
+                        rhs_val = slots.get(rhs_slot, 0)
+                        if isinstance(rhs_val, np.ndarray) and rhs_val.ndim > 0:
+                            arr_idx = len(input_arrays)
+                            input_arrays.append(rhs_val)
+                            input_slot_to_idx[rhs_slot] = arr_idx
+                            rhs_src, rhs_idx = 0, arr_idx
+                        else:
+                            cidx = len(const_list)
+                            const_list.append(float(rhs_val))
+                            const_slot_to_idx[rhs_slot] = cidx
+                            rhs_src, rhs_idx = 1, cidx
 
-                    # Broadcast arrays using NumPy rules
-                    lhs_bcast, rhs_bcast = np.broadcast_arrays(lhs_val, rhs_val)
-                    out_shape = lhs_bcast.shape
+                    fused_ops.append((op_code, lhs_src, lhs_idx, rhs_src, rhs_idx))
+                    op_dst_to_idx[dst_slot] = op_idx
 
-                    lhs_arr = np.ascontiguousarray(lhs_bcast, dtype=target_dtype).ravel()
-                    rhs_arr = np.ascontiguousarray(rhs_bcast, dtype=target_dtype).ravel()
-                    n = lhs_arr.size
+                # Determine element count from the first input array
+                n = 0
+                input_ptr_list = []
+                for arr in input_arrays:
+                    flat = np.ascontiguousarray(arr, dtype=target_dtype).ravel()
+                    if n == 0:
+                        n = flat.size
+                    input_ptr_list.append(flat.ctypes.data)
 
-                    # Allocate output
-                    dst_arr = np.empty(n, dtype=target_dtype)
+                if n == 0:
+                    return None
 
-                    # Execute via SIMD kernel
-                    simd_elem_fn(
-                        op_str,
-                        dst_arr.ctypes.data,
-                        lhs_arr.ctypes.data,
-                        rhs_arr.ctypes.data,
-                        n,
-                    )
-
-                    # Reshape output to match broadcast result shape
-                    if out_shape != (n,):
-                        dst_arr = dst_arr.reshape(out_shape)
-
-                    slots[dst_slot] = dst_arr
-
-                # Execute reduce if present
+                # Reduce op code: 0=sum, 1=max, 2=min, 255=no reduce
                 if reduce_info is not None:
-                    reduce_op, reduce_src_slot, reduce_dst_slot = reduce_info
-                    src_val = slots.get(reduce_src_slot, 0)
-                    if isinstance(src_val, DeviceArray):
-                        src_val = src_val._data
-                    if not isinstance(src_val, np.ndarray) or src_val.ndim == 0:
-                        src_val = np.asarray(src_val, dtype=target_dtype)
+                    reduce_op_name, reduce_src_slot, reduce_dst_slot = reduce_info
+                    _REDUCE_MAP = {"sum": 0, "max": 1, "min": 2}
+                    reduce_op_code = _REDUCE_MAP.get(reduce_op_name, 255)
+                else:
+                    reduce_op_code = 255
+                    reduce_dst_slot = None
 
-                    src_flat = np.ascontiguousarray(src_val, dtype=target_dtype).ravel()
-                    n = src_flat.size
+                # ── Execute via fused single-pass SIMD kernel ──────────────
+                try:
+                    if use_f32:
+                        from ._symplex_core import simd_fused_elementwise_f32
+                        if reduce_op_code != 255:
+                            # Fused elementwise + reduce in one pass
+                            result = simd_fused_elementwise_f32(
+                                fused_ops,
+                                input_ptr_list,
+                                [float(c) for c in const_list],
+                                n,
+                                reduce_op_code,
+                                0,  # dst_ptr unused for reduce
+                            )
+                            slots[reduce_dst_slot] = float(result)
+                        else:
+                            # Fused elementwise, output to array
+                            dst_arr = np.empty(n, dtype=np.float32)
+                            simd_fused_elementwise_f32(
+                                fused_ops,
+                                input_ptr_list,
+                                [float(c) for c in const_list],
+                                n,
+                                255,  # no reduce
+                                dst_arr.ctypes.data,
+                            )
+                            # Find the output slot
+                            last_dst = ops[-1][3] if ops else 0
+                            slots[last_dst] = dst_arr
+                    else:
+                        from ._symplex_core import simd_fused_elementwise_f64
+                        if reduce_op_code != 255:
+                            result = simd_fused_elementwise_f64(
+                                fused_ops,
+                                input_ptr_list,
+                                [float(c) for c in const_list],
+                                n,
+                                reduce_op_code,
+                                0,
+                            )
+                            slots[reduce_dst_slot] = float(result)
+                        else:
+                            dst_arr = np.empty(n, dtype=np.float64)
+                            simd_fused_elementwise_f64(
+                                fused_ops,
+                                input_ptr_list,
+                                [float(c) for c in const_list],
+                                n,
+                                255,
+                                dst_arr.ctypes.data,
+                            )
+                            last_dst = ops[-1][3] if ops else 0
+                            slots[last_dst] = dst_arr
 
-                    # Execute via SIMD reduce kernel
-                    # The kernel reads directly from src_flat and returns a scalar
-                    # (no dst buffer needed — result comes back as the return value)
-                    reduce_result = simd_reduce_fn(
-                        reduce_op,
-                        src_flat.ctypes.data,
-                        n,
-                    )
-
-                    slots[reduce_dst_slot] = float(reduce_result)
+                except (ImportError, AttributeError, Exception) as e:
+                    # Fallback: unfused multi-pass execution
+                    import sys
+                    print(f"[symplex.jit] Fused SIMD failed, falling back to multi-pass: "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
+                    return _simd_elem_fallback_unfused(
+                        inputs, _info, _alloc, use_f32, target_dtype)
 
                 # Result is in the output_slot
                 output_slot = _info["output_slot"]
-                # If the reduce is the last op, the output_slot should be the reduce dst
                 if reduce_info is not None:
                     _, _, reduce_dst_slot = reduce_info
                     if output_slot != reduce_dst_slot:
