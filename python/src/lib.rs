@@ -1438,6 +1438,56 @@ fn simd_elementwise_f32(op: &str, dst_ptr: usize, a_ptr: usize, b_ptr: usize, n:
     Ok(elapsed)
 }
 
+/// Execute a SIMD-accelerated reduction on an f32 array.
+/// op: "sum"=0, "max"=1, "min"=2
+/// data_ptr: raw pointer to contiguous f32 array
+/// n: number of elements
+/// Returns the reduced scalar value (as f64).
+#[pyfunction]
+#[pyo3(signature = (op, data_ptr, n))]
+fn simd_reduce_f32(op: &str, data_ptr: usize, n: usize) -> PyResult<f64> {
+    let op_code: u8 = match op {
+        "sum" => 0,
+        "max" => 1,
+        "min" => 2,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unsupported reduction op: {}. Supported: sum, max, min", op)
+        )),
+    };
+    let result = x86_emitter::simd_reduce_f32(op_code, data_ptr, n);
+    if result.is_nan() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "SIMD reduction f32 kernel execution failed"
+        ));
+    }
+    Ok(result)
+}
+
+/// Execute a SIMD-accelerated reduction on an f64 array.
+/// op: "sum"=0, "max"=1, "min"=2
+/// data_ptr: raw pointer to contiguous f64 array
+/// n: number of elements
+/// Returns the reduced scalar value.
+#[pyfunction]
+#[pyo3(signature = (op, data_ptr, n))]
+fn simd_reduce_f64(op: &str, data_ptr: usize, n: usize) -> PyResult<f64> {
+    let op_code: u8 = match op {
+        "sum" => 0,
+        "max" => 1,
+        "min" => 2,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unsupported reduction op: {}. Supported: sum, max, min", op)
+        )),
+    };
+    let result = x86_emitter::simd_reduce_f64(op_code, data_ptr, n);
+    if result.is_nan() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "SIMD reduction f64 kernel execution failed"
+        ));
+    }
+    Ok(result)
+}
+
 // ── CUDA Backend — GPU execution functions ──────────────────────────────────
 
 /// Check if CUDA is available on this system.
@@ -1808,6 +1858,9 @@ fn _symplex_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // SIMD elementwise f32
     m.add_function(wrap_pyfunction!(simd_elementwise_f32, m)?)?;
     m.add_function(wrap_pyfunction!(simd_elementwise_isa, m)?)?;
+    // SIMD reduction
+    m.add_function(wrap_pyfunction!(simd_reduce_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(simd_reduce_f64, m)?)?;
     // CUDA backend
     m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_device_info, m)?)?;

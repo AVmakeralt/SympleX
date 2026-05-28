@@ -240,14 +240,22 @@ class TracerVal:
     # ── Reduction methods ────────────────────────────────────────────────
 
     def sum(self, axis=None, keepdims=False) -> 'TracerVal':
-        """Sum reduction — emits an add reduction."""
+        """Sum reduction — emits a proper reduce instruction.
+
+        The 'reduce' instruction is distinct from 'binop':
+        - binop(add, x, x) means elementwise x+x (doubles each element)
+        - reduce(sum, x) means horizontal summation → scalar result
+
+        This distinction is critical for the JIT backend:
+        - Elementwise ops → SIMD elementwise kernel (one output per input)
+        - Reductions → SIMD reduction kernel (N inputs → 1 output)
+        """
         result = TracerVal(
             self.allocator, self.trace,
             shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
             dtype=self.dtype,
         )
-        # For a full reduction, emit as binop with self (identity for tracing)
-        self.trace.append(("binop", result.slot, "add", self.slot, self.slot))
+        self.trace.append(("reduce", result.slot, "sum", self.slot))
         return result
 
     def mean(self, axis=None, keepdims=False) -> 'TracerVal':
@@ -259,23 +267,23 @@ class TracerVal:
         return result
 
     def max(self, axis=None, keepdims=False) -> 'TracerVal':
-        """Max reduction."""
+        """Max reduction — emits a proper reduce instruction."""
         result = TracerVal(
             self.allocator, self.trace,
             shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
             dtype=self.dtype,
         )
-        self.trace.append(("binop", result.slot, "max", self.slot, self.slot))
+        self.trace.append(("reduce", result.slot, "max", self.slot))
         return result
 
     def min(self, axis=None, keepdims=False) -> 'TracerVal':
-        """Min reduction."""
+        """Min reduction — emits a proper reduce instruction."""
         result = TracerVal(
             self.allocator, self.trace,
             shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
             dtype=self.dtype,
         )
-        self.trace.append(("binop", result.slot, "min", self.slot, self.slot))
+        self.trace.append(("reduce", result.slot, "min", self.slot))
         return result
 
     def __lt__(self, other) -> 'TracerVal':

@@ -1080,7 +1080,391 @@ pub fn simd_elementwise_f32(op: u8, dst_ptr: usize, a_ptr: usize, b_ptr: usize, 
     }
 }
 
-// ── Multi-threaded matmul ──
+// ── SIMD Reduction Kernels ───────────────────────────────────────────────────
+//
+// Reduction operations (sum, max, min) over a single input array, producing
+// a scalar result.  These use unrolled YMM accumulators to saturate the
+// adder ports, then a horizontal reduction phase to produce the final scalar.
+//
+// op: 0=sum, 1=max, 2=min
+// Calling convention: rdi=data_ptr, rsi=n  →  returns f64 in xmm0
+
+/// Global caches for reduction kernels
+static F32_REDUCE_KERNELS: Mutex<Vec<Option<CompiledKernel>>> = Mutex::new(Vec::new());
+static F64_REDUCE_KERNELS: Mutex<Vec<Option<CompiledKernel>>> = Mutex::new(Vec::new());
+
+impl CompiledKernel {
+    /// Compile AVX2 reduction kernel for f32.
+    /// Uses 8 YMM accumulators for 8-wide unrolling (256 f32 per iteration).
+    /// op: 0=sum, 1=max, 2=min
+    pub fn compile_reduce_avx2_f32(op: u8) -> Self {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.push(rbp).unwrap(); a.mov(rbp, rsp).unwrap();
+        a.push(rbx).unwrap();
+
+        // rdi = data ptr, rsi = n
+        a.mov(rbx, rsi).unwrap(); // rbx = n
+
+        // Zero-initialize 8 YMM accumulators (ymm0-ymm7)
+        a.vxorps(ymm0, ymm0, ymm0).unwrap();
+        a.vxorps(ymm1, ymm1, ymm1).unwrap();
+        a.vxorps(ymm2, ymm2, ymm2).unwrap();
+        a.vxorps(ymm3, ymm3, ymm3).unwrap();
+        a.vxorps(ymm4, ymm4, ymm4).unwrap();
+        a.vxorps(ymm5, ymm5, ymm5).unwrap();
+        a.vxorps(ymm6, ymm6, ymm6).unwrap();
+        a.vxorps(ymm7, ymm7, ymm7).unwrap();
+
+        // Vectorized loop: process 64 f32 (8 × YMM) per iteration
+        // rdx = byte offset
+        a.xor(rdx, rdx).unwrap();
+        a.mov(rax, rbx).unwrap(); a.shl(rax, 2).unwrap(); a.sub(rax, 256).unwrap(); // n*4 - 256
+        let mut vec_loop = a.create_label();
+        let mut vec_exit = a.create_label();
+        a.set_label(&mut vec_loop).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jge(vec_exit).unwrap();
+
+        // Load 8 × 8 = 64 f32 per iteration (256 bytes), accumulate into 8 YMM regs
+        match op {
+            0 => { // sum: VADDPS accumulator
+                a.vaddps(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap();
+                a.vaddps(ymm1, ymm1, ymmword_ptr(rdi + rdx + 32)).unwrap();
+                a.vaddps(ymm2, ymm2, ymmword_ptr(rdi + rdx + 64)).unwrap();
+                a.vaddps(ymm3, ymm3, ymmword_ptr(rdi + rdx + 96)).unwrap();
+                a.vaddps(ymm4, ymm4, ymmword_ptr(rdi + rdx + 128)).unwrap();
+                a.vaddps(ymm5, ymm5, ymmword_ptr(rdi + rdx + 160)).unwrap();
+                a.vaddps(ymm6, ymm6, ymmword_ptr(rdi + rdx + 192)).unwrap();
+                a.vaddps(ymm7, ymm7, ymmword_ptr(rdi + rdx + 224)).unwrap();
+            }
+            1 => { // max: VMAXPS accumulator
+                a.vmaxps(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap();
+                a.vmaxps(ymm1, ymm1, ymmword_ptr(rdi + rdx + 32)).unwrap();
+                a.vmaxps(ymm2, ymm2, ymmword_ptr(rdi + rdx + 64)).unwrap();
+                a.vmaxps(ymm3, ymm3, ymmword_ptr(rdi + rdx + 96)).unwrap();
+                a.vmaxps(ymm4, ymm4, ymmword_ptr(rdi + rdx + 128)).unwrap();
+                a.vmaxps(ymm5, ymm5, ymmword_ptr(rdi + rdx + 160)).unwrap();
+                a.vmaxps(ymm6, ymm6, ymmword_ptr(rdi + rdx + 192)).unwrap();
+                a.vmaxps(ymm7, ymm7, ymmword_ptr(rdi + rdx + 224)).unwrap();
+            }
+            2 => { // min: VMINPS accumulator
+                a.vminps(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap();
+                a.vminps(ymm1, ymm1, ymmword_ptr(rdi + rdx + 32)).unwrap();
+                a.vminps(ymm2, ymm2, ymmword_ptr(rdi + rdx + 64)).unwrap();
+                a.vminps(ymm3, ymm3, ymmword_ptr(rdi + rdx + 96)).unwrap();
+                a.vminps(ymm4, ymm4, ymmword_ptr(rdi + rdx + 128)).unwrap();
+                a.vminps(ymm5, ymm5, ymmword_ptr(rdi + rdx + 160)).unwrap();
+                a.vminps(ymm6, ymm6, ymmword_ptr(rdi + rdx + 192)).unwrap();
+                a.vminps(ymm7, ymm7, ymmword_ptr(rdi + rdx + 224)).unwrap();
+            }
+            _ => {}
+        }
+        a.add(rdx, 256).unwrap(); // 8 × 32 bytes
+        a.jmp(vec_loop).unwrap();
+        a.set_label(&mut vec_exit).unwrap();
+
+        // Remaining vector elements: process one YMM at a time
+        a.mov(rax, rbx).unwrap(); a.shl(rax, 2).unwrap(); a.sub(rax, 32).unwrap(); // n*4 - 32
+        let mut rem_loop = a.create_label();
+        let mut rem_exit = a.create_label();
+        a.set_label(&mut rem_loop).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jge(rem_exit).unwrap();
+        match op {
+            0 => { a.vaddps(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
+            1 => { a.vmaxps(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
+            2 => { a.vminps(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
+            _ => {}
+        }
+        a.add(rdx, 32).unwrap();
+        a.jmp(rem_loop).unwrap();
+        a.set_label(&mut rem_exit).unwrap();
+
+        // Horizontal reduction of the 8 accumulators into ymm0
+        match op {
+            0 => {
+                a.vaddps(ymm0, ymm0, ymm1).unwrap();
+                a.vaddps(ymm0, ymm0, ymm2).unwrap();
+                a.vaddps(ymm0, ymm0, ymm3).unwrap();
+                a.vaddps(ymm0, ymm0, ymm4).unwrap();
+                a.vaddps(ymm0, ymm0, ymm5).unwrap();
+                a.vaddps(ymm0, ymm0, ymm6).unwrap();
+                a.vaddps(ymm0, ymm0, ymm7).unwrap();
+            }
+            1 => {
+                a.vmaxps(ymm0, ymm0, ymm1).unwrap();
+                a.vmaxps(ymm0, ymm0, ymm2).unwrap();
+                a.vmaxps(ymm0, ymm0, ymm3).unwrap();
+                a.vmaxps(ymm0, ymm0, ymm4).unwrap();
+                a.vmaxps(ymm0, ymm0, ymm5).unwrap();
+                a.vmaxps(ymm0, ymm0, ymm6).unwrap();
+                a.vmaxps(ymm0, ymm0, ymm7).unwrap();
+            }
+            2 => {
+                a.vminps(ymm0, ymm0, ymm1).unwrap();
+                a.vminps(ymm0, ymm0, ymm2).unwrap();
+                a.vminps(ymm0, ymm0, ymm3).unwrap();
+                a.vminps(ymm0, ymm0, ymm4).unwrap();
+                a.vminps(ymm0, ymm0, ymm5).unwrap();
+                a.vminps(ymm0, ymm0, ymm6).unwrap();
+                a.vminps(ymm0, ymm0, ymm7).unwrap();
+            }
+            _ => {}
+        }
+
+        // Horizontal reduction within ymm0/xmm0 (BEFORE scalar tail):
+        // ymm0 = [s7, s6, s5, s4, s3, s2, s1, s0]
+        a.vperm2f128(ymm1, ymm0, ymm0, 0x01).unwrap();
+        match op {
+            0 => { a.vaddps(ymm0, ymm0, ymm1).unwrap(); }
+            1 => { a.vmaxps(ymm0, ymm0, ymm1).unwrap(); }
+            2 => { a.vminps(ymm0, ymm0, ymm1).unwrap(); }
+            _ => {}
+        }
+        a.vshufps(ymm1, ymm0, ymm0, 0x4E).unwrap();
+        match op {
+            0 => { a.vaddps(ymm0, ymm0, ymm1).unwrap(); }
+            1 => { a.vmaxps(ymm0, ymm0, ymm1).unwrap(); }
+            2 => { a.vminps(ymm0, ymm0, ymm1).unwrap(); }
+            _ => {}
+        }
+        a.vshufps(ymm1, ymm0, ymm0, 0xB1).unwrap();
+        match op {
+            0 => { a.vaddps(ymm0, ymm0, ymm1).unwrap(); }
+            1 => { a.vmaxps(ymm0, ymm0, ymm1).unwrap(); }
+            2 => { a.vminps(ymm0, ymm0, ymm1).unwrap(); }
+            _ => {}
+        }
+
+        // Scalar tail: handle remaining 0-7 f32 elements (AFTER horizontal reduction)
+        a.mov(rax, rbx).unwrap(); a.shl(rax, 2).unwrap(); // n*4
+        let mut sc_loop = a.create_label();
+        let mut sc_exit = a.create_label();
+        a.set_label(&mut sc_loop).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jge(sc_exit).unwrap();
+        match op {
+            0 => { a.vaddss(xmm0, xmm0, dword_ptr(rdi + rdx)).unwrap(); }
+            1 => { a.vmaxss(xmm0, xmm0, dword_ptr(rdi + rdx)).unwrap(); }
+            2 => { a.vminss(xmm0, xmm0, dword_ptr(rdi + rdx)).unwrap(); }
+            _ => {}
+        }
+        a.add(rdx, 4).unwrap();
+        a.jmp(sc_loop).unwrap();
+        a.set_label(&mut sc_exit).unwrap();
+
+        // Convert f32 result to f64 for return in xmm0
+        a.cvtss2sd(xmm0, xmm0).unwrap();
+
+        a.vzeroupper().unwrap();
+        a.pop(rbx).unwrap(); a.pop(rbp).unwrap();
+        a.ret().unwrap();
+
+        Self::finalize(a, 0, 0, 0)
+    }
+
+    /// Compile AVX2 reduction kernel for f64.
+    /// Uses 4 YMM accumulators for 4-wide unrolling (16 f64 per iteration).
+    /// op: 0=sum, 1=max, 2=min
+    pub fn compile_reduce_avx2_f64(op: u8) -> Self {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.push(rbp).unwrap(); a.mov(rbp, rsp).unwrap();
+        a.push(rbx).unwrap();
+
+        // rdi = data ptr, rsi = n
+        a.mov(rbx, rsi).unwrap(); // rbx = n
+
+        // Zero-initialize 4 YMM accumulators
+        a.vxorpd(ymm0, ymm0, ymm0).unwrap();
+        a.vxorpd(ymm1, ymm1, ymm1).unwrap();
+        a.vxorpd(ymm2, ymm2, ymm2).unwrap();
+        a.vxorpd(ymm3, ymm3, ymm3).unwrap();
+
+        // Vectorized loop: process 16 f64 (4 × YMM) per iteration
+        // rdx = byte offset
+        a.xor(rdx, rdx).unwrap();
+        a.mov(rax, rbx).unwrap(); a.shl(rax, 3).unwrap(); a.sub(rax, 128).unwrap(); // n*8 - 128
+        let mut vec_loop = a.create_label();
+        let mut vec_exit = a.create_label();
+        a.set_label(&mut vec_loop).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jge(vec_exit).unwrap();
+
+        match op {
+            0 => {
+                a.vaddpd(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap();
+                a.vaddpd(ymm1, ymm1, ymmword_ptr(rdi + rdx + 32)).unwrap();
+                a.vaddpd(ymm2, ymm2, ymmword_ptr(rdi + rdx + 64)).unwrap();
+                a.vaddpd(ymm3, ymm3, ymmword_ptr(rdi + rdx + 96)).unwrap();
+            }
+            1 => {
+                a.vmaxpd(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap();
+                a.vmaxpd(ymm1, ymm1, ymmword_ptr(rdi + rdx + 32)).unwrap();
+                a.vmaxpd(ymm2, ymm2, ymmword_ptr(rdi + rdx + 64)).unwrap();
+                a.vmaxpd(ymm3, ymm3, ymmword_ptr(rdi + rdx + 96)).unwrap();
+            }
+            2 => {
+                a.vminpd(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap();
+                a.vminpd(ymm1, ymm1, ymmword_ptr(rdi + rdx + 32)).unwrap();
+                a.vminpd(ymm2, ymm2, ymmword_ptr(rdi + rdx + 64)).unwrap();
+                a.vminpd(ymm3, ymm3, ymmword_ptr(rdi + rdx + 96)).unwrap();
+            }
+            _ => {}
+        }
+        a.add(rdx, 128).unwrap(); // 4 × 32 bytes
+        a.jmp(vec_loop).unwrap();
+        a.set_label(&mut vec_exit).unwrap();
+
+        // Remaining vector elements: process one YMM at a time
+        a.mov(rax, rbx).unwrap(); a.shl(rax, 3).unwrap(); a.sub(rax, 32).unwrap();
+        let mut rem_loop = a.create_label();
+        let mut rem_exit = a.create_label();
+        a.set_label(&mut rem_loop).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jge(rem_exit).unwrap();
+        match op {
+            0 => { a.vaddpd(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
+            1 => { a.vmaxpd(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
+            2 => { a.vminpd(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
+            _ => {}
+        }
+        a.add(rdx, 32).unwrap();
+        a.jmp(rem_loop).unwrap();
+        a.set_label(&mut rem_exit).unwrap();
+
+        // Horizontal reduction of the 4 accumulators into ymm0
+        match op {
+            0 => {
+                a.vaddpd(ymm0, ymm0, ymm1).unwrap();
+                a.vaddpd(ymm0, ymm0, ymm2).unwrap();
+                a.vaddpd(ymm0, ymm0, ymm3).unwrap();
+            }
+            1 => {
+                a.vmaxpd(ymm0, ymm0, ymm1).unwrap();
+                a.vmaxpd(ymm0, ymm0, ymm2).unwrap();
+                a.vmaxpd(ymm0, ymm0, ymm3).unwrap();
+            }
+            2 => {
+                a.vminpd(ymm0, ymm0, ymm1).unwrap();
+                a.vminpd(ymm0, ymm0, ymm2).unwrap();
+                a.vminpd(ymm0, ymm0, ymm3).unwrap();
+            }
+            _ => {}
+        }
+
+        // Horizontal reduction within ymm0 for f64 (BEFORE scalar tail):
+        a.vperm2f128(ymm1, ymm0, ymm0, 0x01).unwrap();
+        match op {
+            0 => { a.vaddpd(ymm0, ymm0, ymm1).unwrap(); }
+            1 => { a.vmaxpd(ymm0, ymm0, ymm1).unwrap(); }
+            2 => { a.vminpd(ymm0, ymm0, ymm1).unwrap(); }
+            _ => {}
+        }
+        a.vshufpd(ymm1, ymm0, ymm0, 0x05).unwrap();
+        match op {
+            0 => { a.vaddpd(ymm0, ymm0, ymm1).unwrap(); }
+            1 => { a.vmaxpd(ymm0, ymm0, ymm1).unwrap(); }
+            2 => { a.vminpd(ymm0, ymm0, ymm1).unwrap(); }
+            _ => {}
+        }
+
+        // Scalar tail (AFTER horizontal reduction)
+        a.mov(rax, rbx).unwrap(); a.shl(rax, 3).unwrap();
+        let mut sc_loop = a.create_label();
+        let mut sc_exit = a.create_label();
+        a.set_label(&mut sc_loop).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jge(sc_exit).unwrap();
+        match op {
+            0 => { a.vaddsd(xmm0, xmm0, qword_ptr(rdi + rdx)).unwrap(); }
+            1 => { a.vmaxsd(xmm0, xmm0, qword_ptr(rdi + rdx)).unwrap(); }
+            2 => { a.vminsd(xmm0, xmm0, qword_ptr(rdi + rdx)).unwrap(); }
+            _ => {}
+        }
+        a.add(rdx, 8).unwrap();
+        a.jmp(sc_loop).unwrap();
+        a.set_label(&mut sc_exit).unwrap();
+
+        // Result is already f64 in xmm0
+        a.vzeroupper().unwrap();
+        a.pop(rbx).unwrap(); a.pop(rbp).unwrap();
+        a.ret().unwrap();
+
+        Self::finalize(a, 0, 0, 0)
+    }
+
+    /// Execute a cached f32 reduction kernel.
+    /// Returns the reduced scalar value.
+    pub fn exec_reduce_f32(&self, data: &[f32], n: i64) -> f64 {
+        if self.exec_ptr.is_null() { return f64::NAN; }
+        unsafe {
+            let f: extern "C" fn(*const f32, i64) -> f64 =
+                std::mem::transmute(self.exec_ptr);
+            f(data.as_ptr(), n)
+        }
+    }
+
+    /// Execute a cached f64 reduction kernel.
+    /// Returns the reduced scalar value.
+    pub fn exec_reduce_f64(&self, data: &[f64], n: i64) -> f64 {
+        if self.exec_ptr.is_null() { return f64::NAN; }
+        unsafe {
+            let f: extern "C" fn(*const f64, i64) -> f64 =
+                std::mem::transmute(self.exec_ptr);
+            f(data.as_ptr(), n)
+        }
+    }
+}
+
+/// Execute a cached f32 reduction kernel over an array.
+/// op: 0=sum, 1=max, 2=min
+/// Returns the reduced scalar value, or NaN on error.
+pub fn simd_reduce_f32(op: u8, data_ptr: usize, n: usize) -> f64 {
+    if n == 0 { return 0.0; }
+
+    let mut kernels = F32_REDUCE_KERNELS.lock().unwrap();
+    let idx = op as usize;
+    while kernels.len() <= idx {
+        kernels.push(None);
+    }
+
+    if kernels[idx].is_none() {
+        let kernel = CompiledKernel::compile_reduce_avx2_f32(op);
+        kernels[idx] = Some(kernel);
+    }
+
+    let kernel = kernels[idx].as_ref().unwrap();
+    if kernel.exec_ptr.is_null() {
+        return f64::NAN;
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(data_ptr as *const f32, n);
+        kernel.exec_reduce_f32(data, n as i64)
+    }
+}
+
+/// Execute a cached f64 reduction kernel over an array.
+/// op: 0=sum, 1=max, 2=min
+/// Returns the reduced scalar value, or NaN on error.
+pub fn simd_reduce_f64(op: u8, data_ptr: usize, n: usize) -> f64 {
+    if n == 0 { return 0.0; }
+
+    let mut kernels = F64_REDUCE_KERNELS.lock().unwrap();
+    let idx = op as usize;
+    while kernels.len() <= idx {
+        kernels.push(None);
+    }
+
+    if kernels[idx].is_none() {
+        let kernel = CompiledKernel::compile_reduce_avx2_f64(op);
+        kernels[idx] = Some(kernel);
+    }
+
+    let kernel = kernels[idx].as_ref().unwrap();
+    if kernel.exec_ptr.is_null() {
+        return f64::NAN;
+    }
+
+    unsafe {
+        let data = std::slice::from_raw_parts(data_ptr as *const f64, n);
+        kernel.exec_reduce_f64(data, n as i64)
+    }
+}
 
 pub fn parallel_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     use rayon::prelude::*;
