@@ -1634,7 +1634,7 @@ class JitFunction:
                         rhs_val = np.asarray(rhs_val, dtype=np.float64)
 
                     # Broadcast arrays using NumPy rules
-                    # This handles (8,8) + (8,) → each row of (8,8) gets (8,) added
+                    # This handles (8,8) + (8,) → each row gets (8,) added
                     lhs_bcast, rhs_bcast = np.broadcast_arrays(lhs_val, rhs_val)
                     out_shape = lhs_bcast.shape
 
