@@ -1,0 +1,590 @@
+// SympleX — Self-contained type definitions
+//
+// These types replace the `crate::compiler::ast::BinOpKind`,
+// `crate::interp::Instr`, and `crate::interp::Value` types from the
+// original "Jules" interpreter. They are defined here so the polyhedral
+// engine and JIT can compile standalone without the full Jules runtime.
+
+// =============================================================================
+// BinOpKind — Binary operator classification
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum BinOpKind {
+    Add = 0,
+    Sub = 1,
+    Mul = 2,
+    Div = 3,
+    Rem = 4,
+    BitAnd = 5,
+    BitOr = 6,
+    BitXor = 7,
+    Shl = 8,
+    Shr = 9,
+    Eq = 10,
+    Ne = 11,
+    Lt = 12,
+    Le = 13,
+    Gt = 14,
+    Ge = 15,
+    And = 16,
+    Or = 17,
+    Min = 18,
+    Max = 19,
+    FloorDiv = 20,
+}
+
+impl BinOpKind {
+    /// Returns true if this operator is associative and commutative,
+    /// meaning it can be safely reordered for reduction parallelization.
+    pub fn is_associative_commutative(&self) -> bool {
+        matches!(self, BinOpKind::Add | BinOpKind::Mul | BinOpKind::Min | BinOpKind::Max
+                     | BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor)
+    }
+
+    /// Returns true if this is a comparison operator producing a boolean.
+    pub fn is_comparison(&self) -> bool {
+        matches!(self, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt
+                     | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge)
+    }
+}
+
+// =============================================================================
+// UnOpKind — Unary operator classification
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum UnOpKind {
+    Neg = 0,
+    Not = 1,
+    BitNot = 2,
+    Abs = 3,
+}
+
+// =============================================================================
+// AmxOpCode — AMX tile operation codes
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AmxOpCode {
+    TileLoad = 0,
+    TileStore = 1,
+    TileMatMul = 2,
+    TileZero = 3,
+    TileConfig = 4,
+    TileRelease = 5,
+    TilePrefetch = 6,
+    TileRelu = 7,
+    Tdpbssd = 8,
+    Tdpbsud = 9,
+    Tdpbusd = 10,
+    Tdpbuud = 11,
+    Tdpbf16ps = 12,
+}
+
+// =============================================================================
+// Value — Runtime value representation
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    I64(i64),
+    I32(i32),
+    I16(i16),
+    I8(i8),
+    U64(u64),
+    U32(u32),
+    U16(u16),
+    U8(u8),
+    F64(f64),
+    F32(f32),
+    Bool(bool),
+    Unit,
+    Tensor(Vec<f64>),
+    TensorFast(Box<[f64]>),
+}
+
+impl Value {
+    pub fn to_i64(&self) -> Option<i64> {
+        match self {
+            Value::I64(v) => Some(*v),
+            Value::I32(v) => Some(*v as i64),
+            Value::I16(v) => Some(*v as i64),
+            Value::I8(v) => Some(*v as i64),
+            Value::U64(v) => Some(*v as i64),
+            Value::U32(v) => Some(*v as i64),
+            Value::U16(v) => Some(*v as i64),
+            Value::U8(v) => Some(*v as i64),
+            Value::Bool(v) => Some(if *v { 1 } else { 0 }),
+            _ => None,
+        }
+    }
+
+    pub fn to_f64(&self) -> Option<f64> {
+        match self {
+            Value::F64(v) => Some(*v),
+            Value::F32(v) => Some(*v as f64),
+            Value::I64(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// RuntimeError — Interpreter error type
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeError {
+    TypeError(String),
+    DivisionByZero,
+    IndexOutOfBounds { index: usize, len: usize },
+    SlotOverflow { slot: u16 },
+    InvalidOperation(String),
+    StackOverflow,
+    Unimplemented(String),
+}
+
+impl RuntimeError {
+    pub fn new(msg: impl Into<String>) -> Self {
+        RuntimeError::InvalidOperation(msg.into())
+    }
+}
+
+// =============================================================================
+// Instr — Interpreter instruction set
+// =============================================================================
+
+/// The core instruction type for the SympleX JIT and polyhedral engine.
+/// Each instruction operates on slot indices (u16) that reference values
+/// in the interpreter's slot array.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Instr {
+    // ── Load constants ─────────────────────────────────────────────────
+    LoadI64(u16, i64),
+    LoadI32(u16, i32),
+    LoadF64(u16, f64),
+    LoadF32(u16, f32),
+    LoadBool(u16, bool),
+    LoadUnit(u16),
+
+    // ── Binary operations ──────────────────────────────────────────────
+    BinOp(u16, BinOpKind, u16, u16),
+
+    // ── Unary operations ───────────────────────────────────────────────
+    UnOp(u16, UnOpKind, u16),
+
+    // ── Data movement ──────────────────────────────────────────────────
+    Move(u16, u16),
+    Store(u16, u16),
+
+    // ── Load from memory slot (compat alias) ─────────────────────────
+    Load(u16, u16),
+
+    // ── Control flow ───────────────────────────────────────────────────
+    Jump(i32),
+    JumpFalse(u16, i32),
+    JumpTrue(u16, i32),
+    Loop { header_pc: usize, back_edge_pc: usize, slot: u16, start: i64, end: i64, step: i64 },
+
+    // ── AMX / Matrix operations ────────────────────────────────────────
+    AmxOp(AmxOpCode, u16, u16, u16),
+
+    // ── SIMD vector pack hint ──────────────────────────────────────────
+    VectorPack { dst: u16, src_start: u16, lanes: u16 },
+
+    // ── Force register lock (polyhedral hint) ──────────────────────────
+    ForceRegisterLock { slot: u16, physical_reg: u8 },
+    ForceRegisterUnlock { slot: u16 },
+
+    // ── Function loading ───────────────────────────────────────────────
+    LoadFn(u16, usize),        // (dst_slot, string_pool_index)
+    LoadStr(u16, usize),       // (dst_slot, string_pool_index)
+    LoadConst(u16, usize),     // (dst_slot, const_pool_index)
+
+    // ── Function calls ──────────────────────────────────────────────────
+    Call(u16, u16, u16, u16),          // (dst, fn_reg, args_start, arg_count)
+    CallBuiltin(u16, usize, u16, u16), // (dst, name_idx, args_start, arg_count)
+    CallMethod(u16, u16, usize, u16, u16), // (dst, recv, method_idx, args_start, arg_count)
+
+    // ── Tensor/math ops ──────────────────────────────────────────────────
+    PowOp(u16, u16, u16),          // (dst, base, exp)
+    MatMulInstr(u16, u16, u16),    // (dst, lhs, rhs)
+
+    // ── Return ────────────────────────────────────────────────────────
+    Return(u16),
+    ReturnUnit,
+
+    // ── No-op / placeholder ────────────────────────────────────────────
+    Nop,
+}
+
+// =============================================================================
+// CompiledFn — Compiled function handle
+// =============================================================================
+
+/// A compiled function that can be called via its entry point.
+pub struct CompiledFn {
+    pub entry: Option<unsafe extern "C" fn(*mut i64) -> i64>,
+    pub slot_count: u16,
+    pub name: String,
+    /// Number of parameters the function takes.
+    pub param_count: u16,
+    /// Instruction stream (bytecode / IR instructions).
+    pub instrs: Vec<Instr>,
+    /// String pool for CallBuiltin / LoadStr / LoadFn names.
+    pub str_pool: Vec<String>,
+    /// Constant pool for LoadConst values.
+    pub const_pool: Vec<Value>,
+}
+
+// =============================================================================
+// Serialization helpers for FFI
+// =============================================================================
+
+/// Serialize an instruction into a compact binary format for FFI transfer.
+/// Format: [opcode: u8] [payload: variable]
+pub fn serialize_instr(instr: &Instr) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16);
+    match instr {
+        Instr::LoadI64(slot, val) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        Instr::LoadI32(slot, val) => {
+            buf.push(0x02);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        Instr::LoadF64(slot, val) => {
+            buf.push(0x03);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        Instr::LoadF32(slot, val) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        Instr::LoadBool(slot, val) => {
+            buf.push(0x05);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.push(if *val { 1 } else { 0 });
+        }
+        Instr::LoadUnit(slot) => {
+            buf.push(0x06);
+            buf.extend_from_slice(&slot.to_le_bytes());
+        }
+        Instr::BinOp(dst, op, lhs, rhs) => {
+            buf.push(0x10);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.push(*op as u8);
+            buf.extend_from_slice(&lhs.to_le_bytes());
+            buf.extend_from_slice(&rhs.to_le_bytes());
+        }
+        Instr::UnOp(dst, op, src) => {
+            buf.push(0x11);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.push(*op as u8);
+            buf.extend_from_slice(&src.to_le_bytes());
+        }
+        Instr::Move(dst, src) => {
+            buf.push(0x20);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&src.to_le_bytes());
+        }
+        Instr::Store(slot, val) => {
+            buf.push(0x21);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        Instr::Load(dst, src) => {
+            buf.push(0x22);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&src.to_le_bytes());
+        }
+        Instr::Jump(off) => {
+            buf.push(0x30);
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+        Instr::JumpFalse(slot, off) => {
+            buf.push(0x31);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+        Instr::JumpTrue(slot, off) => {
+            buf.push(0x32);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+        Instr::Loop { header_pc, back_edge_pc, slot, start, end, step } => {
+            buf.push(0x33);
+            buf.extend_from_slice(&(*header_pc as u64).to_le_bytes());
+            buf.extend_from_slice(&(*back_edge_pc as u64).to_le_bytes());
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&start.to_le_bytes());
+            buf.extend_from_slice(&end.to_le_bytes());
+            buf.extend_from_slice(&step.to_le_bytes());
+        }
+        Instr::AmxOp(op, a, b, c) => {
+            buf.push(0x40);
+            buf.push(*op as u8);
+            buf.extend_from_slice(&a.to_le_bytes());
+            buf.extend_from_slice(&b.to_le_bytes());
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+        Instr::VectorPack { dst, src_start, lanes } => {
+            buf.push(0x50);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&src_start.to_le_bytes());
+            buf.extend_from_slice(&lanes.to_le_bytes());
+        }
+        Instr::ForceRegisterLock { slot, physical_reg } => {
+            buf.push(0x60);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.push(*physical_reg);
+        }
+        Instr::ForceRegisterUnlock { slot } => {
+            buf.push(0x61);
+            buf.extend_from_slice(&slot.to_le_bytes());
+        }
+        Instr::LoadFn(slot, idx) => {
+            buf.push(0x72);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&(*idx as u64).to_le_bytes());
+        }
+        Instr::LoadStr(slot, idx) => {
+            buf.push(0x73);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&(*idx as u64).to_le_bytes());
+        }
+        Instr::LoadConst(slot, idx) => {
+            buf.push(0x74);
+            buf.extend_from_slice(&slot.to_le_bytes());
+            buf.extend_from_slice(&(*idx as u64).to_le_bytes());
+        }
+        Instr::Call(dst, fn_reg, args_start, arg_count) => {
+            buf.push(0x80);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&fn_reg.to_le_bytes());
+            buf.extend_from_slice(&args_start.to_le_bytes());
+            buf.extend_from_slice(&arg_count.to_le_bytes());
+        }
+        Instr::CallBuiltin(dst, name_idx, args_start, arg_count) => {
+            buf.push(0x81);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&(*name_idx as u64).to_le_bytes());
+            buf.extend_from_slice(&args_start.to_le_bytes());
+            buf.extend_from_slice(&arg_count.to_le_bytes());
+        }
+        Instr::CallMethod(dst, recv, method_idx, args_start, arg_count) => {
+            buf.push(0x82);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&recv.to_le_bytes());
+            buf.extend_from_slice(&(*method_idx as u64).to_le_bytes());
+            buf.extend_from_slice(&args_start.to_le_bytes());
+            buf.extend_from_slice(&arg_count.to_le_bytes());
+        }
+        Instr::PowOp(dst, base, exp) => {
+            buf.push(0x90);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&base.to_le_bytes());
+            buf.extend_from_slice(&exp.to_le_bytes());
+        }
+        Instr::MatMulInstr(dst, lhs, rhs) => {
+            buf.push(0x91);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&lhs.to_le_bytes());
+            buf.extend_from_slice(&rhs.to_le_bytes());
+        }
+        Instr::Return(slot) => {
+            buf.push(0x70);
+            buf.extend_from_slice(&slot.to_le_bytes());
+        }
+        Instr::ReturnUnit => {
+            buf.push(0x71);
+        }
+        Instr::Nop => {
+            buf.push(0x00);
+        }
+    }
+    buf
+}
+
+/// Deserialize an instruction from the compact binary format.
+pub fn deserialize_instr(data: &[u8]) -> Option<(Instr, usize)> {
+    if data.is_empty() { return None; }
+    let opcode = data[0];
+    match opcode {
+        0x01 if data.len() >= 11 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let val = i64::from_le_bytes(data[3..11].try_into().ok()?);
+            Some((Instr::LoadI64(slot, val), 11))
+        }
+        0x02 if data.len() >= 7 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let val = i32::from_le_bytes(data[3..7].try_into().ok()?);
+            Some((Instr::LoadI32(slot, val), 7))
+        }
+        0x03 if data.len() >= 11 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let val = f64::from_le_bytes(data[3..11].try_into().ok()?);
+            Some((Instr::LoadF64(slot, val), 11))
+        }
+        0x04 if data.len() >= 7 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let val = f32::from_le_bytes(data[3..7].try_into().ok()?);
+            Some((Instr::LoadF32(slot, val), 7))
+        }
+        0x05 if data.len() >= 4 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let val = data[3] != 0;
+            Some((Instr::LoadBool(slot, val), 4))
+        }
+        0x06 if data.len() >= 3 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            Some((Instr::LoadUnit(slot), 3))
+        }
+        0x10 if data.len() >= 8 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let op = BinOpKind::from_u8(data[3])?;
+            let lhs = u16::from_le_bytes([data[4], data[5]]);
+            let rhs = u16::from_le_bytes([data[6], data[7]]);
+            Some((Instr::BinOp(dst, op, lhs, rhs), 8))
+        }
+        0x11 if data.len() >= 6 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let op = UnOpKind::from_u8(data[3])?;
+            let src = u16::from_le_bytes([data[4], data[5]]);
+            Some((Instr::UnOp(dst, op, src), 6))
+        }
+        0x20 if data.len() >= 5 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let src = u16::from_le_bytes([data[3], data[4]]);
+            Some((Instr::Move(dst, src), 5))
+        }
+        0x21 if data.len() >= 5 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let val = u16::from_le_bytes([data[3], data[4]]);
+            Some((Instr::Store(slot, val), 5))
+        }
+        0x30 if data.len() >= 9 => {
+            let pc = u64::from_le_bytes(data[1..9].try_into().ok()?) as usize;
+            Some((Instr::Jump(pc as i32), 9))
+        }
+        0x31 if data.len() >= 11 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let pc = u64::from_le_bytes(data[3..11].try_into().ok()?) as usize;
+            Some((Instr::JumpFalse(slot, pc as i32), 11))
+        }
+        0x32 if data.len() >= 11 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let pc = u64::from_le_bytes(data[3..11].try_into().ok()?) as usize;
+            Some((Instr::JumpTrue(slot, pc as i32), 11))
+        }
+        0x33 if data.len() >= 38 => {
+            let header_pc = u64::from_le_bytes(data[1..9].try_into().ok()?) as usize;
+            let back_edge_pc = u64::from_le_bytes(data[9..17].try_into().ok()?) as usize;
+            let slot = u16::from_le_bytes([data[17], data[18]]);
+            let start = i64::from_le_bytes(data[19..27].try_into().ok()?);
+            let end = i64::from_le_bytes(data[27..35].try_into().ok()?);
+            let step = i64::from_le_bytes(data[35..43].try_into().ok()?);
+            Some((Instr::Loop { header_pc, back_edge_pc, slot, start, end, step }, 43))
+        }
+        0x40 if data.len() >= 8 => {
+            let op = AmxOpCode::from_u8(data[1])?;
+            let a = u16::from_le_bytes([data[2], data[3]]);
+            let b = u16::from_le_bytes([data[4], data[5]]);
+            let c = u16::from_le_bytes([data[6], data[7]]);
+            Some((Instr::AmxOp(op, a, b, c), 8))
+        }
+        0x50 if data.len() >= 7 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let src_start = u16::from_le_bytes([data[3], data[4]]);
+            let lanes = u16::from_le_bytes([data[5], data[6]]);
+            Some((Instr::VectorPack { dst, src_start, lanes }, 7))
+        }
+        0x60 if data.len() >= 4 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let physical_reg = data[3];
+            Some((Instr::ForceRegisterLock { slot, physical_reg }, 4))
+        }
+        0x61 if data.len() >= 3 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            Some((Instr::ForceRegisterUnlock { slot }, 3))
+        }
+        0x70 if data.len() >= 3 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            Some((Instr::Return(slot), 3))
+        }
+        0x71 => Some((Instr::ReturnUnit, 1)),
+        0x00 => Some((Instr::Nop, 1)),
+        _ => None,
+    }
+}
+
+impl BinOpKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(BinOpKind::Add),
+            1 => Some(BinOpKind::Sub),
+            2 => Some(BinOpKind::Mul),
+            3 => Some(BinOpKind::Div),
+            4 => Some(BinOpKind::Rem),
+            5 => Some(BinOpKind::BitAnd),
+            6 => Some(BinOpKind::BitOr),
+            7 => Some(BinOpKind::BitXor),
+            8 => Some(BinOpKind::Shl),
+            9 => Some(BinOpKind::Shr),
+            10 => Some(BinOpKind::Eq),
+            11 => Some(BinOpKind::Ne),
+            12 => Some(BinOpKind::Lt),
+            13 => Some(BinOpKind::Le),
+            14 => Some(BinOpKind::Gt),
+            15 => Some(BinOpKind::Ge),
+            16 => Some(BinOpKind::And),
+            17 => Some(BinOpKind::Or),
+            18 => Some(BinOpKind::Min),
+            19 => Some(BinOpKind::Max),
+            20 => Some(BinOpKind::FloorDiv),
+            _ => None,
+        }
+    }
+}
+
+impl UnOpKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(UnOpKind::Neg),
+            1 => Some(UnOpKind::Not),
+            2 => Some(UnOpKind::BitNot),
+            3 => Some(UnOpKind::Abs),
+            _ => None,
+        }
+    }
+}
+
+impl AmxOpCode {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(AmxOpCode::TileLoad),
+            1 => Some(AmxOpCode::TileStore),
+            2 => Some(AmxOpCode::TileMatMul),
+            3 => Some(AmxOpCode::TileZero),
+            4 => Some(AmxOpCode::TileConfig),
+            5 => Some(AmxOpCode::TileRelease),
+            6 => Some(AmxOpCode::TilePrefetch),
+            7 => Some(AmxOpCode::TileRelu),
+            8 => Some(AmxOpCode::Tdpbssd),
+            9 => Some(AmxOpCode::Tdpbsud),
+            10 => Some(AmxOpCode::Tdpbusd),
+            11 => Some(AmxOpCode::Tdpbuud),
+            12 => Some(AmxOpCode::Tdpbf16ps),
+            _ => None,
+        }
+    }
+}

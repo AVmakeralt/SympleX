@@ -1,0 +1,55 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "symplex"
+version = "1.0.0"
+description = "SympleX – Polyhedral Tensor Superoptimizer with JAX-style purity enforcement and x86-64 JIT compilation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "AGPL-3.0"}
+authors = [
+    {name = "SympleX Contributors"},
+]
+keywords = ["jit", "compiler", "tensor", "polyhedral", "optimization", "simd", "avx512", "numpy", "scientific-computing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "maturin>=1.0",
+]
+ml = [
+    "scipy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/hollowguy898-cloud/SympleX"
+Repository = "https://github.com/hollowguy898-cloud/SympleX"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "."
+module-name = "symplex._symplex_core"
+manifest-path = "Cargo.toml"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

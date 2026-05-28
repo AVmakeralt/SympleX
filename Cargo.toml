@@ -1,0 +1,15 @@
+[package]
+name = "symplex-matmul-jit"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "matmul_bench"
+path = "matmul_bench.rs"
+
+[lib]
+name = "matmul_kernel"
+path = "matmul_kernel.rs"
+
+[dependencies]
+libc = "0.2"

@@ -1,0 +1,39 @@
+# Build
+build/
+cmake-build-*/
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compiled
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# CUDA
+*.cubin
+*.ptx
+*.fatbin
+
+# Rust build artifacts
+rust-engine/target/
+target/
+Cargo.lock
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/

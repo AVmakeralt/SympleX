@@ -1,0 +1,25 @@
+[package]
+name = "symplex-python"
+version = "1.0.0"
+edition = "2021"
+description = "SympleX Python bindings — PyO3 native module"
+license = "AGPL-3.0-or-later"
+
+[lib]
+name = "_symplex_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+symplex-engine = { path = "../rust-engine" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+num_cpus = "1.16"
+rayon = "1.10"
+
+[features]
+default = []
+cuda = ["symplex-engine/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

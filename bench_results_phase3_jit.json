@@ -1,0 +1,214 @@
+{
+  "elementwise/add/n=1000": {
+    "numpy_time_s": 6.330001269816421e-07,
+    "jit_time_s": null
+  },
+  "elementwise/mul/n=1000": {
+    "numpy_time_s": 6.430000212276354e-07,
+    "jit_time_s": null
+  },
+  "elementwise/fma/n=1000": {
+    "numpy_time_s": 1.6214999050134793e-06,
+    "jit_time_s": null
+  },
+  "elementwise/sub/n=1000": {
+    "numpy_time_s": 5.974998202873394e-07,
+    "jit_time_s": null
+  },
+  "elementwise/add/n=10000": {
+    "numpy_time_s": 2.1764999473816715e-06,
+    "jit_time_s": null
+  },
+  "elementwise/mul/n=10000": {
+    "numpy_time_s": 2.2135000108391978e-06,
+    "jit_time_s": null
+  },
+  "elementwise/fma/n=10000": {
+    "numpy_time_s": 4.130999968765536e-06,
+    "jit_time_s": null
+  },
+  "elementwise/sub/n=10000": {
+    "numpy_time_s": 2.1850000848644413e-06,
+    "jit_time_s": null
+  },
+  "elementwise/add/n=100000": {
+    "numpy_time_s": 2.6092000098287826e-05,
+    "jit_time_s": null
+  },
+  "elementwise/mul/n=100000": {
+    "numpy_time_s": 2.5656000161689008e-05,
+    "jit_time_s": null
+  },
+  "elementwise/fma/n=100000": {
+    "numpy_time_s": 4.519799995250651e-05,
+    "jit_time_s": null
+  },
+  "elementwise/sub/n=100000": {
+    "numpy_time_s": 1.9170999621564988e-05,
+    "jit_time_s": null
+  },
+  "elementwise/add/n=1000000": {
+    "numpy_time_s": 0.0005251765001048625,
+    "jit_time_s": null
+  },
+  "elementwise/mul/n=1000000": {
+    "numpy_time_s": 0.0005030710003666172,
+    "jit_time_s": null
+  },
+  "elementwise/fma/n=1000000": {
+    "numpy_time_s": 0.0008826734997455787,
+    "jit_time_s": null
+  },
+  "elementwise/sub/n=1000000": {
+    "numpy_time_s": 0.00046507549996022135,
+    "jit_time_s": null
+  },
+  "reduction/sum/n=1000": {
+    "numpy_time_s": 1.849500222306233e-06,
+    "jit_time_s": null
+  },
+  "reduction/min/n=1000": {
+    "numpy_time_s": 1.9680001059896313e-06,
+    "jit_time_s": null
+  },
+  "reduction/max/n=1000": {
+    "numpy_time_s": 1.8175001059717033e-06,
+    "jit_time_s": null
+  },
+  "reduction/argmin/n=1000": {
+    "numpy_time_s": 1.0170001587539446e-06,
+    "jit_time_s": null
+  },
+  "reduction/sum/n=100000": {
+    "numpy_time_s": 1.85339999916323e-05,
+    "jit_time_s": null
+  },
+  "reduction/min/n=100000": {
+    "numpy_time_s": 1.1490500128275016e-05,
+    "jit_time_s": null
+  },
+  "reduction/max/n=100000": {
+    "numpy_time_s": 1.30269995679555e-05,
+    "jit_time_s": null
+  },
+  "reduction/argmin/n=100000": {
+    "numpy_time_s": 1.5914999949018238e-05,
+    "jit_time_s": null
+  },
+  "reduction/sum/n=10000000": {
+    "numpy_time_s": 0.004077062499618478,
+    "jit_time_s": null
+  },
+  "reduction/min/n=10000000": {
+    "numpy_time_s": 0.0032687825000721205,
+    "jit_time_s": null
+  },
+  "reduction/max/n=10000000": {
+    "numpy_time_s": 0.003251006000027701,
+    "jit_time_s": null
+  },
+  "reduction/argmin/n=10000000": {
+    "numpy_time_s": 0.004210811000120884,
+    "jit_time_s": null
+  },
+  "matmul/32x32": {
+    "numpy_time_s": 1.6380004126403946e-06,
+    "jit_time_s": 6.290849978540791e-05
+  },
+  "matmul/64x64": {
+    "numpy_time_s": 4.947500201524235e-06,
+    "jit_time_s": 0.0001485619995946763
+  },
+  "matmul/128x128": {
+    "numpy_time_s": 3.343250045872992e-05,
+    "jit_time_s": 0.0001900994998322858
+  },
+  "matmul/256x256": {
+    "numpy_time_s": 0.00015965849979693303,
+    "jit_time_s": 0.0011063545002798492
+  },
+  "matmul/512x512": {
+    "numpy_time_s": 0.0006465479996222712,
+    "jit_time_s": 0.008757967500514496
+  },
+  "stencil/laplacian/64x64": {
+    "numpy_time_s": 2.596400008769706e-05,
+    "jit_time_s": null
+  },
+  "stencil/heat/64x64": {
+    "numpy_time_s": 2.9025000003457535e-05,
+    "jit_time_s": null
+  },
+  "stencil/laplacian/128x128": {
+    "numpy_time_s": 7.484999969165074e-05,
+    "jit_time_s": null
+  },
+  "stencil/heat/128x128": {
+    "numpy_time_s": 9.097200018004514e-05,
+    "jit_time_s": null
+  },
+  "stencil/laplacian/256x256": {
+    "numpy_time_s": 0.0003276329998698202,
+    "jit_time_s": null
+  },
+  "stencil/heat/256x256": {
+    "numpy_time_s": 0.0003609020004660124,
+    "jit_time_s": null
+  },
+  "stencil/laplacian/512x512": {
+    "numpy_time_s": 0.001637342999856628,
+    "jit_time_s": null
+  },
+  "stencil/heat/512x512": {
+    "numpy_time_s": 0.0019359279995114775,
+    "jit_time_s": null
+  },
+  "stencil/heat_multi/256x256/10steps": {
+    "numpy_time_s": 0.0036192870002196287,
+    "jit_time_s": null
+  },
+  "nbody/force/n=100": {
+    "numpy_time_s": 0.0013616440000987495,
+    "jit_time_s": null
+  },
+  "nbody/force_vec/n=100": {
+    "numpy_time_s": 0.0004822170003535575,
+    "jit_time_s": null
+  },
+  "nbody/force/n=500": {
+    "numpy_time_s": 0.008804547000181628,
+    "jit_time_s": null
+  },
+  "nbody/force_vec/n=500": {
+    "numpy_time_s": 0.029253703999529534,
+    "jit_time_s": null
+  },
+  "nbody/force/n=1000": {
+    "numpy_time_s": 0.022609630999795627,
+    "jit_time_s": null
+  },
+  "nbody/force_vec/n=1000": {
+    "numpy_time_s": 0.07293286599997373,
+    "jit_time_s": null
+  },
+  "integer/add/n=10000": {
+    "numpy_time_s": 2.7639998734230176e-06,
+    "jit_time_s": null
+  },
+  "integer/mul/n=10000": {
+    "numpy_time_s": 3.9174997255031485e-06,
+    "jit_time_s": null
+  },
+  "integer/div/n=10000": {
+    "numpy_time_s": 7.828599973436212e-05,
+    "jit_time_s": null
+  },
+  "integer/fib/n=10000": {
+    "numpy_time_s": 0.0011663429995678598,
+    "jit_time_s": null
+  },
+  "integer/collatz/n=1000": {
+    "numpy_time_s": 0.014199598500454158,
+    "jit_time_s": null
+  }
+}
