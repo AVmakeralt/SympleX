@@ -964,6 +964,106 @@ fn phase3_compile(serialized_instrs: Vec<u8>, param_count: Option<u16>) -> PyRes
     })
 }
 
+/// Compile instructions via the SSA path of the phase3 JIT.
+/// This uses FlatIrFunction + translate_from_ir which applies
+/// parallel-move phi destruction and SSA-aware register allocation.
+#[pyfunction]
+#[pyo3(signature = (serialized_instrs, param_count=None))]
+fn phase3_compile_ssa(serialized_instrs: Vec<u8>, param_count: Option<u16>) -> PyResult<Phase3CompiledKernel> {
+    use crate::phase3_jit::{translate_from_ir, FlatIrFunction, FlatBlock, FlatInstr, BlockId, ValueId, IrType, IrOp, EffectFlags, AliasKind, Ownership};
+    use crate::types::deserialize_instr;
+
+    // Deserialize instructions
+    let mut instrs = Vec::new();
+    let mut offset = 0;
+    while offset < serialized_instrs.len() {
+        match deserialize_instr(&serialized_instrs[offset..]) {
+            Some((instr, consumed)) => {
+                instrs.push(instr);
+                offset += consumed;
+            }
+            None => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Failed to deserialize instruction at offset {}", offset)
+                ));
+            }
+        }
+    }
+
+    if instrs.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "No instructions provided"
+        ));
+    }
+
+    let pc = param_count.unwrap_or(0);
+    let instr_count = instrs.len();
+
+    // Convert flat instructions to a FlatIrFunction
+    // Create a single-block IR function from the flat instruction stream
+    let mut flat_instrs = Vec::new();
+    for (i, instr) in instrs.iter().enumerate() {
+        let result = match instr {
+            crate::types::Instr::BinOp(d, _, _, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::UnOp(d, _, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::LoadI32(d, _) | crate::types::Instr::LoadI64(d, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::LoadF32(d, _) | crate::types::Instr::LoadF64(d, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::LoadBool(d, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::Move(d, _) | crate::types::Instr::Load(d, _) => Some(ValueId(i as u32)),
+            _ => None,
+        };
+
+        let op = match instr {
+            crate::types::Instr::LoadI32(_, v) => IrOp::ConstInt { value: *v as i64, ty: IrType::Int { width: 32, signed: true } },
+            crate::types::Instr::LoadI64(_, v) => IrOp::ConstInt { value: *v, ty: IrType::Int { width: 64, signed: true } },
+            crate::types::Instr::LoadBool(_, v) => IrOp::ConstBool { value: *v },
+            crate::types::Instr::BinOp(_, op, l, r) => IrOp::BinOp { op: *op, lhs: ValueId(*l as u32), rhs: ValueId(*r as u32) },
+            crate::types::Instr::UnOp(_, op, s) => IrOp::UnOp { op: *op, operand: ValueId(*s as u32) },
+            crate::types::Instr::Move(_, s) => IrOp::Move { src: ValueId(*s as u32) },
+            crate::types::Instr::Return(s) => IrOp::Ret { value: Some(ValueId(*s as u32)) },
+            crate::types::Instr::Jump(off) => IrOp::Jump { target: BlockId(0), args: Vec::new() },
+            crate::types::Instr::JumpFalse(_, _) | crate::types::Instr::JumpTrue(_, _) => IrOp::Nop,
+            _ => IrOp::Nop,
+        };
+
+        flat_instrs.push(FlatInstr {
+            result,
+            dst: result,
+            op,
+            effect: EffectFlags::PURE,
+            effects: EffectFlags::PURE,
+            alias: AliasKind::Unknown,
+            ownership: Ownership::Copy,
+        });
+    }
+
+    let mut func = FlatIrFunction {
+        name: "phase3_ssa_kernel".to_string(),
+        params: (0..pc).map(|i| (ValueId(i as u32), IrType::Int { width: 64, signed: true })).collect(),
+        ret_ty: IrType::Int { width: 64, signed: true },
+        blocks: vec![FlatBlock {
+            id: BlockId(0),
+            instrs: flat_instrs,
+            terminated: false,
+            params: Vec::new(),
+        }],
+        entry: BlockId(0),
+        num_values: instr_count as u32,
+    };
+
+    let native = translate_from_ir(&mut func)
+        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Failed to compile via SSA path"
+        ))?;
+
+    Ok(Phase3CompiledKernel {
+        native_code: native,
+        name: "phase3_ssa_kernel".to_string(),
+        param_count: pc,
+        instr_count,
+    })
+}
+
 /// Execute a previously compiled Phase3 JIT kernel with integer arguments.
 /// Returns the result as an i64.
 #[pyfunction]
@@ -1408,6 +1508,7 @@ fn symplex_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase3_compile, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_execute, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_compile_and_run, m)?)?;
+    m.add_function(wrap_pyfunction!(phase3_compile_ssa, m)?)?;
     m.add_function(wrap_pyfunction!(tracing_jit_compile_and_run, m)?)?;
 
     // ── CUDA Backend ──

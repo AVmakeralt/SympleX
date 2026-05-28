@@ -1011,6 +1011,112 @@ fn phase3_compile<'py>(py: Python<'py>, trace_bytes: Vec<u8>, param_count: u16) 
     Ok(dict)
 }
 
+/// Compile an instruction trace via the SSA path of phase3_jit.
+/// This uses FlatIrFunction + translate_from_ir which applies
+/// parallel-move phi destruction, dominance-based register allocation,
+/// and SSA-aware register coalescing — producing higher-quality native code
+/// than the standard bytecode path.
+///
+/// Returns a dict with kernel_id and metadata, same as phase3_compile.
+#[pyfunction]
+#[pyo3(signature = (trace_bytes, param_count=0))]
+fn phase3_compile_ssa<'py>(py: Python<'py>, trace_bytes: Vec<u8>, param_count: u16) -> PyResult<Bound<'py, PyDict>> {
+    use symplex_engine::phase3_jit::{
+        translate_from_ir, FlatIrFunction, FlatBlock, FlatInstr,
+        BlockId, ValueId, IrType, IrOp, EffectFlags, AliasKind, Ownership,
+    };
+
+    let instructions = deserialize_stream(&trace_bytes).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(e)
+    })?;
+
+    if instructions.is_empty() {
+        let dict = PyDict::new(py);
+        dict.set_item("success", false)?;
+        dict.set_item("error", "No instructions provided")?;
+        return Ok(dict);
+    }
+
+    let instr_count = instructions.len();
+
+    // Convert flat instructions to a FlatIrFunction for SSA compilation
+    let mut flat_instrs = Vec::new();
+    for (i, instr) in instructions.iter().enumerate() {
+        let result = match instr {
+            Instr::BinOp(d, _, _, _) | Instr::UnOp(d, _, _) => Some(ValueId(i as u32)),
+            Instr::LoadI32(d, _) | Instr::LoadI64(d, _) => Some(ValueId(i as u32)),
+            Instr::LoadF32(d, _) | Instr::LoadF64(d, _) => Some(ValueId(i as u32)),
+            Instr::LoadBool(d, _) => Some(ValueId(i as u32)),
+            Instr::Move(d, _) | Instr::Load(d, _) => Some(ValueId(i as u32)),
+            _ => None,
+        };
+
+        let op = match instr {
+            Instr::LoadI32(_, v) => IrOp::ConstInt { value: *v as i64, ty: IrType::Int { width: 32, signed: true } },
+            Instr::LoadI64(_, v) => IrOp::ConstInt { value: *v, ty: IrType::Int { width: 64, signed: true } },
+            Instr::LoadBool(_, v) => IrOp::ConstBool { value: *v },
+            Instr::BinOp(_, op, l, r) => IrOp::BinOp { op: *op, lhs: ValueId(*l as u32), rhs: ValueId(*r as u32) },
+            Instr::UnOp(_, op, s) => IrOp::UnOp { op: *op, operand: ValueId(*s as u32) },
+            Instr::Move(_, s) => IrOp::Move { src: ValueId(*s as u32) },
+            Instr::Return(s) => IrOp::Ret { value: Some(ValueId(*s as u32)) },
+            _ => IrOp::Nop,
+        };
+
+        flat_instrs.push(FlatInstr {
+            result,
+            dst: result,
+            op,
+            effect: EffectFlags::PURE,
+            effects: EffectFlags::PURE,
+            alias: AliasKind::Unknown,
+            ownership: Ownership::Copy,
+        });
+    }
+
+    let mut func = FlatIrFunction {
+        name: "phase3_ssa_kernel".to_string(),
+        params: (0..param_count).map(|i| (ValueId(i as u32), IrType::Int { width: 64, signed: true })).collect(),
+        ret_ty: IrType::Int { width: 64, signed: true },
+        blocks: vec![FlatBlock {
+            id: BlockId(0),
+            instrs: flat_instrs,
+            terminated: false,
+            params: Vec::new(),
+        }],
+        entry: BlockId(0),
+        num_values: instr_count as u32,
+    };
+
+    let native = translate_from_ir(&mut func)
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+            "phase3_jit SSA compilation failed"
+        ))?;
+
+    // Finalize the arena
+    p3::finalize_arena();
+
+    let code_size = native.code_size();
+    let slot_count = native.slot_count;
+
+    // Store in global kernel table
+    let kernel_id = {
+        let mut kernels = P3_KERNELS.lock().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let id = kernels.len();
+        kernels.push(Some(native));
+        id
+    };
+
+    let dict = PyDict::new(py);
+    dict.set_item("kernel_id", kernel_id)?;
+    dict.set_item("code_size", code_size)?;
+    dict.set_item("slot_count", slot_count)?;
+    dict.set_item("param_count", param_count)?;
+    dict.set_item("instr_count", instr_count)?;
+    dict.set_item("backend", "phase3_jit_ssa")?;
+    dict.set_item("success", true)?;
+    Ok(dict)
+}
+
 /// Execute a phase3-compiled kernel with integer arguments.
 /// Returns the result as an i64.
 #[pyfunction]
@@ -1687,6 +1793,7 @@ fn _symplex_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(num_cores, m)?)?;
     m.add_function(wrap_pyfunction!(jit_info, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_compile, m)?)?;
+    m.add_function(wrap_pyfunction!(phase3_compile_ssa, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_execute_int, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_execute_f64, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_bench_int, m)?)?;

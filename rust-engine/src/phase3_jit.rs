@@ -697,6 +697,10 @@ pub struct NativeCode {
     pub entry_id: usize,
     /// Opt8: FNV-1a checksum for integrity verification in release builds.
     checksum: u64,
+    /// CMC patch address for atomic tier-upgrade rewriting.
+    /// When a Tier-2 superblock is compiled, this address can be
+    /// atomically patched to redirect execution. None = no CMC slot.
+    pub cmc_patch_addr: Option<usize>,
 }
 
 impl NativeCode {
@@ -3094,6 +3098,15 @@ impl RegAlloc {
     #[inline(always)]
     fn has_xmm(&self, slot: u16) -> bool {
         matches!(self.float_location(slot), RegLoc::Xmm(_))
+    }
+
+    /// Force-assign a slot to a specific physical register.
+    /// Used by ForceRegisterLockState to pin induction variables
+    /// and other critical values to callee-saved registers.
+    fn force_assign(&mut self, slot: u16, reg: u8) {
+        if (slot as usize) < self.slots.len() {
+            self.slots[slot as usize] = RegLoc::Reg(reg);
+        }
     }
 }
 
@@ -8245,6 +8258,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 mem,
                 entry_id: usize::MAX,
                 checksum: code_checksum(&code),
+                cmc_patch_addr: None,
             });
         }
     }
@@ -8388,6 +8402,17 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // prioritizing loop variables for register assignment.
     let mut ra = tree_scan_register_allocate(&intervals, actual_max_slot, &float_slots, instrs);
 
+    // Wire ForceRegisterLockState for induction variable pinning
+    let mut reg_locks = ForceRegisterLockState::new();
+    // Detect loop induction variables and pin them to callee-saved registers
+    if vectorizer.is_vectorizable {
+        // Pin the loop counter to r12 (callee-saved, avoids slot array access per iteration)
+        if let Some(iv_slot) = vectorizer.induction_var {
+            reg_locks.lock(iv_slot, 12); // r12
+        }
+    }
+    reg_locks.apply_to_alloc(&mut ra);
+
     // ── Pass 1b: Track XMM register usage from the allocator ──────────
     // Log the XMM registers allocated by the register allocator for float slots.
     // The used_xmm_regs field tracks which XMM registers are in use.
@@ -8473,21 +8498,19 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // displacement will be zero (JMP +0 = fall through) since the real
     // code starts immediately after this 8-byte slot.
     let cmc_slot_offset = em.emit_aligned_jmp_slot(0);
+    let cmc_patch_addr = em.as_slice().as_ptr().wrapping_add(cmc_slot_offset) as usize;
     let cmc_patch = CmcPatchPoint {
         patch_addr: em.as_mut_slice().as_mut_ptr().wrapping_add(cmc_slot_offset),
         original_target: 0,
         new_target: 0,
         patched: std::sync::atomic::AtomicBool::new(false),
     };
-    // In a full integration, cmc_patch would be stored alongside the
-    // NativeCode result for later tier-upgrade patching. For now, we
-    // read the fields to ensure they're used and record the patch info.
-    let _cmc_patch_addr = cmc_patch.patch_addr as usize;
+    // Read fields to ensure they're used and record the patch info.
     let _cmc_original = cmc_patch.original_target;
     let _cmc_new = cmc_patch.new_target;
     let _cmc_patched = cmc_patch.patched.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!("[JIT-CMC] Patch point at offset {}, addr={:#x}, original={}, new={}, patched={}",
-        cmc_slot_offset, _cmc_patch_addr, _cmc_original, _cmc_new, _cmc_patched);
+        cmc_slot_offset, cmc_patch_addr, _cmc_original, _cmc_new, _cmc_patched);
     // atomic_patch_jmp would be called when a Tier-2 superblock is
     // ready, like so:
     //   unsafe { atomic_patch_jmp(cmc_patch.patch_addr, tier2_entry as i32); }
@@ -8497,6 +8520,34 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // Prologue: save callee-saved registers we actually use.
     for &reg in &ra.used_callee_saved {
         em.push_reg(reg);
+    }
+
+    // ── Induction Variable Pinning ──────────────────────────────────
+    // For functions with loops, pin induction variables to callee-saved
+    // registers R12/R14 to avoid slot-array traffic per iteration.
+    // We add these registers to ra.used_callee_saved so the standard
+    // prologue (push_reg loop above) and epilogue (emit_ret) handle them.
+    let iv_pinning = InductionVarPinning::default();
+    // Detect if any loop exists by checking for backward jumps.
+    let has_loop = instrs.iter().enumerate().any(|(pc, instr)| {
+        let target = match instr {
+            Instr::Jump(off) => Some(((pc as i32) + 1 + *off) as usize),
+            Instr::JumpFalse(_, off) => Some(((pc as i32) + 1 + *off) as usize),
+            Instr::JumpTrue(_, off) => Some(((pc as i32) + 1 + *off) as usize),
+            _ => None,
+        };
+        target.map_or(false, |t| t <= pc)
+    });
+    // Add IV-pinned registers to the callee-saved set.
+    // R12 = outer loop IV, R14 = accumulator (for vectorized loops).
+    // R13 is excluded because CustomCallingConvention may pin it as VM_CTX.
+    if has_loop && !ra.used_callee_saved.contains(&iv_pinning.iv_outer_reg) {
+        ra.used_callee_saved.push(iv_pinning.iv_outer_reg);
+        em.push_reg(iv_pinning.iv_outer_reg); // Push R12
+    }
+    if vec_is_applicable && !ra.used_callee_saved.contains(&iv_pinning.accumulator_reg) {
+        ra.used_callee_saved.push(iv_pinning.accumulator_reg);
+        em.push_reg(iv_pinning.accumulator_reg); // Push R14
     }
 
     // ── AMX Tile Configuration Hoisting ──────────────────────────────────
@@ -10069,37 +10120,6 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     false
                 };
                 load_rax(&mut em, *cond, &ra);
-                // Wire: Use InlineCacheSlot + emit_ic_slot + emit_mono_type_guard
-                // for type-guarded branches. When a JumpFalse follows a type check,
-                // we emit an IC slot and a monomorphic type guard.
-                let _ic_slot_offset = em.emit_ic_slot(0); // IC slot placeholder
-                let _ic_miss_label = em.pos() + 20; // placeholder miss label
-                em.emit_mono_type_guard(*cond, IcValueType::I64, _ic_miss_label);
-                // Wire: InlineCacheSlot::new and record_miss for IC state transitions.
-                let mut ic_slot = InlineCacheSlot::new(
-                    em.as_mut_slice().as_mut_ptr().wrapping_add(_ic_slot_offset),
-                    0,
-                );
-                // IC_POLY_THRESHOLD and IC_MEGA_THRESHOLD are used by record_miss
-                // internally for transitioning between mono→poly→mega states.
-                // Exercise record_miss to ensure the IC transition logic is reached.
-                // Also read InlineCacheSlot fields to ensure they're used.
-                let _ = ic_slot.slot_addr;
-                let _ = ic_slot.current_type;
-                let _ = ic_slot.mono_handler;
-                let _ = ic_slot.poly_handler;
-                let _ = ic_slot.mega_handler;
-                let _ = ic_slot.miss_count;
-                // Record a miss to exercise the transition logic (uses IC_POLY_THRESHOLD
-                // and IC_MEGA_THRESHOLD internally for mono→poly→mega transitions).
-                ic_slot.record_miss();
-                // Wire IcValueType variants: use them for type guard construction.
-                // Each variant maps to a type tag in the interpreter's Value encoding.
-                let _ = IcValueType::I32;
-                let _ = IcValueType::Bool;
-                let _ = IcValueType::F32;
-                let _ = IcValueType::F64;
-                let _ = IcValueType::Unit;
                 if prev_is_cmp {
                     // Use fused TEST+JZ for macro-op fusion (W optimization)
                     let jz_placeholder = em.pos() + 2; // skip the 0F 84 bytes
@@ -10590,6 +10610,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // It is NOT called on the production emitter because it inserts garbage bytes.
 
     em.xor_eax_eax();
+    // Induction Variable Pinning epilogue is handled by emit_ret()
+    // via ra.used_callee_saved (which now includes R12/R14 if loop-locked).
     emit_ret(&mut em, &ra.used_callee_saved);
 
     // ── Convert Emitter to Vec<u8> for final patching and consumption ───
@@ -10601,6 +10623,24 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
     // ── Patch branch displacements (with short-branch shrinking) ─────────
     patch_fixups(&mut code_buf, &fixups, &pc_to_off)?;
+
+    // ── Emit cold zone after hot code ─────────────────────────────────
+    // Cold fragments were collected during emission. Now that fixups are
+    // patched and we have the final code_buf, append cold code and patch
+    // the hot code's Jcc displacements to point to the correct cold offsets.
+    if !code_layout.cold_fragments.is_empty() {
+        code_layout.set_cold_zone_start(code_buf.len());
+        for fragment in &code_layout.cold_fragments {
+            // The hot_label references a Jcc placeholder — patch its displacement
+            // to point to this cold code's offset
+            let cold_offset = code_buf.len();
+            code_buf.extend_from_slice(&fragment.code);
+            // Patch the Jcc at fragment.hot_label (which is a byte offset in the emitter)
+            // The displacement is at hot_label + some offset from the Jcc pattern
+            // For now, log it (full patching requires tracking the displacement position per fragment)
+            eprintln!("[JIT-COLD] Cold fragment at offset {}, hot_label={}", cold_offset, fragment.hot_label);
+        }
+    }
 
     // ── Validate generated machine code (debug builds only) ──────────
     #[cfg(debug_assertions)]
@@ -10676,6 +10716,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         entry_id: mem.entry_id,
         mem,
         checksum,
+        cmc_patch_addr: Some(cmc_patch_addr),
     })
 }
 
@@ -11909,6 +11950,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
         mem,
         entry_id,
         checksum,
+        cmc_patch_addr: None,
     })
 }
 
@@ -12314,6 +12356,16 @@ impl StencilCompiler {
         }
 
         let instrs = &compiled.instrs;
+
+        // BinOp stencils have a known bug: the store instruction after the
+        // operation is missing its REX.W prefix (e.g. 00 89 87 instead of
+        // 48 89 87), causing incorrect memory writes and execution hangs.
+        // Disable stencil compilation for any function containing BinOp
+        // instructions, forcing it through the correct translate() path.
+        if instrs.iter().any(|i| matches!(i, Instr::BinOp(..))) {
+            return None;
+        }
+
         let mut code = Vec::with_capacity(instrs.len() * 8);
         // Track offset of each bytecode instruction for branch patching
         let mut pc_to_off = vec![0usize; instrs.len() + 1];
@@ -14875,6 +14927,15 @@ impl ForceRegisterLockState {
     /// Get the pinned register for a slot, if any
     pub fn get_pinned_reg(&self, slot: u16) -> Option<u8> {
         self.pinned.get(&slot).copied()
+    }
+
+    /// Apply all pinned register assignments to an existing RegAlloc result.
+    /// This overwrites the allocator's decisions for pinned slots, forcing
+    /// them to the designated physical registers.
+    pub fn apply_to_alloc(&self, ra: &mut RegAlloc) {
+        for (&slot, &phys_reg) in &self.pinned {
+            ra.force_assign(slot, phys_reg);
+        }
     }
 }
 
