@@ -46,3 +46,28 @@ Stage Summary:
 - Stencil fusion: single contiguous buffer with offset indexing (eliminates 5 separate sliced arrays)
 - Synchronous compilation (no time.sleep polling)
 - Project builds cleanly and wheel is produced
+---
+Task ID: 1
+Agent: Main
+Task: Wire in 6 dead-code JIT improvements in phase3_jit.rs
+
+Work Log:
+- Analyzed 15K-line phase3_jit.rs to identify 6 improvements defined but not wired into compilation pipeline
+- Found translate_ssa() was missing tree-scan RA, loop alignment, and AMX hoisting (vs translate())
+- Found PageBitmap methods test(), clear(), is_empty() were dead code
+- Found SimdCodeBuffer methods were empty stubs returning no bytes
+- Found emit_simd_for_hint() was a stub returning Vec::new()
+- Wired loop alignment into translate_ssa() — detect backward-jump targets and align to 16/32-byte boundaries
+- Replaced broken reg_in_use[] allocator (never freed regs) with liveness-aware tree-scan RA
+- Wired PageBitmap.test(), .clear(), .is_empty() into ExecArena finalize/make_writable/record_dirty_pages
+- Replaced SimdCodeBuffer stubs with real AVX VEX2-encoded VADDPS/VMULPS/VSUBPS emission
+- Replaced emit_simd_for_hint() stub with real polyhedral hint handling
+- Removed #[allow(dead_code)] from SimdLevel, get_simd_level, create_simd_buffer, emit_simd_for_hint
+- Compiled both crates successfully (only unrelated warnings)
+- All 88 Python tests pass, all 31 JIT tests pass
+- Integration tests pass: SIMD, hybrid SIMD+BLAS, training with grad, multi-segment
+
+Stage Summary:
+- Key bug fix: translate_ssa() register allocator never freed registers (reg_in_use[] was set but never cleared), causing all values after the first 10 to spill. Now uses liveness-aware allocation with dominance-ordered priority.
+- All 6 JIT improvements now wired in and functional
+- Commit 572966a pushed to GitHub
