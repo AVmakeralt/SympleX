@@ -37,3 +37,5 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
+skills/
+symplex-venv/
