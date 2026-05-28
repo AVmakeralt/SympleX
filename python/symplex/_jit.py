@@ -505,7 +505,11 @@ def _detect_simple_pattern(trace, allocator, arg_shapes=None):
 
 
 def _build_arg_slot_map(allocator):
-    """Build a mapping from slot index -> argument index."""
+    """Build a mapping from slot index -> argument index.
+
+    Returns {slot_index: arg_index}. For the inverse mapping
+    (arg_index -> slot_index), use _build_slot_for_arg_map().
+    """
     arg_slots = {}
     for slot, tv in allocator._slots.items():
         if tv.name.startswith("arg"):
@@ -514,6 +518,23 @@ def _build_arg_slot_map(allocator):
             except ValueError:
                 pass
     return arg_slots
+
+
+def _build_slot_for_arg_map(allocator):
+    """Build a mapping from argument index -> slot index.
+
+    Returns {arg_index: slot_index} so that inputs[i] can be loaded
+    into the correct slot via slots[slot_for_arg[i]].
+    """
+    slot_for_arg = {}
+    for slot, tv in allocator._slots.items():
+        if tv.name.startswith("arg"):
+            try:
+                arg_index = int(tv.name[3:])
+                slot_for_arg[arg_index] = slot
+            except ValueError:
+                pass
+    return slot_for_arg
 
 
 def _contains_matmul(trace):
@@ -985,7 +1006,7 @@ def _create_segmented_phase3_executor(trace, allocator, phase3_segments_info):
 
     The executor manages the slot state and passes data between segments.
     """
-    arg_slot_map = _build_arg_slot_map(allocator)
+    arg_slot_map = _build_slot_for_arg_map(allocator)
 
     # Pre-compute the execution plan for the hybrid executor
     # (matmul steps + other steps that don't go through Phase 3)
@@ -1258,7 +1279,7 @@ def _create_fused_elementwise_executor(trace, allocator):
     in a single cache-friendly pass over data), which can beat NumPy by
     2-3x for memory-bound elementwise chains by eliminating temporaries.
     """
-    arg_slot_map = _build_arg_slot_map(allocator)
+    arg_slot_map = _build_slot_for_arg_map(allocator)
     
     # Pre-compute a flat execution plan
     # Each step is: (op_type, dst_slot, op, src_slots...)
@@ -1592,7 +1613,7 @@ class JitFunction:
 
                 ops = _info["ops"]
                 raw_instrs = _info["raw_instrs"]
-                arg_slot_map = _build_arg_slot_map(_alloc)
+                arg_slot_map = _build_slot_for_arg_map(_alloc)
 
                 # Load input arrays into slot dict
                 slots = {}
@@ -1683,7 +1704,7 @@ class JitFunction:
             allocator = self._allocator
 
             # Build a hybrid executor with SIMD elementwise + BLAS matmul
-            arg_slot_map = _build_arg_slot_map(allocator)
+            arg_slot_map = _build_slot_for_arg_map(allocator)
 
             def _phase3_hybrid_fast_path(inputs, _plan=hybrid_plan, _alloc=allocator,
                                          _arg_slot_map=arg_slot_map):
@@ -1722,6 +1743,28 @@ class JitFunction:
                         ops = simd_info["ops"]
                         input_slots = simd_info["input_slots"]
                         output_slot = simd_info["output_slot"]
+                        raw_instrs = simd_info.get("raw_instrs", [])
+
+                        # Process load instructions (constants) before SIMD ops.
+                        # This is critical: without it, slots for load_f64/load_f32
+                        # are never populated, so slots.get(slot, 0) returns 0,
+                        # causing the entire SIMD result to be zeroed out.
+                        for instr in raw_instrs:
+                            if instr[0] == "load_f64":
+                                _, slot, val = instr
+                                slots[slot] = float(val)
+                            elif instr[0] == "load_f32":
+                                _, slot, val = instr
+                                slots[slot] = float(val)
+                            elif instr[0] == "load_i64":
+                                _, slot, val = instr
+                                slots[slot] = int(val)
+                            elif instr[0] == "load_i32":
+                                _, slot, val = instr
+                                slots[slot] = int(val)
+                            elif instr[0] == "load_bool":
+                                _, slot, val = instr
+                                slots[slot] = bool(val)
 
                         # Execute each binop in the chain using SIMD
                         for op_str, lhs_slot, rhs_slot, dst_slot in ops:
@@ -2016,15 +2059,50 @@ class JitFunction:
                 break
 
         if n_elements is None:
-            # Scalar inputs — use the scalar execution path
-            from ._symplex_core import phase3_execute_f64
-            arg_values = []
-            for inp in inputs:
-                if isinstance(inp, np.ndarray):
-                    arg_values.append(float(inp.flat[0]))
-                else:
-                    arg_values.append(float(inp))
-            result = phase3_execute_f64(self._phase3_kernel_id, arg_values)
+            # Scalar inputs — use the fused NumPy executor instead of
+            # the Phase3 JIT kernel, which emits integer arithmetic on
+            # float bit patterns and produces NaN/overflow for f64.
+            arg_slot_map = _build_slot_for_arg_map(self._allocator)
+            slots = {}
+            for i, inp in enumerate(inputs):
+                val = float(inp.flat[0]) if isinstance(inp, np.ndarray) else float(inp)
+                s = arg_slot_map.get(i)
+                if s is not None:
+                    slots[s] = val
+
+            # Execute the trace using NumPy dispatch (safe for all dtypes)
+            binop_dispatch = _BINOP_DISPATCH
+            unop_dispatch = _UNOP_DISPATCH
+            for instr in self._trace:
+                op = instr[0]
+                if op == "binop":
+                    _, dst, binop, lhs, rhs = instr
+                    fn = binop_dispatch.get(binop)
+                    if fn is not None:
+                        slots[dst] = fn(slots.get(lhs, 0), slots.get(rhs, 0))
+                    elif binop == "matmul":
+                        slots[dst] = np.matmul(slots.get(lhs, 0), slots.get(rhs, 0))
+                elif op == "unop":
+                    _, dst, unop, src = instr
+                    fn = unop_dispatch.get(unop)
+                    if fn is not None:
+                        slots[dst] = fn(slots.get(src, 0))
+                elif op in ("load_f64", "load_f32"):
+                    _, slot, val = instr
+                    slots[slot] = float(val)
+                elif op in ("load_i64", "load_i32"):
+                    _, slot, val = instr
+                    slots[slot] = int(val)
+                elif op == "load_bool":
+                    _, slot, val = instr
+                    slots[slot] = bool(val)
+                elif op == "move":
+                    _, dst, src = instr
+                    slots[dst] = slots.get(src, 0)
+
+            result = slots.get(0, 0.0)
+            if isinstance(result, np.ndarray):
+                return DeviceArray._wrap(result)
             return DeviceArray._wrap(np.array(result))
 
         # Build input pointer list based on arg-slot mapping
