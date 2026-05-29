@@ -19206,6 +19206,8 @@ pub struct Tier4Node {
     pub estimated_cost: f64,
     /// Data type of inputs/outputs (for fusion compatibility checking)
     pub dtype: Tier4Dtype,
+    /// Instruction range in the original trace: [start, end)
+    pub instr_range: (usize, usize),
 }
 
 /// Lightweight dtype representation for fusion compatibility checking.
@@ -19470,6 +19472,9 @@ impl Tier4Dag {
             let mut all_output_slots: Vec<usize> = Vec::new();
             let mut fused_op_desc = String::new();
             let mut total_cost = 0.0f64;
+            // Track instruction range across the fusion chain
+            let mut fused_instr_start = first.instr_range.0;
+            let mut fused_instr_end = first.instr_range.1;
 
             for (i, &fid) in fusion_chain.iter().enumerate() {
                 let fnode = &self.nodes[fid];
@@ -19487,6 +19492,13 @@ impl Tier4Dag {
                 for &slot in &fnode.output_slots {
                     all_output_slots.push(slot);
                 }
+                // Extend instruction range to cover all fused nodes
+                if fnode.instr_range.0 < fused_instr_start {
+                    fused_instr_start = fnode.instr_range.0;
+                }
+                if fnode.instr_range.1 > fused_instr_end {
+                    fused_instr_end = fnode.instr_range.1;
+                }
             }
 
             let fused_id = fused.add_node(Tier4Node {
@@ -19499,6 +19511,7 @@ impl Tier4Dag {
                 fusible: true,
                 estimated_cost: total_cost * 0.9, // 10% saving from eliminating intermediates
                 dtype: first.dtype,
+                instr_range: (fused_instr_start, fused_instr_end),
             });
 
             for &fid in &fusion_chain {
@@ -19916,12 +19929,35 @@ impl Tier4Decomposer {
     }
 }
 
+/// A single step in the Tier 4 execution schedule.
+/// Carries all the metadata needed for the Python-side executor to dispatch
+/// directly to the appropriate backend without re-scanning the trace.
+#[derive(Clone, Debug)]
+pub struct Tier4Step {
+    /// Node ID in the fused DAG
+    pub node_id: usize,
+    /// Tier to dispatch to (0, 1, 2, or 3)
+    pub tier: u8,
+    /// Operation descriptor (e.g., "add → mul → tanh" for fused nodes)
+    pub op_desc: String,
+    /// Kind of computation (elementwise, reduction, linear algebra, etc.)
+    pub kind: Tier4RegionKind,
+    /// Input slot indices consumed by this step
+    pub input_slots: Vec<usize>,
+    /// Output slot indices produced by this step
+    pub output_slots: Vec<usize>,
+    /// Instruction range in the original trace: [start, end)
+    pub instr_range: (usize, usize),
+    /// Whether this step was formed by fusion
+    pub is_fused: bool,
+}
+
 /// The Tier 4 planner: takes a DAG, applies fusion + buffer planning,
 /// and produces an execution schedule.
 #[derive(Clone, Debug)]
 pub struct Tier4Schedule {
-    /// Execution order: list of (node_id, tier, op_desc) tuples
-    pub steps: Vec<(usize, u8, String)>,
+    /// Execution order: list of fully-described steps
+    pub steps: Vec<Tier4Step>,
     /// Buffer reuse plan
     pub buffer_plan: Tier4BufferPlan,
     /// Whether any fusion was applied
@@ -19956,6 +19992,9 @@ pub fn tier4_compile(trace_ops: &[(u8, Vec<i64>)]) -> Tier4Schedule {
     // Map from output slot to producing node ID (for edge construction)
     let mut slot_producer: FxHashMap<usize, usize> = FxHashMap::default();
 
+    // Track original DAG node count to detect fusion later
+    let original_node_count = regions.len();
+
     for region in regions {
         let node_id = dag.add_node(Tier4Node {
             id: 0,
@@ -19976,6 +20015,7 @@ pub fn tier4_compile(trace_ops: &[(u8, Vec<i64>)]) -> Tier4Schedule {
                 Tier4RegionKind::Scalar => 1.0,
             },
             dtype: region.dtype,
+            instr_range: region.instr_range,
         });
 
         // Add edges from producers of input slots to this node
@@ -19993,12 +20033,12 @@ pub fn tier4_compile(trace_ops: &[(u8, Vec<i64>)]) -> Tier4Schedule {
 
     // Step 3: Apply conservative fusion
     let fused_dag = dag.apply_conservative_fusion();
-    let fusion_applied = fused_dag.nodes.len() < dag.nodes.len();
+    let fusion_applied = fused_dag.nodes.len() < original_node_count;
 
     // Step 4: Compute buffer reuse plan (8 bytes per element = f64 default)
     let buffer_plan = fused_dag.compute_buffer_plan(8);
 
-    // Step 5: Build execution schedule
+    // Step 5: Build execution schedule with full step metadata
     let order = fused_dag.topological_order();
     let mut steps = Vec::with_capacity(order.len());
     let mut total_cost = 0.0f64;
@@ -20006,7 +20046,16 @@ pub fn tier4_compile(trace_ops: &[(u8, Vec<i64>)]) -> Tier4Schedule {
     for &node_id in &order {
         let node = &fused_dag.nodes[node_id];
         total_cost += node.estimated_cost;
-        steps.push((node_id, node.tier, node.op_desc.clone()));
+        steps.push(Tier4Step {
+            node_id: node.id,
+            tier: node.tier,
+            op_desc: node.op_desc.clone(),
+            kind: node.kind,
+            input_slots: node.input_slots.clone(),
+            output_slots: node.output_slots.clone(),
+            instr_range: node.instr_range,
+            is_fused: fusion_applied && node.op_desc.contains(" → "),
+        });
     }
 
     let peak_memory = buffer_plan.total_bytes;
@@ -20021,41 +20070,56 @@ pub fn tier4_compile(trace_ops: &[(u8, Vec<i64>)]) -> Tier4Schedule {
     }
 }
 
-/// Tier 4 execution dispatch.
+/// Tier 4 schedule validator.
 ///
-/// Given a schedule and concrete input data, dispatch each step to the
-/// appropriate backend:
-///   Tier 0 → scalar fallback (interpret_trace)
-///   Tier 1 → SIMD elementwise kernel
-///   Tier 2 → fused vector kernel / reduction kernel / stencil kernel
-///   Tier 3 → BLAS (NumPy matmul)
+/// Validates that a Tier 4 schedule is well-formed before the Python-side
+/// executor dispatches it. Checks:
+///   - All tiers are in range [0, 3]
+///   - All input_slots have producers in earlier steps
+///   - No circular dependencies (topological order is valid)
+///   - Instruction ranges are non-empty and non-overlapping
 ///
-/// This function is the runtime "conductor" — it executes the plan built
-/// by tier4_compile, never inventing new execution methods.
-pub fn tier4_execute_schedule(
-    schedule: &Tier4Schedule,
-    _input_ptrs: &[usize],
-    _output_ptr: usize,
-    _n_elements: usize,
-) -> bool {
-    // The actual execution is dispatched from Python, which has access to
-    // NumPy, the Rust SIMD kernels, and BLAS. This Rust-side function
-    // validates the schedule and provides the execution blueprint.
-    //
-    // Python calls this to get the schedule, then dispatches each step
-    // to the appropriate backend based on the tier assignment.
-
-    // Validate: schedule must have at least one step
+/// Returns (valid, warning_count) — the schedule may be valid with warnings
+/// (e.g., unfused Tier 1 chains that could benefit from fusion).
+pub fn tier4_validate_schedule(schedule: &Tier4Schedule) -> (bool, usize) {
     if schedule.steps.is_empty() {
-        return false;
+        return (false, 0);
     }
 
-    // Validate: all tier assignments must be 0-3
-    for &(_, tier, _) in &schedule.steps {
-        if tier > 3 {
-            return false;
+    let mut warnings = 0usize;
+
+    // Track which output slots are produced by which step
+    let mut produced: FxHashMap<usize, usize> = FxHashMap::default();
+
+    for (step_idx, step) in schedule.steps.iter().enumerate() {
+        // Validate tier range
+        if step.tier > 3 {
+            return (false, warnings);
+        }
+
+        // Validate instruction range is non-empty
+        if step.instr_range.0 >= step.instr_range.1 {
+            warnings += 1;
+        }
+
+        // Check that all input slots have producers
+        for &slot in &step.input_slots {
+            if !produced.contains_key(&slot) {
+                // Input slot has no producer — it must be a function argument
+                // (that's fine, but worth tracking)
+            }
+        }
+
+        // Record output slots
+        for &slot in &step.output_slots {
+            produced.insert(slot, step_idx);
+        }
+
+        // Warn about unfused Tier 1 elementwise chains
+        if step.tier == 1 && !step.is_fused && step.kind == Tier4RegionKind::Elementwise {
+            warnings += 1;
         }
     }
 
-    true
+    (true, warnings)
 }

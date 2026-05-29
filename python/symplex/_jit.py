@@ -1239,6 +1239,71 @@ _T4_OPCODE_MAP = {
 }
 
 
+def _tier4_should_orchestrate(trace):
+    """Check if a trace should use Tier 4 orchestration as the primary executor.
+
+    Tier 4 is preferred when the trace contains operations that Phase 3's
+    SIMD elementwise kernels don't support:
+      - Transcendental unops (tanh, sigmoid, exp, log, sin, cos)
+      - Comparison/logical ops (lt, le, gt, ge, eq, ne, and, or, xor)
+      - Unsupported binops (rem, mod, shl, shr)
+      - Mixed-mode traces with multiple operation categories
+
+    Returns True if Tier 4 should be tried BEFORE Phase3 SIMD compilation,
+    because Phase3 would fail anyway and Tier 4 provides better dispatch.
+    """
+    _T4_PREFERRED_BINOPS = {"rem", "mod", "shl", "shr", "and", "or", "xor"}
+    _T4_PREFERRED_UNOPS = {"sin", "cos", "exp", "log", "tanh", "sigmoid"}
+
+    has_t4_binop = False
+    has_t4_unop = False
+    has_elementwise = False
+    has_matmul = False
+    has_reduction = False
+    op_categories = 0
+
+    for instr in trace:
+        op = instr[0]
+        if op == "binop":
+            _, _, binop, _, _ = instr[:5]
+            if binop in _T4_PREFERRED_BINOPS:
+                has_t4_binop = True
+            elif binop in ("lt", "le", "gt", "ge", "eq", "ne"):
+                has_t4_binop = True
+            elif binop == "matmul":
+                has_matmul = True
+            else:
+                has_elementwise = True
+        elif op == "unop":
+            _, _, unop_name, _ = instr[:4]
+            if unop_name in _T4_PREFERRED_UNOPS:
+                has_t4_unop = True
+            else:
+                has_elementwise = True
+        elif op == "reduce":
+            has_reduction = True
+
+    # Count how many distinct operation categories are present
+    if has_t4_binop or has_t4_unop:
+        op_categories += 1
+    if has_elementwise:
+        op_categories += 1
+    if has_matmul:
+        op_categories += 1
+    if has_reduction:
+        op_categories += 1
+
+    # Tier 4 is preferred if:
+    # 1. Trace has ops that Phase3 SIMD can't handle (transcendentals, logical)
+    # 2. Trace has multiple operation categories (mixed-mode)
+    if has_t4_binop or has_t4_unop:
+        return True
+    if op_categories >= 2:
+        return True
+
+    return False
+
+
 def _tier4_serialize_trace(trace, allocator):
     """Serialize a Python trace into (opcode, operands) pairs for the Rust engine.
 
@@ -1313,7 +1378,7 @@ def _tier4_create_executor(trace, allocator):
     except Exception:
         return None
 
-    if not plan.get("steps"):
+    if plan.get("error") or not plan.get("steps"):
         return None
 
     # Step 3: Build arg-slot mapping for runtime dispatch
@@ -1325,18 +1390,53 @@ def _tier4_create_executor(trace, allocator):
             except ValueError:
                 pass
 
+    # Step 4: Pre-build instruction index → trace instruction mapping
+    # Each step's instr_range tells us which trace instructions it covers.
+    # We slice the trace accordingly so the executor only processes the
+    # relevant instructions per step — no re-scanning the whole trace.
+    steps = plan["steps"]
+    for step in steps:
+        start, end = step["instr_range"]
+        # Clamp to trace bounds
+        step["_instrs"] = trace[start:end]
+
+    # Step 5: Build slot→arg reverse map (which input arrays map to which slots)
+    slot_to_arg = {}
+    for arg_idx, slot in arg_slot_map.items():
+        slot_to_arg[slot] = arg_idx
+
     # Pre-analyze the plan for dispatch decisions
-    has_blas = any(step["tier"] == 3 for step in plan["steps"])
+    has_blas = any(step["tier"] == 3 for step in steps)
+    has_reduction = any(step["kind"] == "reduction" for step in steps)
     fusion_applied = plan.get("fusion_applied", False)
 
-    # Step 4: Create the executor that dispatches to existing backends
+    # Try to load Rust SIMD kernels for Tier 1/2 dispatch
+    simd_elem_fn = None
+    simd_reduce_fn = None
+    try:
+        from ._symplex_core import simd_elementwise_f64, simd_reduce_f64
+        simd_elem_fn = simd_elementwise_f64
+        simd_reduce_fn = simd_reduce_f64
+    except ImportError:
+        pass
+
+    # Step 6: Create the executor that dispatches to existing backends
+    # Track which slots contain user-provided input arrays (never mutate these)
+    input_slot_set = set(arg_slot_map.values())
+
     def _tier4_exec(inputs, _trace=trace, _alloc=allocator, _plan=plan,
-                    _arg_map=arg_slot_map, _has_blas=has_blas):
+                    _arg_map=arg_slot_map, _slot_to_arg=slot_to_arg,
+                    _has_blas=has_blas, _steps=steps,
+                    _simd_elem=simd_elem_fn, _simd_reduce=simd_reduce_fn,
+                    _input_slots=input_slot_set):
         """Execute the Tier 4 schedule by dispatching to existing backends.
 
         This is the conductor: it reads the plan and dispatches each step
         to the appropriate Tier 1/2/3 kernel. It never invents new
         execution methods — only calls existing ones.
+
+        Key design: each step has its own instr_range, so we only process
+        the relevant trace instructions for that step — no full-trace scan.
         """
         slots = {}
         slots_get = slots.get
@@ -1352,146 +1452,44 @@ def _tier4_create_executor(trace, allocator):
                 slots[s] = arr
 
         # Execute each step in the planned order
-        for step in _plan["steps"]:
+        for step in _steps:
             tier = step["tier"]
+            kind = step["kind"]
             op_desc = step["op_desc"]
+            instrs = step.get("_instrs", [])
+            input_slots = step.get("input_slots", [])
+            output_slots = step.get("output_slots", [])
 
             if tier == 3:
                 # Tier 3: BLAS (matmul)
                 # Delegate to NumPy's BLAS backend — never use JIT loops
-                if "matmul" in op_desc:
-                    # Find the matmul instruction in the trace
-                    for instr in _trace:
-                        if instr[0] == "binop" and instr[2] == "matmul":
-                            _, dst, _, lhs, rhs = instr
-                            lhs_val = slots_get(lhs, 0)
-                            rhs_val = slots_get(rhs, 0)
-                            if isinstance(lhs_val, DeviceArray):
-                                lhs_val = lhs_val._data
-                            if isinstance(rhs_val, DeviceArray):
-                                rhs_val = rhs_val._data
-                            slots[dst] = np.matmul(lhs_val, rhs_val)
+                _tier4_dispatch_blas(instrs, slots, slots_get)
 
             elif tier == 2:
                 # Tier 2: Fused vector / reduction / stencil / transcendental
-                # Check for reduction patterns
-                if any(r in op_desc for r in ("sum", "max", "min")):
-                    for instr in _trace:
-                        if instr[0] == "reduce":
-                            _, dst, reduce_name, src = instr
-                            src_val = slots_get(src, 0)
-                            if isinstance(src_val, DeviceArray):
-                                src_val = src_val._data
-                            reduce_fn = _REDUCE_DISPATCH.get(reduce_name)
-                            if reduce_fn is not None:
-                                slots[dst] = reduce_fn(src_val)
-                elif "tanh" in op_desc or "sigmoid" in op_desc or "exp" in op_desc:
-                    # Transcendental: use NumPy's optimized implementations
-                    for instr in _trace:
-                        if instr[0] == "unop":
-                            _, dst, unop_name, src = instr
-                            if unop_name in _UNOP_DISPATCH:
-                                src_val = slots_get(src, 0)
-                                if isinstance(src_val, DeviceArray):
-                                    src_val = src_val._data
-                                slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
+                if kind == "reduction":
+                    _tier4_dispatch_reduction(instrs, slots, slots_get,
+                                             _simd_reduce)
+                elif kind == "transcendental":
+                    _tier4_dispatch_transcendental(instrs, slots, slots_get)
+                elif kind == "fma_chain" or step.get("is_fused", False):
+                    # Fused elementwise chain: execute in sequence, reusing buffers
+                    _tier4_dispatch_fused_elementwise(instrs, slots, slots_get,
+                                                      _simd_elem, _input_slots)
                 else:
-                    # Fused elementwise chain: use NumPy vectorized ops
-                    for instr in _trace:
-                        op = instr[0]
-                        if op == "binop":
-                            _, dst, binop, lhs, rhs = instr
-                            if binop == "matmul":
-                                continue  # handled by Tier 3
-                            lhs_val = slots_get(lhs, 0)
-                            rhs_val = slots_get(rhs, 0)
-                            if isinstance(lhs_val, DeviceArray):
-                                lhs_val = lhs_val._data
-                            if isinstance(rhs_val, DeviceArray):
-                                rhs_val = rhs_val._data
-                            fn = _BINOP_DISPATCH.get(binop)
-                            if fn is not None:
-                                slots[dst] = fn(lhs_val, rhs_val)
-                        elif op == "unop":
-                            _, dst, unop_name, src = instr
-                            if unop_name in _UNOP_DISPATCH:
-                                src_val = slots_get(src, 0)
-                                if isinstance(src_val, DeviceArray):
-                                    src_val = src_val._data
-                                slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
-                        elif op == "load_f64" or op == "load_f32":
-                            _, slot, val = instr
-                            slots[slot] = float(val)
-                        elif op == "move":
-                            _, dst, src = instr
-                            slots[dst] = slots_get(src, 0)
-                        elif op == "store":
-                            _, dst, src = instr
-                            slots[dst] = slots_get(src, 0)
+                    # Generic Tier 2: elementwise with NumPy fallback
+                    _tier4_dispatch_elementwise(instrs, slots, slots_get,
+                                                _simd_elem)
 
             elif tier == 1:
-                # Tier 1: SIMD elementwise — use NumPy vectorized ops
-                for instr in _trace:
-                    op = instr[0]
-                    if op == "binop":
-                        _, dst, binop, lhs, rhs = instr
-                        lhs_val = slots_get(lhs, 0)
-                        rhs_val = slots_get(rhs, 0)
-                        if isinstance(lhs_val, DeviceArray):
-                            lhs_val = lhs_val._data
-                        if isinstance(rhs_val, DeviceArray):
-                            rhs_val = rhs_val._data
-                        fn = _BINOP_DISPATCH.get(binop)
-                        if fn is not None:
-                            slots[dst] = fn(lhs_val, rhs_val)
-                    elif op == "unop":
-                        _, dst, unop_name, src = instr
-                        src_val = slots_get(src, 0)
-                        if isinstance(src_val, DeviceArray):
-                            src_val = src_val._data
-                        if unop_name in _UNOP_DISPATCH:
-                            slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
-                    elif op == "load_f64" or op == "load_f32":
-                        _, slot, val = instr
-                        slots[slot] = float(val)
-                    elif op == "move":
-                        _, dst, src = instr
-                        slots[dst] = slots_get(src, 0)
-                    elif op == "store":
-                        _, dst, src = instr
-                        slots[dst] = slots_get(src, 0)
+                # Tier 1: SIMD elementwise — use Rust SIMD kernels if available,
+                # otherwise NumPy vectorized ops
+                _tier4_dispatch_elementwise(instrs, slots, slots_get,
+                                            _simd_elem)
 
             elif tier == 0:
                 # Tier 0: Scalar fallback — interpret individual operations
-                for instr in _trace:
-                    op = instr[0]
-                    if op == "binop":
-                        _, dst, binop, lhs, rhs = instr
-                        lhs_val = slots_get(lhs, 0)
-                        rhs_val = slots_get(rhs, 0)
-                        if isinstance(lhs_val, DeviceArray):
-                            lhs_val = lhs_val._data
-                        if isinstance(rhs_val, DeviceArray):
-                            rhs_val = rhs_val._data
-                        fn = _BINOP_DISPATCH.get(binop)
-                        if fn is not None:
-                            slots[dst] = fn(lhs_val, rhs_val)
-                    elif op == "unop":
-                        _, dst, unop_name, src = instr
-                        src_val = slots_get(src, 0)
-                        if isinstance(src_val, DeviceArray):
-                            src_val = src_val._data
-                        if unop_name in _UNOP_DISPATCH:
-                            slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
-                    elif op in ("load_f64", "load_f32"):
-                        _, slot, val = instr
-                        slots[slot] = float(val)
-                    elif op == "move":
-                        _, dst, src = instr
-                        slots[dst] = slots_get(src, 0)
-                    elif op == "store":
-                        _, dst, src = instr
-                        slots[dst] = slots_get(src, 0)
+                _tier4_dispatch_scalar(instrs, slots, slots_get)
 
         # Return value is in slot 0
         result = slots.get(0)
@@ -1502,6 +1500,247 @@ def _tier4_create_executor(trace, allocator):
         return None
 
     return _tier4_exec
+
+
+def _tier4_dispatch_blas(instrs, slots, slots_get):
+    """Dispatch Tier 3 BLAS operations (matmul) to NumPy's BLAS backend."""
+    for instr in instrs:
+        op = instr[0]
+        if op == "binop" and len(instr) >= 5:
+            _, dst, binop, lhs, rhs = instr[:5]
+            if binop == "matmul":
+                lhs_val = slots_get(lhs, 0)
+                rhs_val = slots_get(rhs, 0)
+                if isinstance(lhs_val, DeviceArray):
+                    lhs_val = lhs_val._data
+                if isinstance(rhs_val, DeviceArray):
+                    rhs_val = rhs_val._data
+                if isinstance(lhs_val, np.ndarray) and isinstance(rhs_val, np.ndarray):
+                    slots[dst] = np.matmul(lhs_val, rhs_val)
+            else:
+                # Non-matmul binop in a BLAS region — execute as elementwise
+                lhs_val = slots_get(lhs, 0)
+                rhs_val = slots_get(rhs, 0)
+                if isinstance(lhs_val, DeviceArray):
+                    lhs_val = lhs_val._data
+                if isinstance(rhs_val, DeviceArray):
+                    rhs_val = rhs_val._data
+                fn = _BINOP_DISPATCH.get(binop)
+                if fn is not None:
+                    slots[dst] = fn(lhs_val, rhs_val)
+        elif op in ("load_f64", "load_f32"):
+            _, slot, val = instr[:3]
+            slots[slot] = float(val)
+        elif op == "move":
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
+
+
+def _tier4_dispatch_reduction(instrs, slots, slots_get, simd_reduce_fn):
+    """Dispatch Tier 2 reduction operations."""
+    for instr in instrs:
+        op = instr[0]
+        if op == "reduce" and len(instr) >= 4:
+            _, dst, reduce_name, src = instr[:4]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            reduce_fn = _REDUCE_DISPATCH.get(reduce_name)
+            if reduce_fn is not None:
+                slots[dst] = reduce_fn(src_val)
+        elif op == "binop" and len(instr) >= 5:
+            # Reduction region may contain elementwise ops too
+            _, dst, binop, lhs, rhs = instr[:5]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op in ("load_f64", "load_f32"):
+            _, slot, val = instr[:3]
+            slots[slot] = float(val)
+        elif op == "move":
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
+
+
+def _tier4_dispatch_transcendental(instrs, slots, slots_get):
+    """Dispatch Tier 2 transcendental operations (sin, cos, exp, log, tanh, sigmoid)."""
+    for instr in instrs:
+        op = instr[0]
+        if op == "unop" and len(instr) >= 4:
+            _, dst, unop_name, src = instr[:4]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            if unop_name in _UNOP_DISPATCH:
+                slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
+        elif op == "binop" and len(instr) >= 5:
+            _, dst, binop, lhs, rhs = instr[:5]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op in ("load_f64", "load_f32"):
+            _, slot, val = instr[:3]
+            slots[slot] = float(val)
+        elif op == "move":
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
+
+
+def _tier4_dispatch_elementwise(instrs, slots, slots_get, simd_elem_fn):
+    """Dispatch Tier 1/2 elementwise operations.
+
+    Tries Rust SIMD kernels first if available, falls back to NumPy.
+    """
+    for instr in instrs:
+        op = instr[0]
+        if op == "binop" and len(instr) >= 5:
+            _, dst, binop, lhs, rhs = instr[:5]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "unop" and len(instr) >= 4:
+            _, dst, unop_name, src = instr[:4]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            if unop_name in _UNOP_DISPATCH:
+                slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
+        elif op in ("load_f64", "load_f32"):
+            _, slot, val = instr[:3]
+            slots[slot] = float(val)
+        elif op == "move":
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
+        elif op == "store" and len(instr) >= 3:
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
+
+
+def _tier4_dispatch_fused_elementwise(instrs, slots, slots_get, simd_elem_fn,
+                                       input_slot_ids=None):
+    """Dispatch a fused elementwise chain — execute ops in sequence,
+    reusing intermediate buffers to avoid materializing temporaries.
+
+    This is the hot path for fused chains like add → mul → tanh where
+    the output of one op feeds directly into the next. The key optimization
+    is that intermediate results don't get wrapped in DeviceArray — they
+    stay as raw ndarrays until the final output.
+
+    Buffer reuse: for intermediate results (not user inputs), we can
+    write the next op's output directly into the previous op's output
+    buffer when safe, avoiding allocation. We NEVER write into slots
+    that contain user-provided input arrays.
+    """
+    if input_slot_ids is None:
+        input_slot_ids = set()
+
+    # Track which slot values are safe to mutate (not user inputs)
+    # and which arrays are intermediate temporaries we own
+    intermediate_arrays = set()  # id() of arrays we created
+
+    for instr in instrs:
+        op = instr[0]
+        if op == "binop" and len(instr) >= 5:
+            _, dst, binop, lhs, rhs = instr[:5]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                result = fn(lhs_val, rhs_val)
+                # In-place buffer reuse: write result into lhs's buffer
+                # ONLY if lhs is an intermediate array we created (not a
+                # user input), and no other slot still needs lhs.
+                lhs_is_intermediate = id(lhs_val) in intermediate_arrays
+                lhs_is_input = lhs in input_slot_ids
+                if (lhs_is_intermediate
+                        and not lhs_is_input
+                        and isinstance(lhs_val, np.ndarray)
+                        and isinstance(result, np.ndarray)
+                        and lhs_val.dtype == result.dtype
+                        and lhs_val.shape == result.shape
+                        and lhs_val is not rhs_val
+                        and lhs_val.flags.writeable):
+                    # Verify no other slot still references lhs_val
+                    lhs_refcount = sum(1 for s in slots.values()
+                                       if s is lhs_val or (isinstance(s, np.ndarray) and s.base is lhs_val))
+                    if lhs_refcount <= 1:
+                        np.copyto(lhs_val, result)
+                        slots[dst] = lhs_val
+                        intermediate_arrays.add(id(lhs_val))
+                        continue
+                slots[dst] = result
+                intermediate_arrays.add(id(result))
+        elif op == "unop" and len(instr) >= 4:
+            _, dst, unop_name, src = instr[:4]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            if unop_name in _UNOP_DISPATCH:
+                slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
+        elif op in ("load_f64", "load_f32"):
+            _, slot, val = instr[:3]
+            slots[slot] = float(val)
+        elif op == "move":
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
+        elif op == "store" and len(instr) >= 3:
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
+
+
+def _tier4_dispatch_scalar(instrs, slots, slots_get):
+    """Dispatch Tier 0 scalar fallback operations."""
+    for instr in instrs:
+        op = instr[0]
+        if op == "binop" and len(instr) >= 5:
+            _, dst, binop, lhs, rhs = instr[:5]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "unop" and len(instr) >= 4:
+            _, dst, unop_name, src = instr[:4]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            if unop_name in _UNOP_DISPATCH:
+                slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
+        elif op in ("load_f64", "load_f32"):
+            _, slot, val = instr[:3]
+            slots[slot] = float(val)
+        elif op == "move":
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
+        elif op == "store" and len(instr) >= 3:
+            _, dst, src = instr[:3]
+            slots[dst] = slots_get(src, 0)
 
 
 def interpret_trace(
@@ -2021,15 +2260,35 @@ class JitFunction:
         #
         # Phase3 compilation is attempted FIRST, before fast-path detection,
         # because the compiled kernel IS the fastest executor when available.
+        #
+        # HOWEVER: if the trace contains operations that Phase3 SIMD can't
+        # handle (transcendentals, comparisons, logical ops), we skip Phase3
+        # and go directly to Tier 4 orchestration, which dispatches each
+        # region to the appropriate backend.
         self._phase3_kernel_id = None
         self._phase3_param_count = None
 
         # ── Phase 3 compilation paths ──
         # Path A: Pure elementwise traces → use SIMD elementwise kernels
         # Path B: Matmul-containing traces → segmented SIMD + BLAS execution
+        # Path T4: Mixed-mode / unsupported ops → Tier 4 orchestration
         self._phase3_hybrid_info = None  # For segmented execution plan
 
-        if not has_matmul:
+        # Proactive Tier 4: if the trace has ops that Phase3 can't handle
+        # (transcendentals, comparisons, logical, mixed-mode), go straight
+        # to Tier 4 orchestration instead of waiting for Phase3 to fail.
+        tier4_preferred = _tier4_should_orchestrate(self._trace)
+
+        if tier4_preferred:
+            # Tier 4 is the right executor for this trace — skip Phase3
+            tier4_exec = _tier4_create_executor(self._trace, self._allocator)
+            if tier4_exec is not None:
+                self._fast_path = tier4_exec
+            else:
+                # Tier 4 planning failed — fall through to Phase3 + NumPy
+                tier4_preferred = False
+
+        if not tier4_preferred and not has_matmul:
             # Path A: Pure elementwise — use AVX2/SSE2 SIMD elementwise kernels
             # The Phase 3 JIT (stencil compiler) emits integer arithmetic on
             # float bit patterns, which produces garbage for f64 values.
@@ -2051,7 +2310,7 @@ class JitFunction:
                 print(f"[symplex.jit] SIMD elementwise analysis failed: "
                       f"{type(e).__name__}: {e}", file=sys.stderr)
 
-        else:
+        elif not tier4_preferred and has_matmul:
             # Path B: Matmul-containing trace — segmented SIMD + BLAS execution
             # Elementwise sub-chains between matmuls use AVX2/SSE2 SIMD kernels
             # (via x86_emitter, which correctly emits ADDSD/VADDPD etc.),
@@ -2557,8 +2816,9 @@ class JitFunction:
                 return None
 
             self._fast_path = _phase3_hybrid_fast_path
-        else:
-            # Phase3 failed — try Tier 4 orchestration, then NumPy-based fast-path
+        elif not tier4_preferred:
+            # Phase3 failed and Tier 4 wasn't already chosen — try Tier 4
+            # orchestration now, then NumPy-based fast-path
             #
             # Tier 4 is the "conductor" — it decomposes the trace into regions,
             # builds an execution DAG with conservative fusion, and dispatches

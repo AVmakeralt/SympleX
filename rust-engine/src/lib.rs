@@ -1265,12 +1265,42 @@ fn tracing_jit_compile_and_run(serialized_instrs: Vec<u8>, args: Vec<i64>) -> Py
 #[pyfunction]
 fn tier4_plan(trace_ops: Vec<(u8, Vec<i64>)>) -> PyResult<String> {
     use crate::phase3_jit::tier4_compile;
+    use crate::phase3_jit::tier4_validate_schedule;
 
     let schedule = tier4_compile(&trace_ops);
 
-    // Serialize schedule to JSON
-    let steps_json: Vec<String> = schedule.steps.iter().map(|(id, tier, desc)| {
-        format!("{{\"node_id\": {}, \"tier\": {}, \"op_desc\": \"{}\"}}", id, tier, desc)
+    // Validate the schedule before handing it to Python
+    let (valid, warnings) = tier4_validate_schedule(&schedule);
+    if !valid {
+        return Ok(format!("{{\"error\": \"invalid_schedule\", \"warnings\": {}}}", warnings));
+    }
+
+    // Serialize schedule to JSON — include full step metadata for direct dispatch
+    let steps_json: Vec<String> = schedule.steps.iter().map(|step| {
+        let kind_str = match step.kind {
+            phase3_jit::Tier4RegionKind::Elementwise => "elementwise",
+            phase3_jit::Tier4RegionKind::Reduction => "reduction",
+            phase3_jit::Tier4RegionKind::LinearAlgebra => "linear_algebra",
+            phase3_jit::Tier4RegionKind::Stencil => "stencil",
+            phase3_jit::Tier4RegionKind::Transcendental => "transcendental",
+            phase3_jit::Tier4RegionKind::FmaChain => "fma_chain",
+            phase3_jit::Tier4RegionKind::Scalar => "scalar",
+            phase3_jit::Tier4RegionKind::Logical => "logical",
+        };
+        let input_slots_json: Vec<String> = step.input_slots.iter().map(|s| s.to_string()).collect();
+        let output_slots_json: Vec<String> = step.output_slots.iter().map(|s| s.to_string()).collect();
+        format!(
+            "{{\"node_id\": {}, \"tier\": {}, \"op_desc\": \"{}\", \"kind\": \"{}\", \"input_slots\": [{}], \"output_slots\": [{}], \"instr_range\": [{}, {}], \"is_fused\": {}}}",
+            step.node_id,
+            step.tier,
+            step.op_desc,
+            kind_str,
+            input_slots_json.join(", "),
+            output_slots_json.join(", "),
+            step.instr_range.0,
+            step.instr_range.1,
+            step.is_fused,
+        )
     }).collect();
 
     let buffer_plan_json: Vec<String> = schedule.buffer_plan.buffer_lifetimes.iter().map(|(idx, size, first, last)| {
@@ -1282,12 +1312,13 @@ fn tier4_plan(trace_ops: Vec<(u8, Vec<i64>)>) -> PyResult<String> {
     }).collect();
 
     Ok(format!(
-        "{{\"steps\": [{}], \"fusion_applied\": {}, \"fused_node_count\": {}, \"estimated_cost\": {}, \"peak_memory_bytes\": {}, \"buffer_plan\": {{\"total_buffers\": {}, \"total_bytes\": {}, \"slot_mapping\": {{{}}}, \"lifetimes\": [{}]}}}}",
+        "{{\"steps\": [{}], \"fusion_applied\": {}, \"fused_node_count\": {}, \"estimated_cost\": {}, \"peak_memory_bytes\": {}, \"warnings\": {}, \"buffer_plan\": {{\"total_buffers\": {}, \"total_bytes\": {}, \"slot_mapping\": {{{}}}, \"lifetimes\": [{}]}}}}",
         steps_json.join(", "),
         schedule.fusion_applied,
         schedule.fused_node_count,
         schedule.estimated_cost,
         schedule.peak_memory_bytes,
+        warnings,
         schedule.buffer_plan.total_buffers,
         schedule.buffer_plan.total_bytes,
         slot_mapping_json.join(", "),
