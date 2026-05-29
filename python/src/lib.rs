@@ -1506,7 +1506,7 @@ fn simd_reduce_f64(op: &str, data_ptr: usize, n: usize) -> PyResult<f64> {
 /// dst_ptr: output array pointer (used when reduce_op == 255)
 #[pyfunction]
 fn simd_fused_elementwise_f32(
-    ops: Vec<(u8, u8, u8, u8, u8)>,
+    ops: Vec<(u8, u8, u16, u8, u16)>,
     input_ptrs: Vec<usize>,
     constants: Vec<f32>,
     n: usize,
@@ -1520,7 +1520,7 @@ fn simd_fused_elementwise_f32(
 /// Same as simd_fused_elementwise_f32 but for double-precision data.
 #[pyfunction]
 fn simd_fused_elementwise_f64(
-    ops: Vec<(u8, u8, u8, u8, u8)>,
+    ops: Vec<(u8, u8, u16, u8, u16)>,
     input_ptrs: Vec<usize>,
     constants: Vec<f64>,
     n: usize,

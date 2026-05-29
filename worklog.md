@@ -334,3 +334,30 @@ Stage Summary:
 - Both translate_ssa and translate pipelines now include live-range splitting and software pipelining analysis
 - Polyhedral pipeline now includes cache-line conflict padding as Stage 15b
 - Zero compilation errors/warnings, all tests pass
+
+---
+Task ID: 1
+Agent: Bug Fix Agent
+Task: Fix two critical bugs in SympleX JIT fused SIMD elementwise kernel
+
+Work Log:
+- Read worklog.md to understand 8 prior tasks' work
+- Read x86_emitter.rs (2245 lines), rust-engine/src/lib.rs, python/src/lib.rs to understand current code
+- Bug 1: Changed `FusedOpDesc.lhs_idx` and `FusedOpDesc.rhs_idx` from `u8` to `u16` to support indices > 255 (needed for Mandelbrot traces with 400+ binops)
+- Bug 2: Fixed silent truncation to MAX_FUSED_OPS=8 ops:
+  - Modified `fused_elem_f32_scalar` to use `Vec<f32>` intermediates with capacity = ops.len() instead of `[f32; MAX_FUSED_OPS]`, enabling arbitrary-length chains
+  - Modified inline f64 scalar path in `simd_fused_elementwise_f64` similarly with `Vec<f64>` intermediates
+  - Changed both `simd_fused_elementwise_f32` and `simd_fused_elementwise_f64` to use AVX2 path only when ops.len() <= MAX_FUSED_OPS; for longer chains, scalar path processes ALL ops correctly (correctness over speed)
+- Updated function signatures from `Vec<(u8, u8, u8, u8, u8)>` to `Vec<(u8, u8, u16, u8, u16)>` in:
+  - x86_emitter.rs: simd_fused_elementwise_f32, simd_fused_elementwise_f64
+  - rust-engine/src/lib.rs: simd_fused_elementwise_f32, simd_fused_elementwise_f64 (PyO3 wrappers)
+  - python/src/lib.rs: simd_fused_elementwise_f32, simd_fused_elementwise_f64 (PyO3 wrappers)
+- Verified: Both rust-engine and python package compile with ZERO warnings using RUSTFLAGS="-D warnings"
+- No remaining references to `Vec<(u8, u8, u8, u8, u8)>` pattern in codebase
+
+Stage Summary:
+- x86_emitter.rs: FusedOpDesc idx fields u8→u16, scalar paths now support arbitrary-length chains
+- Bug 1 fix: PyO3 OverflowError for indices > 255 resolved by u16 type
+- Bug 2 fix: Silent truncation to 8 ops resolved by making scalar path unbounded; AVX2 fast path preserved for ≤8 ops
+- All function signatures updated consistently across 3 files
+- Zero compilation errors, zero warnings

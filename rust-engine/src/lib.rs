@@ -425,7 +425,7 @@ fn discover_fusions(ops: Vec<(String, Vec<i64>, String)>) -> String {
 /// dst_ptr: output array pointer (used when reduce_op == 255)
 #[pyfunction]
 fn simd_fused_elementwise_f32(
-    ops: Vec<(u8, u8, u8, u8, u8)>,
+    ops: Vec<(u8, u8, u16, u8, u16)>,
     input_ptrs: Vec<usize>,
     constants: Vec<f32>,
     n: usize,
@@ -441,7 +441,7 @@ fn simd_fused_elementwise_f32(
 /// Same parameter encoding as simd_fused_elementwise_f32 but for f64 arrays.
 #[pyfunction]
 fn simd_fused_elementwise_f64(
-    ops: Vec<(u8, u8, u8, u8, u8)>,
+    ops: Vec<(u8, u8, u16, u8, u16)>,
     input_ptrs: Vec<usize>,
     constants: Vec<f64>,
     n: usize,
