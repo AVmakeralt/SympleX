@@ -3585,6 +3585,8 @@ impl FusionOp {
 ///
 /// 1.0 (no compute savings, just launch overhead elimination)
 pub fn detect_horizontal_fusion(ops: &[FusionOp]) -> Vec<FusionBoundary> {
+    use rustc_hash::FxHashMap;
+
     /// Kernel launch overhead in bytes (5μs at 1GHz equivalent).
     const KERNEL_LAUNCH_OVERHEAD_BYTES: i64 = 5000;
 
@@ -3592,14 +3594,20 @@ pub fn detect_horizontal_fusion(ops: &[FusionOp]) -> Vec<FusionBoundary> {
         return Vec::new();
     }
 
-    // Step 1: Find elementwise ops and group by output shape
-    let mut shape_groups: std::collections::HashMap<Vec<i64>, Vec<usize>> =
-        std::collections::HashMap::new();
+    // Step 1: Find elementwise ops and group by output shape.
+    // Also build a (output_shape, dtype) → Vec<op_index> index for O(1)
+    // amortized dependency lookups instead of O(N) linear scans.
+    let mut shape_groups: FxHashMap<Vec<i64>, Vec<usize>> = FxHashMap::default();
+    let mut output_shape_index: FxHashMap<(Vec<i64>, DType), Vec<usize>> = FxHashMap::default();
 
     for (i, op) in ops.iter().enumerate() {
         if op.op_type.is_elementwise() && !op.output_shape.is_empty() {
             shape_groups
                 .entry(op.output_shape.clone())
+                .or_default()
+                .push(i);
+            output_shape_index
+                .entry((op.output_shape.clone(), op.dtype))
                 .or_default()
                 .push(i);
         }
@@ -3608,42 +3616,44 @@ pub fn detect_horizontal_fusion(ops: &[FusionOp]) -> Vec<FusionBoundary> {
     let mut boundaries = Vec::new();
 
     // Step 2: For each group of same-shape elementwise ops, check independence
+    // using the output_shape_index for O(1) amortized lookups per operator.
     for (_shape, indices) in shape_groups {
         if indices.len() < 2 {
             continue; // Need at least 2 ops for horizontal fusion
         }
 
-        // Check independence: no op's output is another op's input.
-        // For elementwise ops, we check if any op's input_shapes overlap
-        // with another op's output_shape.
-        let _index_set: std::collections::HashSet<usize> =
-            indices.iter().copied().collect();
-
+        // Build an incremental output shape index for ops in this group that
+        // have already been processed. Since `indices` are in ascending order
+        // (from the enumeration above), adding to this index as we iterate
+        // naturally enforces the dependency direction: an op can only depend
+        // on ops with smaller indices (earlier ops in program order).
+        //
+        // Key insight: an operator depends on the group if any of its input
+        // shapes matches the output shape of an operator already in the index
+        // WITH THE SAME dtype. Instead of scanning the group linearly (O(N)
+        // per operator), we check if the (input_shape, dtype) key exists in
+        // the index — O(1) amortized per input shape.
+        let mut group_output_index: FxHashMap<(Vec<i64>, DType), Vec<usize>> =
+            FxHashMap::default();
         let mut independent_group: Vec<usize> = Vec::new();
 
         for &idx in &indices {
             let op = &ops[idx];
-            // Check if this op depends on the output of any other op in the group.
-            // A simple heuristic: if an op's input shape matches another op's
-            // output shape AND the dtypes match, it might be a dependency.
-            // For a conservative check, we verify that none of the other ops
-            // produce a tensor that this op consumes.
-            let depends_on_group = indices.iter().any(|&other_idx| {
-                if other_idx == idx {
-                    return false;
-                }
-                let other_op = &ops[other_idx];
-                // If other_idx < idx and other_op's output shape matches one
-                // of this op's input shapes, it might be a dependency.
-                // We use a simple shape+dtype heuristic.
-                if other_idx < idx {
-                    op.input_shapes.iter().any(|input_shape| {
-                        input_shape == &other_op.output_shape && op.dtype == other_op.dtype
-                    })
-                } else {
-                    false
-                }
+
+            // O(1) amortized per input shape: check if any of this op's
+            // (input_shape, dtype) keys exists in the group's output index.
+            let depends_on_group = op.input_shapes.iter().any(|input_shape| {
+                group_output_index.contains_key(&(input_shape.clone(), op.dtype))
             });
+
+            // Always add this op's (output_shape, dtype) to the index so that
+            // subsequent ops can check against it. This matches the original
+            // behavior of checking against ALL group members with smaller
+            // indices, including dependent ops not in independent_group.
+            group_output_index
+                .entry((op.output_shape.clone(), op.dtype))
+                .or_default()
+                .push(idx);
 
             if !depends_on_group {
                 independent_group.push(idx);

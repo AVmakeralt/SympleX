@@ -38,6 +38,10 @@ pub const MAX_POLY_DEPTH: usize = 8;
 /// Size limit for JIT tracking slots.
 pub const MAX_TRACKED_SLOTS: usize = 4096;
 
+const SLOT_WORD_SHIFT: usize = 6; // log2(64) — bits per u64 word
+const SLOT_BIT_MASK: usize = 63;  // 64 - 1 — mask for bit position within word
+const SLOT_WORDS: usize = MAX_TRACKED_SLOTS / 64; // number of u64 words in the bitset
+
 /// Maximum tensor rank for N-dimensional access relations.
 pub const MAX_TENSOR_RANK: usize = 6;
 
@@ -832,11 +836,11 @@ pub fn classify_dependency_type(
 /// Stack-resident: 64 × u64 = 4096 bits covering MAX_TRACKED_SLOTS.
 #[derive(Debug, Clone)]
 pub struct ReductionMap {
-    bits: [u64; 64],
+    bits: [u64; SLOT_WORDS],
 }
 
 impl ReductionMap {
-    pub fn new() -> Self { Self { bits: [0u64; 64] } }
+    pub fn new() -> Self { Self { bits: [0u64; SLOT_WORDS] } }
 
     /// Mark a slot as an associative reduction accumulator, recording the
     /// reduction operator so that downstream dependency analysis can classify
@@ -844,8 +848,9 @@ impl ReductionMap {
     #[inline]
     pub fn mark_reduction(&mut self, slot: u16, op: BinOpKind) {
         let idx = slot as usize;
+        assert!(idx < MAX_TRACKED_SLOTS, "slot index {} exceeds MAX_TRACKED_SLOTS {}", idx, MAX_TRACKED_SLOTS);
         if idx < MAX_TRACKED_SLOTS {
-            self.bits[idx >> 6] |= 1u64 << (idx & 63);
+            self.bits[idx >> SLOT_WORD_SHIFT] |= 1u64 << (idx & SLOT_BIT_MASK);
         }
         // Store the operator in the upper bits of the bitset for later retrieval
         // by get_reduction_op(). We use a secondary bitset for the operator tag.
@@ -866,8 +871,9 @@ impl ReductionMap {
     #[inline]
     pub fn is_reduction(&self, slot: u16) -> bool {
         let idx = slot as usize;
+        assert!(idx < MAX_TRACKED_SLOTS, "slot index {} exceeds MAX_TRACKED_SLOTS {}", idx, MAX_TRACKED_SLOTS);
         if idx >= MAX_TRACKED_SLOTS { return false; }
-        self.bits[idx >> 6] & (1u64 << (idx & 63)) != 0
+        self.bits[idx >> SLOT_WORD_SHIFT] & (1u64 << (idx & SLOT_BIT_MASK)) != 0
     }
 }
 
@@ -881,14 +887,14 @@ pub fn classify_reductions(arena: &ScopArena) -> ReductionMap {
     let mut map = ReductionMap::new();
 
     // Collect all self-accumulation patterns:  d = d op src
-    let mut self_acc_slots = [0u64; 64]; // bitset of self-accumulating dst slots
+    let mut self_acc_slots = [0u64; SLOT_WORDS]; // bitset of self-accumulating dst slots
     for stmt in &arena.stmts {
         if stmt.dst == stmt.src1 {
             match stmt.op {
                 BinOpKind::Add | BinOpKind::Mul => {
                     let idx = stmt.dst as usize;
                     if idx < MAX_TRACKED_SLOTS {
-                        self_acc_slots[idx >> 6] |= 1u64 << (idx & 63);
+                        self_acc_slots[idx >> SLOT_WORD_SHIFT] |= 1u64 << (idx & SLOT_BIT_MASK);
                     }
                 }
                 _ => {}
@@ -905,15 +911,15 @@ pub fn classify_reductions(arena: &ScopArena) -> ReductionMap {
         let stmt_end   = stmt_start + poly_loop.stmt_len as usize;
 
         // Collect written and read slots within this loop
-        let mut write_slots = [0u64; 64];
-        let mut read_slots  = [0u64; 64];
+        let mut write_slots = [0u64; SLOT_WORDS];
+        let mut read_slots  = [0u64; SLOT_WORDS];
         for acc in &arena.accesses[acc_start..acc_end] {
             let idx = acc.array_base_slot as usize;
             if idx < MAX_TRACKED_SLOTS {
                 if acc.is_read {
-                    read_slots[idx >> 6] |= 1u64 << (idx & 63);
+                    read_slots[idx >> SLOT_WORD_SHIFT] |= 1u64 << (idx & SLOT_BIT_MASK);
                 } else {
-                    write_slots[idx >> 6] |= 1u64 << (idx & 63);
+                    write_slots[idx >> SLOT_WORD_SHIFT] |= 1u64 << (idx & SLOT_BIT_MASK);
                 }
             }
         }
@@ -922,10 +928,10 @@ pub fn classify_reductions(arena: &ScopArena) -> ReductionMap {
         for stmt in &arena.stmts[stmt_start..stmt_end] {
             let idx = stmt.dst as usize;
             if idx >= MAX_TRACKED_SLOTS { continue; }
-            let bit = 1u64 << (idx & 63);
-            if self_acc_slots[idx >> 6] & bit != 0 {
+            let bit = 1u64 << (idx & SLOT_BIT_MASK);
+            if self_acc_slots[idx >> SLOT_WORD_SHIFT] & bit != 0 {
                 // Slot is self-accumulating AND read+written in this loop → reduction
-                if (write_slots[idx >> 6] & bit != 0) && (read_slots[idx >> 6] & bit != 0) {
+                if (write_slots[idx >> SLOT_WORD_SHIFT] & bit != 0) && (read_slots[idx >> SLOT_WORD_SHIFT] & bit != 0) {
                     map.mark_reduction(stmt.dst, stmt.op);
                 }
             }
@@ -1122,7 +1128,7 @@ impl Scop {
 /// Slot-indexed affine expression cache with 4096-bit presence bitset.
 pub struct SlotCache {
     pub data: Vec<Option<AffineExpr>>,
-    present: [u64; 64],
+    present: [u64; SLOT_WORDS],
 }
 
 impl SlotCache {
@@ -1130,28 +1136,26 @@ impl SlotCache {
     pub fn new() -> Self {
         Self {
             data: vec![None; MAX_TRACKED_SLOTS],
-            present: [0u64; 64],
+            present: [0u64; SLOT_WORDS],
         }
     }
 
     #[inline]
     pub fn insert(&mut self, slot: u16, expr: AffineExpr) {
         let idx = slot as usize;
-        debug_assert!(
-            idx < MAX_TRACKED_SLOTS,
-            "slot {} exceeds MAX_TRACKED_SLOTS ({})", slot, MAX_TRACKED_SLOTS
-        );
+        assert!(idx < MAX_TRACKED_SLOTS, "slot index {} exceeds MAX_TRACKED_SLOTS {}", idx, MAX_TRACKED_SLOTS);
         if idx < MAX_TRACKED_SLOTS {
             self.data[idx] = Some(expr);
-            self.present[idx >> 6] |= 1u64 << (idx & 63);
+            self.present[idx >> SLOT_WORD_SHIFT] |= 1u64 << (idx & SLOT_BIT_MASK);
         }
     }
 
     #[inline]
     pub fn get(&self, slot: u16) -> Option<AffineExpr> {
         let idx = slot as usize;
+        assert!(idx < MAX_TRACKED_SLOTS, "slot index {} exceeds MAX_TRACKED_SLOTS {}", idx, MAX_TRACKED_SLOTS);
         if idx >= MAX_TRACKED_SLOTS { return None; }
-        if self.present[idx >> 6] & (1u64 << (idx & 63)) == 0 {
+        if self.present[idx >> SLOT_WORD_SHIFT] & (1u64 << (idx & SLOT_BIT_MASK)) == 0 {
             return None;
         }
         self.data[idx]
@@ -1173,12 +1177,12 @@ pub fn populate_slot_cache(instrs: &[Instr], cache: &mut SlotCache, loop_iv_slot
         }
     }
 
-    let mut iv_bitset = [0u64; 64];
+    let mut iv_bitset = [0u64; SLOT_WORDS];
     for &s in loop_iv_slots {
-        iv_bitset[(s >> 6) as usize] |= 1u64 << (s & 63);
+        iv_bitset[(s >> SLOT_WORD_SHIFT) as usize] |= 1u64 << ((s as usize) & SLOT_BIT_MASK);
     }
     let iv_is_variant = |slot: u16| -> bool {
-        iv_bitset[(slot >> 6) as usize] & (1u64 << (slot & 63)) != 0
+        iv_bitset[(slot >> SLOT_WORD_SHIFT) as usize] & (1u64 << ((slot as usize) & SLOT_BIT_MASK)) != 0
     };
 
     for instr in instrs {
@@ -1992,10 +1996,72 @@ pub fn generate_hierarchical_tiled_loops(
 // §10. REGISTER-LOCKED MICRO-KERNEL EMISSION (AMX / AVX-512)
 // =============================================================================
 
+/// Represents a micro-kernel as an opaque intrinsic block within the IR.
+/// The register allocator treats these as atomic blocks: all declared
+/// clobbered registers are unavailable during the kernel's lifetime,
+/// and the allocator must spill any active temporaries that overlap.
+///
+/// This prevents the register allocator from silently assigning GPRs or
+/// SIMD registers that the micro-kernel uses for its own inner loop,
+/// which would cause state clobbering and silent miscompilation.
+#[derive(Debug, Clone)]
+pub struct MicroKernelNode {
+    /// What kind of micro-kernel this represents (GEMM, convolution, etc.)
+    pub kernel_type: MicroKernelKind,
+    /// SSA slot indices read by the kernel (inputs)
+    pub input_slots: Vec<u16>,
+    /// SSA slot indices written by the kernel (outputs / accumulators)
+    pub output_slots: Vec<u16>,
+    /// Physical GPR register numbers clobbered by the kernel (0-15)
+    pub clobbered_gprs: Vec<u8>,
+    /// Physical SIMD register numbers clobbered by the kernel (0-31 for ZMM)
+    pub clobbered_simd: Vec<u8>,
+}
+
+/// Classification of micro-kernel types for the IR
+#[derive(Debug, Clone, PartialEq)]
+pub enum MicroKernelKind {
+    /// AVX-512 GEMM kernel: uses ZMM0-ZMM31 for tiles, R8-R11 for loop vars
+    Avx512Gemm { tile_m: usize, tile_n: usize, tile_k: usize },
+    /// AMX matrix multiplication: uses TMM0-TMM7 tile registers
+    AmxMatMul { tile_m: usize, tile_n: usize, tile_k: usize },
+    /// Scalar fallback: uses minimal registers
+    ScalarGemm { tile_m: usize, tile_n: usize, tile_k: usize },
+}
+
+impl MicroKernelNode {
+    /// Create a MicroKernelNode for the current scalar micro-kernel emitter.
+    /// This declares the register clobbers so the allocator can plan around them.
+    pub fn scalar_gemm(
+        input_slots: Vec<u16>,
+        output_slots: Vec<u16>,
+        tile_m: usize,
+        tile_n: usize,
+        tile_k: usize,
+    ) -> Self {
+        Self {
+            kernel_type: MicroKernelKind::ScalarGemm { tile_m, tile_n, tile_k },
+            input_slots,
+            output_slots,
+            // Scalar kernel uses: RAX (0), RCX (1), R8-R11 (8-11) for loop vars,
+            // RDI (7) for slot base pointer
+            clobbered_gprs: vec![0, 1, 7, 8, 9, 10, 11],
+            // Scalar kernel uses no SIMD registers
+            clobbered_simd: vec![],
+        }
+    }
+}
+
 /// Emits the absolute fastest innermost GEMM kernel by locking a
 /// REGISTER_TILE_M × REGISTER_TILE_N sub-matrix of C into SIMD registers,
 /// streaming A and B panels through the remaining registers, and generating
 /// fused-multiply-add instructions with no register spilling.
+///
+/// BUG FIX NOTE: This kernel emits instructions via the IR (Instr enum),
+/// which allows the register allocator to see its slot usage.  However,
+/// the allocator must also consult the MicroKernelNode's clobbered_gprs
+/// and clobbered_simd fields to avoid assigning those physical registers
+/// to other temporaries during the kernel's lifetime.
 pub fn emit_register_microkernel(scop: &Scop) -> Vec<Instr> {
     let arena = &scop.arena;
     let mut out = Vec::with_capacity(
@@ -2560,7 +2626,7 @@ pub fn reciprocal_multiply(instrs: &mut Vec<Instr>) -> bool {
     // For each loop, find Div instructions where the divisor is loop-invariant
     for &(loop_start, loop_end) in &loop_ranges {
         // Collect all slots written inside the loop
-        let mut written_inside = [0u64; 64];
+        let mut written_inside = [0u64; SLOT_WORDS];
         for pc in loop_start..=loop_end.min(instrs.len() - 1) {
             match instrs[pc] {
                 Instr::BinOp(d, _, _, _) | Instr::Move(d, _) |
@@ -2568,7 +2634,7 @@ pub fn reciprocal_multiply(instrs: &mut Vec<Instr>) -> bool {
                 Instr::Store(d, _) => {
                     let idx = d as usize;
                     if idx < MAX_TRACKED_SLOTS {
-                        written_inside[idx >> 6] |= 1u64 << (idx & 63);
+                        written_inside[idx >> SLOT_WORD_SHIFT] |= 1u64 << (idx & SLOT_BIT_MASK);
                     }
                 }
                 _ => {}
@@ -2578,7 +2644,7 @@ pub fn reciprocal_multiply(instrs: &mut Vec<Instr>) -> bool {
         let is_invariant = |slot: u16| -> bool {
             let idx = slot as usize;
             if idx >= MAX_TRACKED_SLOTS { return true; }
-            written_inside[idx >> 6] & (1u64 << (idx & 63)) == 0
+            written_inside[idx >> SLOT_WORD_SHIFT] & (1u64 << (idx & SLOT_BIT_MASK)) == 0
         };
 
         // Find BinOp(_, Div, x, invariant_y) inside the loop
@@ -2718,14 +2784,14 @@ pub struct AlignmentHint {
 /// 2. Pad the innermost dimension up to a multiple of SIMD_WIDTH.
 pub fn compute_alignment_hints(_scop: &Scop, tensor_dims: &[(u16, usize)]) -> Vec<AlignmentHint> {
     let mut hints: Vec<AlignmentHint> = Vec::new();
-    let mut seen_slots = [0u64; 64];
+    let mut seen_slots = [0u64; SLOT_WORDS];
 
     for &(base_slot, inner_dim) in tensor_dims {
         let idx = base_slot as usize;
         if idx >= MAX_TRACKED_SLOTS { continue; }
-        let bit = 1u64 << (idx & 63);
-        if seen_slots[idx >> 6] & bit != 0 { continue; }
-        seen_slots[idx >> 6] |= bit;
+        let bit = 1u64 << (idx & SLOT_BIT_MASK);
+        if seen_slots[idx >> SLOT_WORD_SHIFT] & bit != 0 { continue; }
+        seen_slots[idx >> SLOT_WORD_SHIFT] |= bit;
 
         let padded = pad_to_simd_width(inner_dim);
         hints.push(AlignmentHint {
@@ -2758,15 +2824,19 @@ pub fn strength_reduce_poly(instrs: &mut Vec<Instr>) -> bool {
     }
 
     for &(loop_start, loop_end) in &loop_ranges {
-        let mut iv_slots = [0u64; 64];
+        let mut iv_slots = [0u64; SLOT_WORDS];
 
         #[inline(always)]
-        fn iv_insert(bits: &mut [u64; 64], slot: u16) {
-            bits[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+        fn iv_insert(bits: &mut [u64; SLOT_WORDS], slot: u16) {
+            let idx = slot as usize;
+            assert!(idx < MAX_TRACKED_SLOTS, "slot index {} exceeds MAX_TRACKED_SLOTS {}", idx, MAX_TRACKED_SLOTS);
+            bits[(slot >> SLOT_WORD_SHIFT) as usize] |= 1u64 << ((slot as usize) & SLOT_BIT_MASK);
         }
         #[inline(always)]
-        fn iv_contains(bits: &[u64; 64], slot: u16) -> bool {
-            bits[(slot >> 6) as usize] & (1u64 << (slot & 63)) != 0
+        fn iv_contains(bits: &[u64; SLOT_WORDS], slot: u16) -> bool {
+            let idx = slot as usize;
+            assert!(idx < MAX_TRACKED_SLOTS, "slot index {} exceeds MAX_TRACKED_SLOTS {}", idx, MAX_TRACKED_SLOTS);
+            bits[(slot >> SLOT_WORD_SHIFT) as usize] & (1u64 << ((slot as usize) & SLOT_BIT_MASK)) != 0
         }
 
         for j in loop_start..loop_end.min(instrs.len()) {
@@ -3063,7 +3133,7 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
         let mut group_heads    = vec![u32::MAX; MAX_TRACKED_SLOTS];
         let mut next_in_group  = vec![u32::MAX; n_tensor.max(1)];
         let mut slot_index_map: Vec<(u16, usize)> = Vec::with_capacity(64);
-        let mut slot_seen = [0u64; 64];
+        let mut slot_seen = [0u64; SLOT_WORDS];
 
         for (i, tac) in arena.tensor_accesses.iter().enumerate() {
             let slot = tac.array_base_slot as usize;
@@ -3071,8 +3141,8 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
                 next_in_group[i] = group_heads[slot];
                 group_heads[slot] = i as u32;
             }
-            let word = slot >> 6;
-            let bit  = 1u64 << (slot & 63);
+            let word = slot >> SLOT_WORD_SHIFT;
+            let bit  = 1u64 << (slot & SLOT_BIT_MASK);
             if slot_seen[word] & bit == 0 {
                 slot_seen[word] |= bit;
                 slot_index_map.push((tac.array_base_slot, slot));

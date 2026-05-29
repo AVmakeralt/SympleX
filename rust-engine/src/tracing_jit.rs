@@ -397,6 +397,11 @@ impl TraceRecorder {
                 trace.slot_types[*slot as usize] = Some(vtype);
 
                 if Self::is_unboxable(vtype) {
+                    // Align offset to the required alignment for this type.
+                    // E.g. an I64/F64 following an F32 (4 bytes) must be
+                    // padded to an 8-byte boundary.
+                    let align = Self::unboxed_align(vtype);
+                    offset = (offset + align - 1) & !(align - 1);
                     trace.unboxed_slots[*slot as usize] = Some(offset);
                     offset += Self::unboxed_size(vtype);
                 }
@@ -431,11 +436,24 @@ impl TraceRecorder {
     }
 
     /// Returns the size (in bytes) of a value of the given type in the
-    /// unboxed buffer.  F32 is widened to 8 bytes (lossless f32 -> f64).
+    /// unboxed buffer.  F32 uses its native 4-byte width (no widening).
     #[inline]
     fn unboxed_size(vtype: ValueType) -> u32 {
         match vtype {
-            ValueType::I64 | ValueType::F64 | ValueType::F32 => 8,
+            ValueType::I64 | ValueType::F64 => 8,
+            ValueType::F32 => 4, // Native bit-width — no widening
+            ValueType::Bool => 1,
+            _ => 8, // fallback for any future unboxable types
+        }
+    }
+
+    /// Returns the alignment (in bytes) required for a value of the given
+    /// type in the unboxed buffer.
+    #[inline]
+    fn unboxed_align(vtype: ValueType) -> u32 {
+        match vtype {
+            ValueType::I64 | ValueType::F64 => 8,
+            ValueType::F32 => 4,
             ValueType::Bool => 1,
             _ => 8, // fallback for any future unboxable types
         }
@@ -1320,8 +1338,16 @@ mod tests {
     fn test_unboxed_size() {
         assert_eq!(TraceRecorder::unboxed_size(ValueType::I64), 8);
         assert_eq!(TraceRecorder::unboxed_size(ValueType::F64), 8);
-        assert_eq!(TraceRecorder::unboxed_size(ValueType::F32), 8); // widened to f64
+        assert_eq!(TraceRecorder::unboxed_size(ValueType::F32), 4); // native bit-width
         assert_eq!(TraceRecorder::unboxed_size(ValueType::Bool), 1);
+    }
+
+    #[test]
+    fn test_unboxed_align() {
+        assert_eq!(TraceRecorder::unboxed_align(ValueType::I64), 8);
+        assert_eq!(TraceRecorder::unboxed_align(ValueType::F64), 8);
+        assert_eq!(TraceRecorder::unboxed_align(ValueType::F32), 4);
+        assert_eq!(TraceRecorder::unboxed_align(ValueType::Bool), 1);
     }
 
     #[test]

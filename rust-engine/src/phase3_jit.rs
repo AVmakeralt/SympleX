@@ -157,6 +157,19 @@
 //!    existing backends — never inventing new execution methods.
 //!    The conductor, not a new instrument.
 
+// ── Conditional JIT trace logging ──────────────────────────────────────────
+// In release builds, jit_trace! compiles to a no-op unless the `jit_trace`
+// feature is enabled, eliminating all formatting and I/O overhead from the
+// compilation hot path.  Enable with: cargo build --features jit_trace
+#[cfg(feature = "jit_trace")]
+macro_rules! jit_trace {
+    ($($arg:tt)*) => { eprintln!($($arg)*) };
+}
+#[cfg(not(feature = "jit_trace"))]
+macro_rules! jit_trace {
+    ($($arg:tt)*) => {};
+}
+
 use std::cell::RefCell;
 use std::collections::{BinaryHeap, VecDeque};
 use std::ptr::NonNull;
@@ -249,17 +262,18 @@ impl PageBitmap {
     }
 
     /// Iterate over all set page addresses. Yields absolute page-aligned
-    /// addresses (base + offset).
+    /// addresses (base + offset).  Uses `trailing_zeros()` to skip empty
+    /// bits in O(popcount) instead of scanning all 64 bits per word.
     fn iter_set(&self) -> impl Iterator<Item = usize> + '_ {
         let base = self.base;
         self.bits.iter().enumerate().flat_map(move |(word_idx, &word)| {
             let base_bit = word_idx * 64;
-            (0..64).filter_map(move |bit| {
-                if (word >> bit) & 1 == 1 {
-                    Some(base + (base_bit + bit) * PAGE_SIZE)
-                } else {
-                    None
-                }
+            let mut w = word;
+            std::iter::from_fn(move || {
+                if w == 0 { return None; }
+                let bit = w.trailing_zeros() as usize;
+                w &= w.wrapping_sub(1); // clear lowest set bit
+                Some(base + (base_bit + bit) * PAGE_SIZE)
             })
         })
     }
@@ -800,7 +814,7 @@ pub fn compile_amx_matmul(m: usize, n: usize, k: usize) -> Option<NativeCode> {
     // 4. Stores results
     // Full implementation requires iced-x86 AMX instruction support
 
-    eprintln!("[JIT] AMX matmul: dimensions M={} N={} K={} suitable for AMX", m, n, k);
+    jit_trace!("[JIT] AMX matmul: dimensions M={} N={} K={} suitable for AMX", m, n, k);
 
     // Return None for now — actual AMX emission requires iced-x86 AMX support
     // which may not be available. The matmul will fall back to AVX2/AVX-512.
@@ -1051,7 +1065,7 @@ impl ExecArena {
         // eliminates all mprotect/RW→RX flips. If dual mapping fails (e.g. no
         // memfd_create support), we fall back to the single-mapping approach.
         if let Some(dual) = DualMappedArena::try_new(Self::DEFAULT_LEN) {
-            eprintln!("[JIT] DualMappedArena: dual-mapped arena created (rw={:?}, rx={:?}, cap={})",
+            jit_trace!("[JIT] DualMappedArena: dual-mapped arena created (rw={:?}, rx={:?}, cap={})",
                 dual.rw_base, dual.rx_base, dual.capacity);
             let chunk = ArenaChunk {
                 base: NonNull::new(dual.rw_base)?,
@@ -1413,7 +1427,7 @@ impl ExecArena {
             }
 
             self.dual_mapped = Some(dual);
-            eprintln!("[JIT] force_dual_mapped: successfully upgraded to dual-mapped arena");
+            jit_trace!("[JIT] force_dual_mapped: successfully upgraded to dual-mapped arena");
             return true;
         }
 
@@ -1566,7 +1580,7 @@ impl ExecArena {
             return Vec::new();
         }
 
-        eprintln!(
+        jit_trace!(
             "JIT arena near capacity: {} / {} bytes ({:.1}% used, needed: {}), triggering LRU eviction",
             self.total_allocated, total_capacity, usage * 100.0, needed
         );
@@ -1612,7 +1626,7 @@ impl ExecArena {
         }
 
         if !invalidated.is_empty() {
-            eprintln!(
+            jit_trace!(
                 "JIT LRU eviction: evicted {} entries, freed {} bytes",
                 invalidated.len(), freed
             );
@@ -3347,13 +3361,63 @@ impl Emitter {
         self.b(0x90);
     }
 
-    /// Multi-byte NOP: emit `n` bytes of NOP using optimal multi-byte NOP
-    /// encodings.  This is preferred over repeated single-byte NOPs because
-    /// the decoder can consume a single multi-byte NOP in one cycle.
+    /// Multi-byte NOP: emit `n` bytes of NOP using canonical x86-64
+    /// multi-byte NOP encodings up to 15 bytes.  Each multi-byte NOP
+    /// decodes in a single cycle on modern CPUs (Skylake+, Zen+), and
+    /// using the longest possible single-instruction NOP minimizes
+    /// front-end instruction fetch/decode queue pressure and DSB
+    /// (Decoded ICache) slot consumption.
+    ///
+    /// Reference: Intel 64 and IA-32 Architectures Software Developer's
+    /// Manual, Vol 2B, "NOP" instruction encoding tables.  The canonical
+    /// NOP sequence uses the 3-byte opcode `0F 1F /0` with varying
+    /// prefix, SIB, and displacement bytes.
     fn nop_multi(&mut self, n: usize) {
         let mut remaining = n;
         while remaining > 0 {
-            if remaining >= 9 {
+            // Emit the longest single-instruction NOP that fits.
+            // All encodings are based on: [66] 0F 1F [/0] [SIB] [disp8] [disp32]
+            if remaining >= 15 {
+                // 15-byte NOP: 66 66 66 66 66 66 0F 1F 84 00 00 00 00 00 00
+                //   6× prefix + 0F 1F ModRM SIB + 4-byte disp + 1 extra
+                self.emit4(0x66, 0x66, 0x66, 0x66);
+                self.emit4(0x66, 0x66, 0x0F, 0x1F);
+                self.emit4(0x84, 0x00, 0x00, 0x00);
+                self.emit3(0x00, 0x00, 0x00);
+                remaining -= 15;
+            } else if remaining >= 14 {
+                // 14-byte NOP: 66 66 66 66 66 0F 1F 84 00 00 00 00 00 00
+                self.emit4(0x66, 0x66, 0x66, 0x66);
+                self.emit4(0x66, 0x0F, 0x1F, 0x84);
+                self.emit4(0x00, 0x00, 0x00, 0x00);
+                self.emit2(0x00, 0x00);
+                remaining -= 14;
+            } else if remaining >= 13 {
+                // 13-byte NOP: 66 66 66 66 0F 1F 84 00 00 00 00 00 00
+                self.emit4(0x66, 0x66, 0x66, 0x66);
+                self.emit4(0x0F, 0x1F, 0x84, 0x00);
+                self.emit4(0x00, 0x00, 0x00, 0x00);
+                self.b(0x00);
+                remaining -= 13;
+            } else if remaining >= 12 {
+                // 12-byte NOP: 66 66 66 0F 1F 84 00 00 00 00 00 00
+                self.emit4(0x66, 0x66, 0x66, 0x0F);
+                self.emit4(0x1F, 0x84, 0x00, 0x00);
+                self.emit4(0x00, 0x00, 0x00, 0x00);
+                remaining -= 12;
+            } else if remaining >= 11 {
+                // 11-byte NOP: 66 66 0F 1F 84 00 00 00 00 00 00
+                self.emit4(0x66, 0x66, 0x0F, 0x1F);
+                self.emit4(0x84, 0x00, 0x00, 0x00);
+                self.emit3(0x00, 0x00, 0x00);
+                remaining -= 11;
+            } else if remaining >= 10 {
+                // 10-byte NOP: 66 0F 1F 84 00 00 00 00 00 00
+                self.emit4(0x66, 0x0F, 0x1F, 0x84);
+                self.emit4(0x00, 0x00, 0x00, 0x00);
+                self.emit2(0x00, 0x00);
+                remaining -= 10;
+            } else if remaining >= 9 {
                 // 9-byte NOP: 66 0F 1F 84 00 00 00 00 00
                 self.emit4(0x66, 0x0F, 0x1F, 0x84);
                 self.emit4(0x00, 0x00, 0x00, 0x00);
@@ -4079,7 +4143,7 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize, float_slots: &[boo
         }
 
         if swap_count > 0 {
-            eprintln!("[JIT-RA] Hot-path demotion: swapped {} cold→spill, hot→reg", swap_count);
+            jit_trace!("[JIT-RA] Hot-path demotion: swapped {} cold→spill, hot→reg", swap_count);
         }
     }
 
@@ -4161,6 +4225,7 @@ fn linear_scan(intervals: &[LiveInterval], slot_count: usize, float_slots: &[boo
 //   - No separate liveness pass needed — last-use is tracked inline
 
 /// Result of single-pass SSA register allocation.
+#[allow(dead_code)]
 pub struct SsaRegAlloc {
     /// Map from ValueId to physical register or spill slot
     assignments: FxHashMap<ValueId, SsaRegLoc>,
@@ -5442,11 +5507,11 @@ impl LoopVectorizer {
         self.loop_start = Some(header_pc);
         self.loop_end = Some(back_pc);
 
-        eprintln!("[JIT-VEC] Found loop: header={}, back={}", header_pc, back_pc);
+        jit_trace!("[JIT-VEC] Found loop: header={}, back={}", header_pc, back_pc);
 
         // Dump loop body for debugging
-        for pc in header_pc..=back_pc {
-            eprintln!("[JIT-VEC]   pc={}: {:?}", pc, instrs[pc]);
+        for _pc in header_pc..=back_pc {
+            jit_trace!("[JIT-VEC]   pc={}: {:?}", _pc, instrs[_pc]);
         }
 
         // Phase 2: Analyze the condition.
@@ -5637,7 +5702,7 @@ impl LoopVectorizer {
                     if let Some((iv_slot, step)) = detected_iv {
                         self.induction_var = Some(iv_slot);
                         self.induction_step = step;
-                        eprintln!("[JIT-VEC] Found induction var: slot_{} step={}", iv_slot, step);
+                        jit_trace!("[JIT-VEC] Found induction var: slot_{} step={}", iv_slot, step);
                     }
 
                     // Check for reduction pattern by tracking Store-backs.
@@ -5665,7 +5730,7 @@ impl LoopVectorizer {
                                         op: *op,
                                         val_slot: val,
                                     });
-                                    eprintln!("[JIT-VEC] Found reduction (direct): slot_{} = slot_{} {:?} slot_{}",
+                                    jit_trace!("[JIT-VEC] Found reduction (direct): slot_{} = slot_{} {:?} slot_{}",
                                         acc, acc, op, val);
                                 }
                             }
@@ -5691,7 +5756,7 @@ impl LoopVectorizer {
                                                             op: *op,
                                                             val_slot: *r,
                                                         });
-                                                        eprintln!("[JIT-VEC] Found reduction (store-back): slot_{} = slot_{} {:?} slot_{}",
+                                                        jit_trace!("[JIT-VEC] Found reduction (store-back): slot_{} = slot_{} {:?} slot_{}",
                                                             store_slot, store_slot, op, r);
                                                     }
                                                     break;
@@ -5705,7 +5770,7 @@ impl LoopVectorizer {
                                                             op: *op,
                                                             val_slot: *r,
                                                         });
-                                                        eprintln!("[JIT-VEC] Found reduction (store-back move): slot_{} = slot_{} {:?} slot_{}",
+                                                        jit_trace!("[JIT-VEC] Found reduction (store-back move): slot_{} = slot_{} {:?} slot_{}",
                                                             store_slot, store_slot, op, r);
                                                     }
                                                     break;
@@ -5791,7 +5856,7 @@ impl LoopVectorizer {
                                     op,
                                     val_slot,
                                 });
-                                eprintln!("[JIT-VEC] Found reduction (chain): slot_{} {:?} slot_{}",
+                                jit_trace!("[JIT-VEC] Found reduction (chain): slot_{} {:?} slot_{}",
                                     store_slot, op, val_slot);
                             }
                         }
@@ -5814,10 +5879,10 @@ impl LoopVectorizer {
                             let r_is_iv = *cmp_r == iv || slot_reads_from(instrs, *cmp_r, iv, search_pc, body_start);
                             if l_is_iv {
                                 self.bound_slot = Some(*cmp_r);
-                                eprintln!("[JIT-VEC] Found bound: slot_{} (iv < bound)", cmp_r);
+                                jit_trace!("[JIT-VEC] Found bound: slot_{} (iv < bound)", cmp_r);
                             } else if r_is_iv {
                                 self.bound_slot = Some(*cmp_l);
-                                eprintln!("[JIT-VEC] Found bound: slot_{} (bound > iv)", cmp_l);
+                                jit_trace!("[JIT-VEC] Found bound: slot_{} (bound > iv)", cmp_l);
                             }
                             break;
                         }
@@ -5898,7 +5963,7 @@ impl LoopVectorizer {
         }
 
         self.is_vectorizable = true;
-        eprintln!("[JIT-VEC] Loop vectorizable: header={}, back={}, iv=slot_{:?}, step={}, reductions={}",
+        jit_trace!("[JIT-VEC] Loop vectorizable: header={}, back={}, iv=slot_{:?}, step={}, reductions={}",
             header_pc, back_pc, self.induction_var, self.induction_step, self.reductions.len());
     }
 
@@ -5975,7 +6040,7 @@ fn emit_vectorized_loop(
     let bound_slot = match vec.bound_slot {
         Some(s) => s,
         None => {
-            eprintln!("[JIT-VEC] No bound slot found, falling back to scalar");
+            jit_trace!("[JIT-VEC] No bound slot found, falling back to scalar");
             return false;
         }
     };
@@ -5983,7 +6048,7 @@ fn emit_vectorized_loop(
     // Check if any reduction operand is the induction var — can't vectorize those
     for red in &vec.reductions {
         if Some(red.val_slot) == vec.induction_var {
-            eprintln!("[JIT-VEC] Reduction operand is induction var (slot_{}), not vectorizable",
+            jit_trace!("[JIT-VEC] Reduction operand is induction var (slot_{}), not vectorizable",
                 red.val_slot);
             return false;
         }
@@ -6008,12 +6073,12 @@ fn emit_vectorized_loop(
     // based initialization is implemented.
     let has_mul = vec.reductions.iter().any(|r| r.op == BinOpKind::Mul);
     if has_mul {
-        eprintln!("[JIT-VEC] Mul reductions require stride-based vectorization (not yet implemented), falling back to scalar");
+        jit_trace!("[JIT-VEC] Mul reductions require stride-based vectorization (not yet implemented), falling back to scalar");
         return false;
     }
     let has_addsub = vec.reductions.iter().any(|r| matches!(r.op, BinOpKind::Add | BinOpKind::Sub));
 
-    eprintln!("[JIT-VEC] Emitting AVX2 vectorized loop: VF={}, iv=slot_{}, bound=slot_{}, has_mul={}, accs={}",
+    jit_trace!("[JIT-VEC] Emitting AVX2 vectorized loop: VF={}, iv=slot_{}, bound=slot_{}, has_mul={}, accs={}",
         vf, iv_slot, bound_slot, has_mul, acc_slots.len());
 
     // For Mul reductions, we need to precompute K^VF (stride multiplier)
@@ -6066,11 +6131,11 @@ fn emit_vectorized_loop(
                         for _ in 0..vf {
                             stride = (stride as i32).wrapping_mul(v as i32) as i64;
                         }
-                        eprintln!("[JIT-VEC] Mul stride: {}^8 = {} (i32)", v, stride as i32);
+                        jit_trace!("[JIT-VEC] Mul stride: {}^8 = {} (i32)", v, stride as i32);
                         Some(stride)
                     }
                     None => {
-                        eprintln!("[JIT-VEC] Mul operand not a compile-time constant, falling back to scalar");
+                        jit_trace!("[JIT-VEC] Mul operand not a compile-time constant, falling back to scalar");
                         return false;
                     }
                 }
@@ -6169,7 +6234,7 @@ fn emit_vectorized_loop(
                                     8 // K=1: sum = 8
                                 };
                                 let stride = (c as i32).wrapping_mul(geo_sum);
-                                eprintln!("[JIT-VEC] Add stride (geometric): C={} * geo_sum={} = {}", c as i32, geo_sum, stride);
+                                jit_trace!("[JIT-VEC] Add stride (geometric): C={} * geo_sum={} = {}", c as i32, geo_sum, stride);
                                 Some(stride as i64)
                             }
                             _ => None,
@@ -6384,7 +6449,7 @@ fn emit_vectorized_loop(
                 .copy_from_slice(&rel32.to_le_bytes());
         }
 
-        eprintln!("[JIT-VEC] AVX-512 masked tail emitted (eliminates scalar remainder loop)");
+        jit_trace!("[JIT-VEC] AVX-512 masked tail emitted (eliminates scalar remainder loop)");
     }
 
     // ── Step 4: Horizontal reduction ─────────────────────────────────────
@@ -6784,7 +6849,7 @@ fn emit_vectorized_loop(
         }
     }
 
-    eprintln!("[JIT-VEC] AVX2 vectorized loop emitted ({} bytes for SIMD portion), avx512_masked_tail={}",
+    jit_trace!("[JIT-VEC] AVX2 vectorized loop emitted ({} bytes for SIMD portion), avx512_masked_tail={}",
         em.pos() - simd_loop_start + 50, use_avx512_tail);
     true
 }
@@ -7994,6 +8059,14 @@ impl Emitter {
         // needed as a source?" set as a u16 bitmask, making the inner check
         // O(1) instead of O(N).  Combined with swap_remove for O(1) deletion,
         // the overall complexity drops from O(N³) to O(N²) worst case.
+        //
+        // Scratch register rotation: for complex cycles that can't be resolved
+        // with XCHG, we alternate between R10 and R11 as scratch registers.
+        // This avoids creating artificial WAR/WAW dependencies in the CPU's
+        // Register Alias Table (RAT) when breaking multiple consecutive cycles.
+        // The RAT can perform zero-cycle moves via register renaming, but only
+        // if the scratch registers don't create name dependencies.
+        let mut scratch_reg: u8 = 10; // Start with R10, alternate to R11
         let mut remaining = pending.len();
 
         while remaining > 0 {
@@ -8052,15 +8125,16 @@ impl Emitter {
                         pending.swap(partner_idx, remaining);
                     }
                 } else {
-                    // Complex cycle: use R11 as scratch register
-                    // MOV R11, src    (save src value)
-                    // MOV dst, R11    (move saved value to dst)
+                    // Complex cycle: use rotating scratch register (R10/R11)
+                    // to avoid WAR/WAW structural hazards in the RAT.
+                    // MOV scratch, src    (save src value)
+                    // MOV dst, scratch    (move saved value to dst)
                     // The remaining pending moves that referenced `src` will
-                    // now read the old value from R11 — but since we already
-                    // removed this entry, the remaining cycle members will be
-                    // resolved in subsequent iterations.
-                    self.mov_reg_reg(11, src);  // R11 = src
-                    self.mov_reg_reg(dst, 11);  // dst = R11(=old src)
+                    // be resolved in subsequent iterations.
+                    self.mov_reg_reg(scratch_reg, src);  // scratch = src
+                    self.mov_reg_reg(dst, scratch_reg);  // dst = scratch(=old src)
+                    // Rotate scratch register for next cycle break
+                    scratch_reg = if scratch_reg == 10 { 11 } else { 10 };
                 }
             }
         }
@@ -8538,7 +8612,7 @@ fn induction_var_strength_reduce(instrs: &mut Vec<Instr>) {
             if !induction_vars.is_empty() {
                 // Use SCEV trip_count (if known) to log additional info.
                 if scev.trip_count.is_some() {
-                    eprintln!("[JIT-SCEV] Loop trip count: {}", scev.trip_count.unwrap());
+                    jit_trace!("[JIT-SCEV] Loop trip count: {}", scev.trip_count.unwrap());
                 }
 
                 // Collect slots to use for new temporaries.  Find the max slot.
@@ -9732,7 +9806,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // This information drives alignment, instruction selection, and scheduling
     // decisions throughout the code generation pipeline.
     let cpu = cpu_features();
-    eprintln!("[JIT] CPU features: SSE4.2={} AVX={} AVX2={} BMI1={} BMI2={} POPCNT={} LZCNT={} ADX={} AVX512F={}",
+    jit_trace!("[JIT] CPU features: SSE4.2={} AVX={} AVX2={} BMI1={} BMI2={} POPCNT={} LZCNT={} ADX={} AVX512F={}",
         cpu.has_sse42, cpu.has_avx, cpu.has_avx2, cpu.has_bmi1, cpu.has_bmi2,
         cpu.has_popcnt, cpu.has_lzcnt, cpu.has_adx, cpu.has_avx512f);
 
@@ -9748,7 +9822,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     let _lbr = lbr_profiler();
     let _tmam = tmam_analyzer();
     let _tmam_result = _tmam.analyze(4); // 4-wide machine
-    eprintln!("[JIT] TMAM: {:?}", _tmam_result._dominant);
+    jit_trace!("[JIT] TMAM: {:?}", _tmam_result._dominant);
 
     // ── Try Copy-and-Patch stencil compilation first (O(1) per instruction) ──
     // The stencil compiler uses pre-compiled bytecode handler templates with
@@ -9758,15 +9832,15 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     let stencil_compiler = stencil_compiler();
     if let Some(code) = stencil_compiler.compile_stencil(compiled) {
         if let Some(mem) = ExecMem::new(&code) {
-            let compile_elapsed = compile_start.elapsed();
-            eprintln!("[JIT] Stencil compilation of '{}' succeeded in {} µs ({} bytes, {} slots)",
-                compiled.name, compile_elapsed.as_micros(), code.len(), compiled.slot_count);
+            let _compile_elapsed = compile_start.elapsed();
+            jit_trace!("[JIT] Stencil compilation of '{}' succeeded in {} µs ({} bytes, {} slots)",
+                compiled.name, _compile_elapsed.as_micros(), code.len(), compiled.slot_count);
 
             // Exercise stencil specialization and super-stencil building
             let _bank = specialized_stencil_bank();
             let _supers = build_super_stencils(&compiled.instrs);
             if !_supers.is_empty() {
-                eprintln!("[JIT] Super-stencils: {} fused sequences found", _supers.len());
+                jit_trace!("[JIT] Super-stencils: {} fused sequences found", _supers.len());
             }
 
             // Exercise register-aware stencil compilation and legacy extract_slot_disp
@@ -9774,14 +9848,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 let _ = StencilCompiler::extract_slot_disp(&compiled.instrs[0], StencilPatch::SlotDisp32);
             }
             if let Some(_ra_code) = stencil_compiler.compile_stencil_ra(compiled, &RegAlloc::new(compiled.slot_count)) {
-                eprintln!("[JIT] RA stencil compilation produced {} bytes", _ra_code.len());
+                jit_trace!("[JIT] RA stencil compilation produced {} bytes", _ra_code.len());
             }
 
             // Exercise AVX-512 stencil kernels if available
             if cpu_features().has_avx512f {
                 let mut avx512_kernels = Avx512StencilKernels::new();
                 let _ = avx512_kernels.get_or_compile(4, 4, 4);
-                eprintln!("[JIT] AVX-512 stencil kernels initialized");
+                jit_trace!("[JIT] AVX-512 stencil kernels initialized");
             }
 
             return Some(NativeCode {
@@ -9802,8 +9876,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // Gate: bail out early if any instruction is outside our supported set.
     // NOTE: MatMulInstr is now supported — it triggers AVX-512 FMA kernel emission
     // when detected, or falls back to the interpreter for the actual computation.
-    for (i, instr) in instrs.iter().enumerate() {
-        match instr {
+    for (_i, _instr) in instrs.iter().enumerate() {
+        match _instr {
             Instr::LoadI32(..)
             | Instr::LoadI64(..)
             | Instr::LoadBool(..)
@@ -9824,7 +9898,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             | Instr::MatMulInstr(..)
             | Instr::Nop => {}
             _ => {
-                eprintln!("[JIT] translate: rejected at pc={}: {:?}", i, instr);
+                jit_trace!("[JIT] translate: rejected at pc={}: {:?}", _i, _instr);
                 return None;
             }
         }
@@ -9859,7 +9933,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // Build SCEV expressions for all induction variables in the loop.
     // This feeds into the stencil compiler for pre-computed offset emission
     // and avoids deep match-tree dispatch inside the hot loop body.
-    let scev = if let Some(iv_slot) = vectorizer.induction_var {
+    let scev = if let Some(_iv_slot) = vectorizer.induction_var {
         // Find loop boundaries for SCEV analysis
         let mut loop_start = 0usize;
         let mut loop_end = instrs.len();
@@ -9875,8 +9949,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         }
         let scev = ScalarEvolution::analyze(instrs, loop_start, loop_end);
         if scev.primary_induction.is_some() {
-            eprintln!("[JIT-SCEV] Primary induction var: slot_{}, stride={}",
-                iv_slot, scev.stride);
+            jit_trace!("[JIT-SCEV] Primary induction var: slot_{}, stride={}",
+                _iv_slot, scev.stride);
         }
         scev
     } else {
@@ -9901,7 +9975,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     };
     let _simd_f32_lanes = simd_level.f32_lanes();
     if _simd_f32_lanes > 1 {
-        eprintln!("[JIT-VEC] SimdLevel::{:?} provides {} f32 lanes", simd_level, _simd_f32_lanes);
+        jit_trace!("[JIT-VEC] SimdLevel::{:?} provides {} f32 lanes", simd_level, _simd_f32_lanes);
     }
     // Enable SIMD vectorization for all reduction types including Mul.
     // Mul reductions use the polynomial/geometric-sum stride approach already
@@ -9914,12 +9988,12 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     if vec_is_applicable {
         let has_mul = vectorizer.reductions.iter().any(|r| r.op == BinOpKind::Mul);
         if has_mul {
-            eprintln!("[JIT-VEC] Vectorization factor = {}, will emit AVX2 SIMD loop (Mul reduction: geometric-sum stride)", vec_factor);
+            jit_trace!("[JIT-VEC] Vectorization factor = {}, will emit AVX2 SIMD loop (Mul reduction: geometric-sum stride)", vec_factor);
         } else {
-            eprintln!("[JIT-VEC] Vectorization factor = {}, will emit AVX2 SIMD loop", vec_factor);
+            jit_trace!("[JIT-VEC] Vectorization factor = {}, will emit AVX2 SIMD loop", vec_factor);
         }
     } else if vectorizer.reject_reason.is_some() {
-        eprintln!("[JIT-VEC] Loop not vectorized: {}", vectorizer.reject_reason.unwrap());
+        jit_trace!("[JIT-VEC] Loop not vectorized: {}", vectorizer.reject_reason.unwrap());
     }
 
     // ── Superpower Y: Speculative AVX-512 Vectorization ────────────────
@@ -9945,7 +10019,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
         }
         if !spec_vec512.candidates.is_empty() {
-            eprintln!("[JIT-VEC-512] AVX-512: {} vectorizable loop candidates detected",
+            jit_trace!("[JIT-VEC-512] AVX-512: {} vectorizable loop candidates detected",
                 spec_vec512.candidates.len());
         }
     }
@@ -9983,7 +10057,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // Log the XMM registers allocated by the register allocator for float slots.
     // The used_xmm_regs field tracks which XMM registers are in use.
     if !ra.used_xmm_regs.is_empty() {
-        eprintln!("[JIT] Allocated XMM registers: {:?}", ra.used_xmm_regs);
+        jit_trace!("[JIT] Allocated XMM registers: {:?}", ra.used_xmm_regs);
     }
     // Verify that float slots marked by compute_float_slots have XMM assignments.
     // Use has_xmm() to check if float-typed slots received XMM register allocation.
@@ -9991,14 +10065,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         .filter(|&s| float_slots[s] && ra.has_xmm(s as u16))
         .count();
     if _xmm_allocated_count > 0 {
-        eprintln!("[JIT] {} float slots assigned XMM registers", _xmm_allocated_count);
+        jit_trace!("[JIT] {} float slots assigned XMM registers", _xmm_allocated_count);
     }
 
     // ── Pass 2: Register coalescing ─────────────────────────────────────
     let coalesced = coalesce_registers(instrs, &mut ra);
     let coalesced_count = coalesced.iter().filter(|&&c| c).count();
     if coalesced_count > 0 {
-        eprintln!("[JIT] Coalesced {} redundant Move instructions", coalesced_count);
+        jit_trace!("[JIT] Coalesced {} redundant Move instructions", coalesced_count);
     }
 
     // ── Emission ──────────────────────────────────────────────────────────
@@ -10032,7 +10106,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // wired in so the struct and its emitter methods are reachable.
     let custom_cc = CustomCallingConvention::new();
     if custom_cc.enabled {
-        eprintln!("[JIT-CC] Custom calling convention enabled: VM_CTX=R13, STACK=R14, HEAP=R15");
+        jit_trace!("[JIT-CC] Custom calling convention enabled: VM_CTX=R13, STACK=R14, HEAP=R15");
     }
 
     // ── Opt3: Pre-pass — identify cold blocks (loop exits, deopt targets) ─
@@ -10091,7 +10165,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     let _cmc_original = cmc_patch.original_target;
     let _cmc_new = cmc_patch.new_target;
     let _cmc_patched = cmc_patch.patched.load(std::sync::atomic::Ordering::Relaxed);
-    eprintln!("[JIT-CMC] Patch point at offset {}, addr={:#x}, original={}, new={}, patched={}",
+    jit_trace!("[JIT-CMC] Patch point at offset {}, addr={:#x}, original={}, new={}, patched={}",
         cmc_slot_offset, cmc_patch_addr, _cmc_original, _cmc_new, _cmc_patched);
     // atomic_patch_jmp would be called when a Tier-2 superblock is
     // ready, like so:
@@ -10260,7 +10334,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             );
             if emitted {
                 if cpu.has_avx512f {
-                    eprintln!("[JIT-VEC] SIMD loop emitted at PC={}, AVX-512 masked tail handles remainder", pc);
+                    jit_trace!("[JIT-VEC] SIMD loop emitted at PC={}, AVX-512 masked tail handles remainder", pc);
                     // Superpower Y: If AVX-512 is available and the speculative
                     // vectorizer detected candidates, emit the AVX-512 masked
                     // tail loop. This uses ZMM registers and opmask registers
@@ -10275,7 +10349,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     // With mask_reg=0 (k0 = no masking), this is a plain add.
                     em.emit_vaddps_zmm_masked(0, 0, 1, 0);
                 } else {
-                    eprintln!("[JIT-VEC] SIMD loop emitted at PC={}, scalar loop will handle remainder", pc);
+                    jit_trace!("[JIT-VEC] SIMD loop emitted at PC={}, scalar loop will handle remainder", pc);
                 }
             }
             // After SIMD emission, continue with scalar code for the remainder.
@@ -11669,7 +11743,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
             Instr::Jump(off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
-                eprintln!("[JIT-CG] pc={}: Jump({}) target_pc={} cur_offset={}", pc, off, target, em.pos());
+                jit_trace!("[JIT-CG] pc={}: Jump({}) target_pc={} cur_offset={}", pc, off, target, em.pos());
                 if target > instrs.len() {
                     return None;
                 }
@@ -11689,7 +11763,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             }
             Instr::JumpFalse(cond, off) => {
                 let target = ((pc as i32) + 1 + *off) as usize;
-                eprintln!("[JIT-CG] pc={}: JumpFalse({}, {}) target_pc={} cur_offset={}", pc, cond, off, target, em.pos());
+                jit_trace!("[JIT-CG] pc={}: JumpFalse({}, {}) target_pc={} cur_offset={}", pc, cond, off, target, em.pos());
                 if target > instrs.len() {
                     return None;
                 }
@@ -12115,7 +12189,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 // time, emit the inline AVX-512 FMA kernel instead of a CALL.
                 // For now, call it with placeholder dimensions to exercise the code path.
                 let _matmul_kernel_code = Emitter::emit_avx512_matmul_kernel(4, 16, 4);
-                eprintln!("[JIT] MatMulInstr: AVX-512 matmul kernel emitted ({} bytes)", _matmul_kernel_code.len());
+                jit_trace!("[JIT] MatMulInstr: AVX-512 matmul kernel emitted ({} bytes)", _matmul_kernel_code.len());
 
                 // CALL the matmul helper function
                 // For now, emit a placeholder CALL rel32 (will be patched at link time)
@@ -12127,7 +12201,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 // Emit epilogue for pinned IV registers
                 iv_pinning.emit_epilogue(&mut em, true, true, true);
 
-                eprintln!("[JIT] MatMulInstr: dst={}, lhs={}, rhs={} — emitted runtime dispatch call (IV pins: R{}, R{}, R{})",
+                jit_trace!("[JIT] MatMulInstr: dst={}, lhs={}, rhs={} — emitted runtime dispatch call (IV pins: R{}, R{}, R{})",
                     dst, lhs, rhs, ML_IV_PIN_REG, ML_IV_PIN_REG2, ML_BASE_PTR_PIN);
 
                 const_at.clear();
@@ -12150,7 +12224,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         // The hot_label field is used to correlate cold code with the
         // hot-code jump that references it.
         let _hot_ref = fragment.hot_label;
-        eprintln!("[JIT-LAYOUT] Emitting cold fragment at offset {}, hot_label={}", em.pos(), _hot_ref);
+        jit_trace!("[JIT-LAYOUT] Emitting cold fragment at offset {}, hot_label={}", em.pos(), _hot_ref);
         em.extend_from_slice(&fragment.code);
     }
     // Emit a cold deopt stub for each cold label identified during the
@@ -12220,12 +12294,12 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
         for fragment in &code_layout.cold_fragments {
             // The hot_label references a Jcc placeholder — patch its displacement
             // to point to this cold code's offset
-            let cold_offset = code_buf.len();
+            let _cold_offset = code_buf.len();
             code_buf.extend_from_slice(&fragment.code);
             // Patch the Jcc at fragment.hot_label (which is a byte offset in the emitter)
             // The displacement is at hot_label + some offset from the Jcc pattern
             // For now, log it (full patching requires tracking the displacement position per fragment)
-            eprintln!("[JIT-COLD] Cold fragment at offset {}, hot_label={}", cold_offset, fragment.hot_label);
+            jit_trace!("[JIT-COLD] Cold fragment at offset {}, hot_label={}", _cold_offset, fragment.hot_label);
         }
     }
 
@@ -12249,7 +12323,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             let src_ty = type_at.get(*src);
             return_is_i32 = !matches!(src_ty, SlotType::I64);
             if !return_is_i32 {
-                eprintln!("[JIT] Return slot {} is {:?}, using i64 return path", src, src_ty);
+                jit_trace!("[JIT] Return slot {} is {:?}, using i64 return path", src, src_ty);
             }
             break;
         }
@@ -12284,7 +12358,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     let _bi_delta = _bi_end.saturating_sub(_bi_start);
     let _ = (compilation_heat, _bm_delta, _ic_delta, _bi_delta); // suppress unused warning
     if profiler.available {
-        eprintln!("[JIT-PMC] Compilation profiled: branch_mispredicts={}, icache_misses={}, branch_instrs={}, heat_score={:.1}",
+        jit_trace!("[JIT-PMC] Compilation profiled: branch_mispredicts={}, icache_misses={}, branch_instrs={}, heat_score={:.1}",
             _bm_delta, _ic_delta, _bi_delta, compilation_heat);
     }
 
@@ -12292,10 +12366,10 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
     // making it impossible to diagnose whether slow execution was due to
     // compilation overhead or runtime performance. Now we always display
     // the compilation duration so users can see the JIT's performance.
-    let compile_elapsed = compile_start.elapsed();
-    let compile_us = compile_elapsed.as_micros();
-    eprintln!("[JIT] Compilation of '{}' completed in {} µs ({} bytes, {} slots, {} instrs)",
-        compiled.name, compile_us, code_buf.len(), compiled.slot_count, compiled.instrs.len());
+    let _compile_elapsed = compile_start.elapsed();
+    let _compile_us = _compile_elapsed.as_micros();
+    jit_trace!("[JIT] Compilation of '{}' completed in {} µs ({} bytes, {} slots, {} instrs)",
+        compiled.name, _compile_us, code_buf.len(), compiled.slot_count, compiled.instrs.len());
 
     Some(NativeCode {
         slot_count: compiled.slot_count,
@@ -12339,6 +12413,14 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
     let mut str_pool: Vec<String> = Vec::new();
     let mut str_idx: FxHashMap<String, u16> = FxHashMap::default();
 
+    // ── Block ID → index lookup ─────────────────────────────────────────
+    // Pre-build an index so block lookups are O(1) instead of O(B) via
+    // linear scan.  This eliminates O(B²) behavior in DFS traversal.
+    let block_index: FxHashMap<BlockId, usize> = func.blocks.iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
     // ── ValueId → slot mapping ──────────────────────────────────────────
     // Assign dense slot indices to all ValueIds. Parameters get the first
     // N slots (matching the calling convention). Then all other defined
@@ -12353,14 +12435,15 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
     }
     let param_count = next_slot;
 
-    // Helper: intern a string
+    // Helper: intern a string — single allocation on miss path
     let intern_str = |s: &str, str_pool: &mut Vec<String>, str_idx: &mut FxHashMap<String, u16>| -> u16 {
         if let Some(&idx) = str_idx.get(s) {
             idx
         } else {
             let idx = str_pool.len() as u16;
-            str_pool.push(s.to_string());
-            str_idx.insert(s.to_string(), idx);
+            let owned = s.to_string();
+            str_pool.push(owned.clone());
+            str_idx.insert(owned, idx);
             idx
         }
     };
@@ -12387,29 +12470,31 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
         fn dfs_visit(
             bid: BlockId,
             func: &FlatIrFunction,
+            block_index: &FxHashMap<BlockId, usize>,
             visited: &mut FxHashSet<BlockId>,
             order: &mut Vec<BlockId>,
         ) {
             if visited.contains(&bid) { return; }
             visited.insert(bid);
             order.push(bid);
-            if let Some(block) = func.blocks.iter().find(|b| b.id == bid) {
+            if let Some(&bi) = block_index.get(&bid) {
+                let block = &func.blocks[bi];
                 for instr in &block.instrs {
                     match &instr.op {
                         // Visit if_true FIRST (fall-through path), then if_false
                         IrOp::CondBr { if_true, if_false, .. } => {
-                            dfs_visit(*if_true, func, visited, order);
-                            dfs_visit(*if_false, func, visited, order);
+                            dfs_visit(*if_true, func, block_index, visited, order);
+                            dfs_visit(*if_false, func, block_index, visited, order);
                         }
                         IrOp::Jump { target, .. } => {
-                            dfs_visit(*target, func, visited, order);
+                            dfs_visit(*target, func, block_index, visited, order);
                         }
                         _ => {}
                     }
                 }
             }
         }
-        dfs_visit(func.entry, func, &mut visited, &mut block_order);
+        dfs_visit(func.entry, func, &block_index, &mut visited, &mut block_order);
         // Add any remaining blocks not reachable from entry
         for block in &func.blocks {
             if !visited.contains(&block.id) {
@@ -12454,8 +12539,8 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
     let mut block_start_pc: FxHashMap<BlockId, usize> = FxHashMap::default();
 
     for (block_order_idx, bid) in block_order.iter().enumerate() {
-        let block = match func.blocks.iter().find(|b| b.id == *bid) {
-            Some(b) => b,
+        let block = match block_index.get(bid) {
+            Some(&bi) => &func.blocks[bi],
             None => continue,
         };
 
@@ -13780,16 +13865,22 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
     // ── Step 1: Eradicate Phi nodes → Block Parameters ──────────────────
     let phi_count = func.phis_to_block_params();
     if phi_count > 0 {
-        eprintln!("[JIT-SSA] Converted {} phi nodes to block parameters in {}", phi_count, func.name);
+        jit_trace!("[JIT-SSA] Converted {} phi nodes to block parameters in {}", phi_count, func.name);
     }
 
     // ── Step 2: Split critical edges ────────────────────────────────────
     let edges_split = func.split_critical_edges();
     if edges_split > 0 {
-        eprintln!("[JIT-SSA] Split {} critical edges in {}", edges_split, func.name);
+        jit_trace!("[JIT-SSA] Split {} critical edges in {}", edges_split, func.name);
     }
 
-    eprintln!("[JIT-SSA] Compiling {} ({} blocks, {} params, phi_erased={})",
+    // Build block ID → index HashMap AFTER edge splitting (which may add new blocks)
+    let block_index: FxHashMap<BlockId, usize> = func.blocks.iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    jit_trace!("[JIT-SSA] Compiling {} ({} blocks, {} params, phi_erased={})",
         func.name, func.blocks.len(), func.params.len(), phi_count);
 
     // ── Step 2b: Speculative engine — observe value types at branch points ──
@@ -13810,7 +13901,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
         }
     }
     if spec_guard_count > 0 {
-        eprintln!("[JIT-SSA] SpeculativeEngine: {} guard candidates in {}",
+        jit_trace!("[JIT-SSA] SpeculativeEngine: {} guard candidates in {}",
             spec_guard_count, func.name);
     }
 
@@ -13849,28 +13940,30 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
         fn dfs_visit_ssa(
             bid: BlockId,
             func: &FlatIrFunction,
+            block_index: &FxHashMap<BlockId, usize>,
             visited: &mut FxHashSet<BlockId>,
             order: &mut Vec<BlockId>,
         ) {
             if visited.contains(&bid) { return; }
             visited.insert(bid);
             order.push(bid);
-            if let Some(block) = func.blocks.iter().find(|b| b.id == bid) {
+            if let Some(&bi) = block_index.get(&bid) {
+                let block = &func.blocks[bi];
                 for instr in &block.instrs {
                     match &instr.op {
                         IrOp::CondBr { if_true, if_false, .. } => {
-                            dfs_visit_ssa(*if_true, func, visited, order);
-                            dfs_visit_ssa(*if_false, func, visited, order);
+                            dfs_visit_ssa(*if_true, func, block_index, visited, order);
+                            dfs_visit_ssa(*if_false, func, block_index, visited, order);
                         }
                         IrOp::Jump { target, .. } => {
-                            dfs_visit_ssa(*target, func, visited, order);
+                            dfs_visit_ssa(*target, func, block_index, visited, order);
                         }
                         _ => {}
                     }
                 }
             }
         }
-        dfs_visit_ssa(func.entry, func, &mut visited, &mut block_order);
+        dfs_visit_ssa(func.entry, func, &block_index, &mut visited, &mut block_order);
         for block in &func.blocks {
             if !visited.contains(&block.id) {
                 block_order.push(block.id);
@@ -13895,7 +13988,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
     };
 
     for bid in &block_order {
-        let block = func.blocks.iter().find(|b| b.id == *bid).unwrap();
+        let block = &func.blocks[*block_index.get(bid).unwrap()];
         // Block parameters are "used" from the start of the block
         for &(param_vid, _) in &block.params {
             record_use(param_vid, global_idx);
@@ -13959,7 +14052,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
     let mut hot_values: FxHashSet<ValueId> = FxHashSet::default();
     for bid in &block_order {
         if ssa_loop_headers_ra.contains(bid) {
-            let block = func.blocks.iter().find(|b| b.id == *bid).unwrap();
+            let block = &func.blocks[*block_index.get(bid).unwrap()];
             for &(param_vid, _) in &block.params {
                 hot_values.insert(param_vid);
             }
@@ -14106,7 +14199,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
 
     // Block parameters and instruction results, in DFS/dominance order
     for bid in &block_order {
-        let block = func.blocks.iter().find(|b| b.id == *bid).unwrap();
+        let block = &func.blocks[*block_index.get(bid).unwrap()];
         let block_start_idx = def_pos.values().copied().min().unwrap_or(0);
 
         // Allocate block parameters with affinity from predecessors
@@ -14127,7 +14220,8 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
             // Build affinity: for Jump/CondBr args → target block params
             match &instr.op {
                 IrOp::Jump { target, args } => {
-                    if let Some(target_block) = func.blocks.iter().find(|b| b.id == *target) {
+                    if let Some(&bi) = block_index.get(target) {
+                        let target_block = &func.blocks[bi];
                         for (arg_vid, (param_vid, _)) in args.iter().zip(target_block.params.iter()) {
                             if let Some(&param_reg) = value_to_reg.get(param_vid) {
                                 affinity_hints.insert(*arg_vid, param_reg);
@@ -14136,14 +14230,16 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
                     }
                 }
                 IrOp::CondBr { if_true, if_true_args, if_false, if_false_args, .. } => {
-                    if let Some(true_block) = func.blocks.iter().find(|b| b.id == *if_true) {
+                    if let Some(&bi) = block_index.get(if_true) {
+                        let true_block = &func.blocks[bi];
                         for (arg_vid, (param_vid, _)) in if_true_args.iter().zip(true_block.params.iter()) {
                             if let Some(&param_reg) = value_to_reg.get(param_vid) {
                                 affinity_hints.insert(*arg_vid, param_reg);
                             }
                         }
                     }
-                    if let Some(false_block) = func.blocks.iter().find(|b| b.id == *if_false) {
+                    if let Some(&bi) = block_index.get(if_false) {
+                        let false_block = &func.blocks[bi];
                         for (arg_vid, (param_vid, _)) in if_false_args.iter().zip(false_block.params.iter()) {
                             if let Some(&param_reg) = value_to_reg.get(param_vid) {
                                 affinity_hints.insert(*arg_vid, param_reg);
@@ -14219,7 +14315,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
             }
         }
 
-        let block = func.blocks.iter().find(|b| b.id == *bid)?;
+        let block = &func.blocks[*block_index.get(bid)?];
         block_offsets.insert(*bid, em.pos());
         pc_to_off.push(em.pos());
 
@@ -14412,7 +14508,8 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
                     // ── Edge Moves for Block Parameters ───────────────────
                     // Before jumping, move the args into the registers
                     // assigned to the target block's parameters.
-                    if let Some(target_block) = func.blocks.iter().find(|b| b.id == *target) {
+                    if let Some(&bi) = block_index.get(target) {
+                        let target_block = &func.blocks[bi];
                         let mut moves: Vec<(u8, u8)> = Vec::new();
                         for (arg_vid, (param_vid, _)) in args.iter().zip(target_block.params.iter()) {
                             let src_reg = value_to_reg.get(arg_vid).copied().unwrap_or(0);
@@ -14451,7 +14548,8 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
                     // ── Edge Moves for if_false branch ────────────────────
                     // If the condition is zero, we go to if_false.
                     // Insert edge moves for if_false's block parameters.
-                    if let Some(false_block) = func.blocks.iter().find(|b| b.id == *if_false) {
+                    if let Some(&bi) = block_index.get(if_false) {
+                        let false_block = &func.blocks[bi];
                         let mut moves: Vec<(u8, u8)> = Vec::new();
                         for (arg_vid, (param_vid, _)) in if_false_args.iter().zip(false_block.params.iter()) {
                             let src_reg = value_to_reg.get(arg_vid).copied().unwrap_or(0);
@@ -14483,7 +14581,8 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
                     });
 
                     // ── Edge Moves for if_true branch (fall-through) ──────
-                    if let Some(true_block) = func.blocks.iter().find(|b| b.id == *if_true) {
+                    if let Some(&bi) = block_index.get(if_true) {
+                        let true_block = &func.blocks[bi];
                         let mut moves: Vec<(u8, u8)> = Vec::new();
                         for (arg_vid, (param_vid, _)) in if_true_args.iter().zip(true_block.params.iter()) {
                             let src_reg = value_to_reg.get(arg_vid).copied().unwrap_or(0);
@@ -14594,7 +14693,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
             // Mark as already resolved so patch_fixups won't touch it
             fixup.target_pc = usize::MAX;
         } else {
-            eprintln!("[JIT-SSA] Warning: no offset for block {:?} in {}", target_block, func.name);
+            jit_trace!("[JIT-SSA] Warning: no offset for block {:?} in {}", target_block, func.name);
         }
     }
 
@@ -14602,7 +14701,7 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
     // resolved above (e.g., fixups created before block_offsets was built).
     let mut code_buf = em.into_vec();
     if patch_fixups(&mut code_buf, &fixups, &pc_to_off).is_none() {
-        eprintln!("[JIT-SSA] Warning: branch fixup failed for {}", func.name);
+        jit_trace!("[JIT-SSA] Warning: branch fixup failed for {}", func.name);
     }
 
     let mem = ExecMem::new(&code_buf)?;
@@ -14640,7 +14739,7 @@ pub fn translate_from_ir(func: &mut FlatIrFunction) -> Option<NativeCode> {
         return None;
     }
 
-    eprintln!("[JIT-IR] translate_from_ir: compiling {} ({} blocks, {} params)",
+    jit_trace!("[JIT-IR] translate_from_ir: compiling {} ({} blocks, {} params)",
         func.name, func.blocks.len(), func.params.len());
 
     // ── Global SSA Optimization Passes ────────────────────────────────────
@@ -14649,19 +14748,19 @@ pub fn translate_from_ir(func: &mut FlatIrFunction) -> Option<NativeCode> {
     // This replaces the older block-level CSE and const-prop passes.
     let sccp_changes = sccp_optimize(func);
     if sccp_changes > 0 {
-        eprintln!("[JIT-IR] SCCP: {} constants propagated / branches resolved in {}",
+        jit_trace!("[JIT-IR] SCCP: {} constants propagated / branches resolved in {}",
             sccp_changes, func.name);
     }
 
     let gvn_eliminated = gvn_optimize(func);
     if gvn_eliminated > 0 {
-        eprintln!("[JIT-IR] GVN: {} redundant computations eliminated in {}",
+        jit_trace!("[JIT-IR] GVN: {} redundant computations eliminated in {}",
             gvn_eliminated, func.name);
     }
 
     let non_escaping = escape_analysis(func);
     if non_escaping > 0 {
-        eprintln!("[JIT-IR] Escape analysis: {} non-escaping allocations in {}",
+        jit_trace!("[JIT-IR] Escape analysis: {} non-escaping allocations in {}",
             non_escaping, func.name);
     }
 
@@ -14700,7 +14799,7 @@ pub fn translate_from_ir(func: &mut FlatIrFunction) -> Option<NativeCode> {
             }
         }
         pettis_hansen_reorder(func, &edge_weights);
-        eprintln!("[JIT-IR] Pettis-Hansen block reordering applied to {}", func.name);
+        jit_trace!("[JIT-IR] Pettis-Hansen block reordering applied to {}", func.name);
     }
 
     // ── SSA Register Allocation ────────────────────────────────────────────
@@ -14709,15 +14808,15 @@ pub fn translate_from_ir(func: &mut FlatIrFunction) -> Option<NativeCode> {
     let gpr_pool: &[u8] = &[8, 9, 10, 11, 6, 12, 13, 14, 15, 3];
     let xmm_pool: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
     let custom_cc = CustomCallingConvention::new();
-    let ssa_ra = single_pass_ra(func, gpr_pool, xmm_pool, &custom_cc);
-    eprintln!("[JIT-IR] Single-pass RA: {} values assigned, {} callee-saved, {} spill bytes",
-        ssa_ra.assignments.len(), ssa_ra.used_callee_saved.len(), ssa_ra.spill_frame_size);
+    let _ssa_ra = single_pass_ra(func, gpr_pool, xmm_pool, &custom_cc);
+    jit_trace!("[JIT-IR] Single-pass RA: {} values assigned, {} callee-saved, {} spill bytes",
+        _ssa_ra.assignments.len(), _ssa_ra.used_callee_saved.len(), _ssa_ra.spill_frame_size);
 
     // Run chordal graph coloring RA as an alternative for comparison
-    let chordal_ra = ChordalGraphColoringRA::new(gpr_pool.len(), xmm_pool.len())
+    let _chordal_ra = ChordalGraphColoringRA::new(gpr_pool.len(), xmm_pool.len())
         .allocate(func);
-    eprintln!("[JIT-IR] Chordal graph coloring RA: {} values assigned, {} callee-saved, {} spill bytes",
-        chordal_ra.assignments.len(), chordal_ra.used_callee_saved.len(), chordal_ra.spill_frame_size);
+    jit_trace!("[JIT-IR] Chordal graph coloring RA: {} values assigned, {} callee-saved, {} spill bytes",
+        _chordal_ra.assignments.len(), _chordal_ra.used_callee_saved.len(), _chordal_ra.spill_frame_size);
 
     // RAT-aware pinning for short-lived temporaries
     let mut rat_pinning = RatAwarePinning::new(gpr_pool);
@@ -14730,25 +14829,25 @@ pub fn translate_from_ir(func: &mut FlatIrFunction) -> Option<NativeCode> {
             }
         }
     }
-    eprintln!("[JIT-IR] RAT-aware pinning: {} short-lived values pinned", rat_pinning.free_regs.len());
+    jit_trace!("[JIT-IR] RAT-aware pinning: {} short-lived values pinned", rat_pinning.free_regs.len());
 
     // ── Try the SSA-direct path first (Block Parameters + Edge Moves) ────
     // This bypasses the slot-array bytecode entirely, producing superior code.
     if let Some(native) = translate_ssa(func) {
-        eprintln!("[JIT-SSA] SSA-direct compilation succeeded for {}", func.name);
+        jit_trace!("[JIT-SSA] SSA-direct compilation succeeded for {}", func.name);
         return Some(native);
     }
 
-    eprintln!("[JIT-IR] SSA path not available, falling back to bytecode path for {}", func.name);
+    jit_trace!("[JIT-IR] SSA path not available, falling back to bytecode path for {}", func.name);
 
     // ── Fallback: bytecode path (flat_ir_to_compiled_fn → translate) ────
     let compiled = flat_ir_to_compiled_fn(func);
 
     // Debug: dump the generated instructions
-    eprintln!("[JIT-IR] Generated {} instructions for {}, slot_count={}, param_count={}",
+    jit_trace!("[JIT-IR] Generated {} instructions for {}, slot_count={}, param_count={}",
         compiled.instrs.len(), compiled.name, compiled.slot_count, compiled.param_count);
-    for (pc, instr) in compiled.instrs.iter().enumerate() {
-        eprintln!("[JIT-IR]   pc={}: {:?}", pc, instr);
+    for (_pc, _instr) in compiled.instrs.iter().enumerate() {
+        jit_trace!("[JIT-IR]   pc={}: {:?}", _pc, _instr);
     }
 
     // Delegate to the existing translate() for machine code emission
@@ -14762,13 +14861,13 @@ pub fn translate_from_ir(func: &mut FlatIrFunction) -> Option<NativeCode> {
     match &func.ret_ty {
         IrType::Int { width: 64, .. } => {
             if native.return_is_i32 {
-                eprintln!("[JIT-IR] Overriding return_is_i32→false for {} (ret_ty = i64)", func.name);
+                jit_trace!("[JIT-IR] Overriding return_is_i32→false for {} (ret_ty = i64)", func.name);
             }
             native.return_is_i32 = false;
         }
         IrType::Int { width: 32, .. } => {
             if !native.return_is_i32 {
-                eprintln!("[JIT-IR] Overriding return_is_i32→true for {} (ret_ty = i32)", func.name);
+                jit_trace!("[JIT-IR] Overriding return_is_i32→true for {} (ret_ty = i32)", func.name);
             }
             native.return_is_i32 = true;
         }
@@ -19092,7 +19191,7 @@ impl Emitter {
         // correctly and log the layout decision.
         let cold_size = layout.cold_code_size();
         if cold_size > 0 {
-            eprintln!(
+            jit_trace!(
                 "[JIT-OPT3] Hot/Cold layout: hot code = {} bytes, cold code = {} bytes, {} cold fragments",
                 layout.cold_zone_start,
                 cold_size,
