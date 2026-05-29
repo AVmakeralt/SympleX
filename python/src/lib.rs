@@ -1864,6 +1864,54 @@ fn stencil_compute_unrolled(src_ptr: usize, dst_ptr: usize, rows: i64, cols: i64
     0
 }
 
+// ── Tier 4: Composition / Orchestration Layer ────────────────────────────────
+//
+// Tier 4 is NOT a new execution engine — it's a smart scheduler that breaks
+// general code into Tier 1–3 chunks. This function takes a trace (as opcode +
+// operand pairs), runs the Rust Tier 4 planner (decompose → DAG → fusion →
+// buffer plan → schedule), and returns a JSON schedule string.
+//
+// The Python side then dispatches each step to the appropriate existing
+// backend (SIMD elementwise, fused vector, BLAS).
+
+/// Plan a Tier 4 execution schedule for a trace.
+///
+/// Takes a list of (opcode, operands) pairs representing the trace,
+/// decomposes into regions, builds a DAG, applies conservative fusion,
+/// computes a buffer reuse plan, and returns a JSON schedule.
+#[pyfunction]
+fn tier4_plan(trace_ops: Vec<(u8, Vec<i64>)>) -> PyResult<String> {
+    use symplex_engine::phase3_jit::tier4_compile;
+
+    let schedule = tier4_compile(&trace_ops);
+
+    // Serialize schedule to JSON
+    let steps_json: Vec<String> = schedule.steps.iter().map(|(id, tier, desc)| {
+        format!("{{\"node_id\": {}, \"tier\": {}, \"op_desc\": \"{}\"}}", id, tier, desc)
+    }).collect();
+
+    let buffer_plan_json: Vec<String> = schedule.buffer_plan.buffer_lifetimes.iter().map(|(idx, size, first, last)| {
+        format!("{{\"buffer\": {}, \"size_bytes\": {}, \"first_use\": {}, \"last_use\": {}}}", idx, size, first, last)
+    }).collect();
+
+    let slot_mapping_json: Vec<String> = schedule.buffer_plan.slot_to_buffer.iter().map(|(slot, buf)| {
+        format!("\"{}\": {}", slot, buf)
+    }).collect();
+
+    Ok(format!(
+        "{{\"steps\": [{}], \"fusion_applied\": {}, \"fused_node_count\": {}, \"estimated_cost\": {}, \"peak_memory_bytes\": {}, \"buffer_plan\": {{\"total_buffers\": {}, \"total_bytes\": {}, \"slot_mapping\": {{{}}}, \"lifetimes\": [{}]}}}}",
+        steps_json.join(", "),
+        schedule.fusion_applied,
+        schedule.fused_node_count,
+        schedule.estimated_cost,
+        schedule.peak_memory_bytes,
+        schedule.buffer_plan.total_buffers,
+        schedule.buffer_plan.total_bytes,
+        slot_mapping_json.join(", "),
+        buffer_plan_json.join(", ")
+    ))
+}
+
 // ── Module definition ───────────────────────────────────────────────────────
 
 #[pymodule]
@@ -1916,5 +1964,7 @@ fn _symplex_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Fused stencil compute
     m.add_function(wrap_pyfunction!(stencil_compute, m)?)?;
     m.add_function(wrap_pyfunction!(stencil_compute_unrolled, m)?)?;
+    // Tier 4 orchestration
+    m.add_function(wrap_pyfunction!(tier4_plan, m)?)?;
     Ok(())
 }

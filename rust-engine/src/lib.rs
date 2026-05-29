@@ -1241,6 +1241,61 @@ fn tracing_jit_compile_and_run(serialized_instrs: Vec<u8>, args: Vec<i64>) -> Py
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Tier 4: Composition / Orchestration Layer — Python bindings
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Tier 4 is NOT a new execution engine — it's a smart scheduler that breaks
+// general code into Tier 1–3 chunks. The Python side calls `tier4_plan()`
+// to get a JSON execution schedule, then dispatches each step to the
+// appropriate existing backend (SIMD elementwise, fused vector, BLAS, etc.).
+
+/// Plan a Tier 4 execution schedule for a trace.
+///
+/// Takes a list of (opcode, operands) pairs representing the trace,
+/// decomposes into regions, builds a DAG, applies conservative fusion,
+/// computes a buffer reuse plan, and returns a JSON schedule.
+///
+/// The schedule is a JSON string containing:
+///   - "steps": list of {node_id, tier, op_desc} execution steps
+///   - "fusion_applied": whether fusion reduced the DAG
+///   - "fused_node_count": number of nodes after fusion
+///   - "estimated_cost": total estimated execution cost
+///   - "peak_memory_bytes": estimated peak memory usage
+///   - "buffer_plan": slot-to-buffer mapping and lifetime info
+#[pyfunction]
+fn tier4_plan(trace_ops: Vec<(u8, Vec<i64>)>) -> PyResult<String> {
+    use crate::phase3_jit::tier4_compile;
+
+    let schedule = tier4_compile(&trace_ops);
+
+    // Serialize schedule to JSON
+    let steps_json: Vec<String> = schedule.steps.iter().map(|(id, tier, desc)| {
+        format!("{{\"node_id\": {}, \"tier\": {}, \"op_desc\": \"{}\"}}", id, tier, desc)
+    }).collect();
+
+    let buffer_plan_json: Vec<String> = schedule.buffer_plan.buffer_lifetimes.iter().map(|(idx, size, first, last)| {
+        format!("{{\"buffer\": {}, \"size_bytes\": {}, \"first_use\": {}, \"last_use\": {}}}", idx, size, first, last)
+    }).collect();
+
+    let slot_mapping_json: Vec<String> = schedule.buffer_plan.slot_to_buffer.iter().map(|(slot, buf)| {
+        format!("\"{}\": {}", slot, buf)
+    }).collect();
+
+    Ok(format!(
+        "{{\"steps\": [{}], \"fusion_applied\": {}, \"fused_node_count\": {}, \"estimated_cost\": {}, \"peak_memory_bytes\": {}, \"buffer_plan\": {{\"total_buffers\": {}, \"total_bytes\": {}, \"slot_mapping\": {{{}}}, \"lifetimes\": [{}]}}}}",
+        steps_json.join(", "),
+        schedule.fusion_applied,
+        schedule.fused_node_count,
+        schedule.estimated_cost,
+        schedule.peak_memory_bytes,
+        schedule.buffer_plan.total_buffers,
+        schedule.buffer_plan.total_bytes,
+        slot_mapping_json.join(", "),
+        buffer_plan_json.join(", ")
+    ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CUDA Backend — Python bindings
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1553,6 +1608,9 @@ fn symplex_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(phase3_compile_and_run, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_compile_ssa, m)?)?;
     m.add_function(wrap_pyfunction!(tracing_jit_compile_and_run, m)?)?;
+
+    // ── Tier 4 Orchestration ──
+    m.add_function(wrap_pyfunction!(tier4_plan, m)?)?;
 
     // ── CUDA Backend ──
     m.add_class::<CudaGpuKernel>()?;

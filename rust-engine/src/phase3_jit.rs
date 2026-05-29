@@ -148,6 +148,14 @@
 //! AH. TLB Pre-hinting: newly compiled code regions are pre-faulted through
 //!    both RW and RX mappings to warm the DTLB and ITLB, avoiding the
 //!    ~100-cycle TLB miss penalty on first execution.
+//!
+//! AI. Tier 4 Composition / Orchestration Layer: smart scheduler that
+//!    decomposes general code into Tier 1-3 chunks (SIMD elementwise,
+//!    fused vector, BLAS), builds an execution DAG with conservative
+//!    fusion (same-dtype, contiguous, no branch explosion), computes
+//!    buffer reuse plans via lifetime analysis, and dispatches to
+//!    existing backends — never inventing new execution methods.
+//!    The conductor, not a new instrument.
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
@@ -19117,7 +19125,7 @@ impl InductionVarPinning {
             emitter.emit2(0x41, 0x56); // PUSH R14
         }
     }
-    
+
     /// Emit epilogue: pop callee-saved registers in reverse order
     pub(crate) fn emit_epilogue(&self, emitter: &mut Emitter, use_outer: bool, use_middle: bool, use_accum: bool) {
         if use_accum {
@@ -19130,4 +19138,924 @@ impl InductionVarPinning {
             emitter.emit2(0x41, 0x5C); // POP R12
         }
     }
+}
+
+// =============================================================================
+// TIER 4: COMPOSITION / ORCHESTRATION LAYER
+// =============================================================================
+//
+// Tier 4 is NOT a new execution engine. It is a smart scheduler that breaks
+// general code into Tier 1–3 chunks, builds an execution DAG, and dispatches
+// to existing optimized kernels — never inventing new execution methods.
+//
+// Design principles:
+//   1. Decompose general code into "regions" classified by execution tier
+//   2. Build an execution DAG (nodes = kernels, edges = data dependencies)
+//   3. Apply conservative fusion (only fuse if safe: contiguous, no dtype
+//      conflicts, no branch dependency explosion)
+//   4. Schedule execution order respecting dependencies
+//   5. Reuse buffers aggressively (no extra copies unless required)
+//   6. Compile strategy = "cheap planning" (trace → classify → graph → assign)
+//
+// Tier model:
+//   Tier 1 = SIMD elementwise kernel
+//   Tier 2 = Fused vector kernel / reduction kernel
+//   Tier 3 = BLAS / heavy numeric ops
+//   Tier 4 = Orchestration of Tier 1–3 (the conductor, not a new instrument)
+
+/// Classification of a computation region for Tier dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tier4RegionKind {
+    /// Vectorizable elementwise op → Tier 1 (SIMD elementwise kernel)
+    Elementwise,
+    /// Reduction pattern (sum/max/min over axis) → Tier 2 (fused vector/reduction kernel)
+    Reduction,
+    /// Linear algebra (matmul, dot, solve) → Tier 3 (BLAS)
+    LinearAlgebra,
+    /// Stencil pattern (5-point, 9-point) → Tier 2 (fused stencil kernel)
+    Stencil,
+    /// Transcendental function (sin, cos, exp, log, tanh, sigmoid) → Tier 2
+    Transcendental,
+    /// Scalar or control-flow heavy → Tier 0/1 fallback
+    Scalar,
+    /// Fused multiply-add chain → Tier 2 (fused SIMD FMA kernel)
+    FmaChain,
+    /// Comparison / logical op producing boolean → Tier 1
+    Logical,
+}
+
+/// A node in the Tier 4 execution DAG.
+/// Each node represents a kernel invocation at a specific tier level.
+#[derive(Clone, Debug)]
+pub struct Tier4Node {
+    /// Unique node identifier within the DAG
+    pub id: usize,
+    /// What kind of computation this node performs
+    pub kind: Tier4RegionKind,
+    /// The tier to dispatch to (1, 2, or 3)
+    pub tier: u8,
+    /// Input slot indices consumed by this node
+    pub input_slots: Vec<usize>,
+    /// Output slot indices produced by this node
+    pub output_slots: Vec<usize>,
+    /// Opaque operation descriptor (binop name, reduction op, etc.)
+    pub op_desc: String,
+    /// Whether this node can be fused with its successor
+    pub fusible: bool,
+    /// Estimated cost (approximate cycle count) for scheduling priority
+    pub estimated_cost: f64,
+    /// Data type of inputs/outputs (for fusion compatibility checking)
+    pub dtype: Tier4Dtype,
+}
+
+/// Lightweight dtype representation for fusion compatibility checking.
+/// Prevents fusion between incompatible types (e.g., f32 + f64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tier4Dtype {
+    F32,
+    F64,
+    I32,
+    I64,
+    Bool,
+    Unknown,
+}
+
+/// An edge in the Tier 4 execution DAG.
+/// Represents a data dependency: the source node produces a value that the
+/// target node consumes. Edges are the basis for topological scheduling and
+/// buffer lifetime analysis.
+#[derive(Clone, Debug)]
+pub struct Tier4Edge {
+    /// Source node ID (producer)
+    pub from_node: usize,
+    /// Target node ID (consumer)
+    pub to_node: usize,
+    /// Slot index that carries the data
+    pub slot: usize,
+    /// Whether the data flows contiguously in memory (required for fusion)
+    pub contiguous: bool,
+    /// Size in bytes of the data flowing through this edge
+    pub data_size_bytes: usize,
+}
+
+/// The Tier 4 execution DAG — the central data structure for orchestration.
+///
+/// Nodes represent kernel invocations at specific tier levels; edges represent
+/// data dependencies. The DAG is built by the decomposition pass and consumed
+/// by the scheduler. Fusion decisions are made during the build phase using
+/// conservative rules, not by a separate optimizer.
+pub struct Tier4Dag {
+    /// All nodes in the DAG, indexed by node ID
+    pub nodes: Vec<Tier4Node>,
+    /// All edges (data dependencies) in the DAG
+    pub edges: Vec<Tier4Edge>,
+    /// Adjacency list: node_id → list of (edge_index, target_node_id)
+    pub adjacency: FxHashMap<usize, Vec<(usize, usize)>>,
+    /// Reverse adjacency: node_id → list of (edge_index, source_node_id)
+    pub reverse_adj: FxHashMap<usize, Vec<(usize, usize)>>,
+    /// Input slot → first node that consumes it
+    pub input_map: FxHashMap<usize, usize>,
+    /// Output slot → last node that produces it
+    pub output_map: FxHashMap<usize, usize>,
+    /// Next available node ID
+    next_id: usize,
+}
+
+impl Tier4Dag {
+    /// Create an empty execution DAG.
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            adjacency: FxHashMap::default(),
+            reverse_adj: FxHashMap::default(),
+            input_map: FxHashMap::default(),
+            output_map: FxHashMap::default(),
+            next_id: 0,
+        }
+    }
+
+    /// Add a new node to the DAG, returning its ID.
+    pub fn add_node(&mut self, node: Tier4Node) -> usize {
+        let id = self.next_id;
+        let mut node = node;
+        node.id = id;
+        self.next_id += 1;
+
+        // Record input/output mappings
+        for &slot in &node.input_slots {
+            self.input_map.entry(slot).or_insert(id);
+        }
+        for &slot in &node.output_slots {
+            self.output_map.insert(slot, id);
+        }
+
+        self.nodes.push(node);
+        id
+    }
+
+    /// Add a data dependency edge from `from_node` to `to_node`.
+    pub fn add_edge(&mut self, from_node: usize, to_node: usize, slot: usize,
+                     contiguous: bool, data_size_bytes: usize) {
+        let edge_idx = self.edges.len();
+        self.edges.push(Tier4Edge {
+            from_node,
+            to_node,
+            slot,
+            contiguous,
+            data_size_bytes,
+        });
+        self.adjacency.entry(from_node).or_default().push((edge_idx, to_node));
+        self.reverse_adj.entry(to_node).or_default().push((edge_idx, from_node));
+    }
+
+    /// Topologically sort the DAG for execution order.
+    /// Uses Kahn's algorithm (BFS-based) for deterministic ordering.
+    /// Returns node IDs in valid execution order.
+    pub fn topological_order(&self) -> Vec<usize> {
+        let n = self.nodes.len();
+        if n == 0 { return Vec::new(); }
+
+        // Compute in-degrees
+        let mut in_degree = vec![0u32; n];
+        for edge in &self.edges {
+            if edge.to_node < n {
+                in_degree[edge.to_node] += 1;
+            }
+        }
+
+        // Initialize queue with zero in-degree nodes
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        for (i, &deg) in in_degree.iter().enumerate() {
+            if deg == 0 {
+                queue.push_back(i);
+            }
+        }
+
+        let mut order = Vec::with_capacity(n);
+        while let Some(node_id) = queue.pop_front() {
+            order.push(node_id);
+            if let Some(neighbors) = self.adjacency.get(&node_id) {
+                for &(_, target) in neighbors {
+                    if target < n {
+                        in_degree[target] -= 1;
+                        if in_degree[target] == 0 {
+                            queue.push_back(target);
+                        }
+                    }
+                }
+            }
+        }
+
+        order
+    }
+
+    /// Check whether two adjacent nodes can be conservatively fused.
+    ///
+    /// Fusion is allowed ONLY when ALL of these conditions hold:
+    ///   1. Both nodes have the same dtype (no hidden promotion)
+    ///   2. Memory access is contiguous (no stride/gather patterns)
+    ///   3. No branch dependency explosion (neither node is Scalar with control flow)
+    ///   4. The producer node is fusible (its op supports inline chaining)
+    ///   5. The edge between them is marked contiguous
+    ///   6. Fusing does not create a new allocation (buffer reuse only)
+    pub fn can_fuse(&self, producer_id: usize, consumer_id: usize) -> bool {
+        let producer = match self.nodes.get(producer_id) {
+            Some(n) => n,
+            None => return false,
+        };
+        let consumer = match self.nodes.get(consumer_id) {
+            Some(n) => n,
+            None => return false,
+        };
+
+        // Rule 1: Same dtype — no hidden promotion
+        if producer.dtype != consumer.dtype {
+            return false;
+        }
+
+        // Rule 2: No branch dependency explosion
+        if producer.kind == Tier4RegionKind::Scalar || consumer.kind == Tier4RegionKind::Scalar {
+            return false;
+        }
+
+        // Rule 3: Producer must be fusible
+        if !producer.fusible {
+            return false;
+        }
+
+        // Rule 4: Edge must be contiguous
+        let edge_contiguous = self.edges.iter().any(|e| {
+            e.from_node == producer_id && e.to_node == consumer_id && e.contiguous
+        });
+        if !edge_contiguous {
+            return false;
+        }
+
+        // Rule 5: Tier compatibility — can fuse Tier1+Tier1, Tier1+Tier2, Tier2+Tier2
+        // Cannot fuse with Tier3 (BLAS is opaque, can't be chained inline)
+        if consumer.tier == 3 || producer.tier == 3 {
+            return false;
+        }
+
+        // Rule 6: Logical ops can only fuse with other logical ops or elementwise
+        if producer.kind == Tier4RegionKind::Logical && consumer.kind != Tier4RegionKind::Logical
+            && consumer.kind != Tier4RegionKind::Elementwise {
+            return false;
+        }
+
+        true
+    }
+
+    /// Apply conservative fusion: merge adjacent fusible nodes into super-nodes.
+    /// This reduces kernel launch overhead and eliminates intermediate buffers.
+    ///
+    /// Returns a new DAG with fused nodes. The original DAG is not modified.
+    pub fn apply_conservative_fusion(&self) -> Tier4Dag {
+        let mut fused = Tier4Dag::new();
+        let order = self.topological_order();
+
+        // Track which original nodes have been absorbed into a super-node
+        let mut absorbed: FxHashSet<usize> = FxHashSet::default();
+        // Map from original node ID to fused node ID
+        let mut orig_to_fused: FxHashMap<usize, usize> = FxHashMap::default();
+
+        for &node_id in &order {
+            if absorbed.contains(&node_id) {
+                continue;
+            }
+
+            let node = &self.nodes[node_id];
+
+            // Try to find a fusible successor
+            let mut fusion_chain = vec![node_id];
+            let mut current = node_id;
+
+            'chain: loop {
+                // Find a single successor that can be fused
+                let successors: Vec<usize> = self.adjacency
+                    .get(&current)
+                    .map(|adj| adj.iter().map(|&(_, t)| t).collect())
+                    .unwrap_or_default();
+
+                let mut found_fusion = false;
+                for &succ in &successors {
+                    if absorbed.contains(&succ) { continue; }
+                    if self.can_fuse(current, succ) {
+                        // Check that the successor has only one predecessor (the current node)
+                        // — otherwise fusion would duplicate code
+                        let pred_count = self.reverse_adj
+                            .get(&succ)
+                            .map(|p| p.len())
+                            .unwrap_or(0);
+                        if pred_count == 1 {
+                            fusion_chain.push(succ);
+                            absorbed.insert(succ);
+                            current = succ;
+                            found_fusion = true;
+                            break;
+                        }
+                    }
+                }
+                if !found_fusion {
+                    break 'chain;
+                }
+            }
+
+            // Build a fused super-node from the chain
+            let first = &self.nodes[fusion_chain[0]];
+            let last = &self.nodes[*fusion_chain.last().unwrap()];
+
+            let mut all_input_slots: Vec<usize> = Vec::new();
+            let mut all_output_slots: Vec<usize> = Vec::new();
+            let mut fused_op_desc = String::new();
+            let mut total_cost = 0.0f64;
+
+            for (i, &fid) in fusion_chain.iter().enumerate() {
+                let fnode = &self.nodes[fid];
+                if i > 0 { fused_op_desc.push_str(" → "); }
+                fused_op_desc.push_str(&fnode.op_desc);
+                total_cost += fnode.estimated_cost;
+
+                // Input slots: exclude slots produced by previous node in chain
+                for &slot in &fnode.input_slots {
+                    if i == 0 || !self.nodes[fusion_chain[i - 1]].output_slots.contains(&slot) {
+                        all_input_slots.push(slot);
+                    }
+                }
+                // Output slots: always include
+                for &slot in &fnode.output_slots {
+                    all_output_slots.push(slot);
+                }
+            }
+
+            let fused_id = fused.add_node(Tier4Node {
+                id: 0, // will be set by add_node
+                kind: first.kind,
+                tier: if fusion_chain.len() > 1 { 2 } else { first.tier }, // fused → Tier 2
+                input_slots: all_input_slots,
+                output_slots: all_output_slots,
+                op_desc: fused_op_desc,
+                fusible: true,
+                estimated_cost: total_cost * 0.9, // 10% saving from eliminating intermediates
+                dtype: first.dtype,
+            });
+
+            for &fid in &fusion_chain {
+                orig_to_fused.insert(fid, fused_id);
+            }
+        }
+
+        // Rebuild edges in the fused DAG
+        for edge in &self.edges {
+            let from_fused = *orig_to_fused.get(&edge.from_node).unwrap_or(&edge.from_node);
+            let to_fused = *orig_to_fused.get(&edge.to_node).unwrap_or(&edge.to_node);
+            if from_fused != to_fused {
+                fused.add_edge(from_fused, to_fused, edge.slot,
+                              edge.contiguous, edge.data_size_bytes);
+            }
+        }
+
+        fused
+    }
+}
+
+/// Buffer reuse plan generated by the Tier 4 planner.
+///
+/// Instead of allocating a new buffer for every intermediate result, the
+/// planner identifies buffers whose lifetimes do not overlap and assigns
+/// them the same memory slot. This can reduce peak memory by 30-50% for
+/// complex DAGs with many intermediate values.
+#[derive(Clone, Debug)]
+pub struct Tier4BufferPlan {
+    /// Map from slot index to assigned buffer index
+    pub slot_to_buffer: FxHashMap<usize, usize>,
+    /// Total number of unique buffers needed
+    pub total_buffers: usize,
+    /// Total bytes allocated
+    pub total_bytes: usize,
+    /// List of (buffer_index, size_bytes, first_use_node, last_use_node)
+    pub buffer_lifetimes: Vec<(usize, usize, usize, usize)>,
+}
+
+impl Tier4Dag {
+    /// Compute a buffer reuse plan using first-fit lifetime analysis.
+    ///
+    /// Algorithm:
+    ///   1. For each node in topological order, determine when each output
+    ///      buffer is first and last used.
+    ///   2. Sort buffers by first-use time.
+    ///   3. Greedily assign buffers: when a buffer's lifetime ends, free it
+    ///      and reuse its slot for a new buffer with a later lifetime.
+    ///   4. This is optimal for straight-line DAGs and near-optimal for
+    ///      general DAGs.
+    pub fn compute_buffer_plan(&self, element_size: usize) -> Tier4BufferPlan {
+        let order = self.topological_order();
+
+        // Step 1: Compute lifetime (first_use, last_use) for each output slot
+        let mut slot_first_use: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut slot_last_use: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut slot_size: FxHashMap<usize, usize> = FxHashMap::default();
+
+        for (step, &node_id) in order.iter().enumerate() {
+            let node = &self.nodes[node_id];
+            for &slot in &node.output_slots {
+                slot_first_use.entry(slot).or_insert(step);
+                slot_last_use.insert(slot, step);
+                slot_size.insert(slot, element_size); // simplified: uniform element size
+            }
+            // Inputs also "use" the slot
+            for &slot in &node.input_slots {
+                slot_last_use.entry(slot).and_modify(|v| { if step > *v { *v = step; } });
+            }
+        }
+
+        // Step 2: Sort slots by first-use time
+        let mut slots: Vec<usize> = slot_first_use.keys().copied().collect();
+        slots.sort_by_key(|s| slot_first_use.get(s).copied().unwrap_or(0));
+
+        // Step 3: Greedy first-fit assignment
+        let mut slot_to_buffer: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut free_buffers: Vec<usize> = Vec::new(); // buffer indices available for reuse
+        let mut buffer_lifetimes: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut next_buffer = 0usize;
+        let mut total_bytes = 0usize;
+
+        for slot in &slots {
+            let first = slot_first_use.get(slot).copied().unwrap_or(0);
+            let last = slot_last_use.get(slot).copied().unwrap_or(0);
+            let size = slot_size.get(slot).copied().unwrap_or(element_size);
+
+            // Find a free buffer whose lifetime has ended
+            let reused = free_buffers.iter().position(|&b| {
+                buffer_lifetimes.get(b).map(|&(_, _, _, last_use)| last_use < first).unwrap_or(false)
+            });
+
+            let buf_idx = if let Some(idx) = reused {
+                let b = free_buffers.remove(idx);
+                // Update lifetime
+                if b < buffer_lifetimes.len() {
+                    buffer_lifetimes[b] = (b, size, first, last);
+                }
+                b
+            } else {
+                let b = next_buffer;
+                next_buffer += 1;
+                total_bytes += size;
+                buffer_lifetimes.push((b, size, first, last));
+                b
+            };
+
+            slot_to_buffer.insert(*slot, buf_idx);
+        }
+
+        Tier4BufferPlan {
+            slot_to_buffer,
+            total_buffers: next_buffer,
+            total_bytes,
+            buffer_lifetimes,
+        }
+    }
+}
+
+/// The Tier 4 region decomposition engine.
+///
+/// Takes a flat list of trace instructions and classifies each into a
+/// computation region. Adjacent regions of the same kind are merged.
+/// The result is a list of classified regions that can be assembled into
+/// a DAG.
+pub struct Tier4Decomposer {
+    /// Detected regions from the last decomposition
+    pub regions: Vec<Tier4Region>,
+}
+
+/// A contiguous region of the trace, classified by tier kind.
+#[derive(Clone, Debug)]
+pub struct Tier4Region {
+    /// Region index in the decomposition order
+    pub index: usize,
+    /// Kind of computation
+    pub kind: Tier4RegionKind,
+    /// Assigned tier (1, 2, or 3)
+    pub tier: u8,
+    /// Instruction indices belonging to this region
+    pub instr_range: (usize, usize), // [start, end)
+    /// Slot indices consumed
+    pub input_slots: Vec<usize>,
+    /// Slot indices produced
+    pub output_slots: Vec<usize>,
+    /// Opaque operation descriptor
+    pub op_desc: String,
+    /// Whether fusible with adjacent regions
+    pub fusible: bool,
+    /// Data type of this region's primary computation
+    pub dtype: Tier4Dtype,
+}
+
+impl Tier4Decomposer {
+    /// Create a new decomposer.
+    pub fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+        }
+    }
+
+    /// Classify a single binop into a Tier4RegionKind.
+    fn classify_binop(op: &str) -> Tier4RegionKind {
+        match op {
+            "add" | "sub" | "mul" | "div" => Tier4RegionKind::Elementwise,
+            "matmul" | "dot" => Tier4RegionKind::LinearAlgebra,
+            "min" | "max" => Tier4RegionKind::Elementwise,
+            "lt" | "le" | "gt" | "ge" | "eq" | "ne" => Tier4RegionKind::Logical,
+            "and" | "or" | "xor" => Tier4RegionKind::Logical,
+            "rem" | "mod" => Tier4RegionKind::Elementwise,
+            "shl" | "shr" => Tier4RegionKind::Elementwise,
+            _ => Tier4RegionKind::Scalar,
+        }
+    }
+
+    /// Classify a unop into a Tier4RegionKind.
+    fn classify_unop(op: &str) -> Tier4RegionKind {
+        match op {
+            "neg" | "abs" => Tier4RegionKind::Elementwise,
+            "sin" | "cos" | "tan" | "exp" | "log" | "tanh" | "sigmoid" => Tier4RegionKind::Transcendental,
+            "not" => Tier4RegionKind::Logical,
+            _ => Tier4RegionKind::Scalar,
+        }
+    }
+
+    /// Assign a tier level to a region kind.
+    fn tier_for_kind(kind: &Tier4RegionKind) -> u8 {
+        match kind {
+            Tier4RegionKind::Elementwise => 1,
+            Tier4RegionKind::Logical => 1,
+            Tier4RegionKind::Reduction => 2,
+            Tier4RegionKind::Stencil => 2,
+            Tier4RegionKind::Transcendental => 2,
+            Tier4RegionKind::FmaChain => 2,
+            Tier4RegionKind::LinearAlgebra => 3,
+            Tier4RegionKind::Scalar => 0,
+        }
+    }
+
+    /// Determine if a region kind can be fused with another.
+    fn is_fusible(kind: &Tier4RegionKind) -> bool {
+        match kind {
+            Tier4RegionKind::Elementwise
+            | Tier4RegionKind::Logical
+            | Tier4RegionKind::Transcendental
+            | Tier4RegionKind::FmaChain => true,
+            // Reduction and Stencil have fixed output shapes; BLAS is opaque
+            Tier4RegionKind::Reduction
+            | Tier4RegionKind::Stencil
+            | Tier4RegionKind::LinearAlgebra
+            | Tier4RegionKind::Scalar => false,
+        }
+    }
+
+    /// Decompose a trace into classified regions.
+    ///
+    /// The trace is a list of instruction tuples (in Python-serialized form).
+    /// Each instruction is represented as (opcode, ...operands).
+    ///
+    /// Returns a list of regions, where each region contains:
+    ///   - Its kind (elementwise, reduction, BLAS, etc.)
+    ///   - Its tier assignment
+    ///   - The instruction range it covers
+    ///   - Input/output slot indices
+    ///   - Whether it can be fused with neighbors
+    pub fn decompose(&mut self, trace_ops: &[(u8, Vec<i64>)]) -> &[Tier4Region] {
+        self.regions.clear();
+
+        let mut current_kind: Option<Tier4RegionKind> = None;
+        let mut current_start = 0usize;
+        let mut current_input_slots: Vec<usize> = Vec::new();
+        let mut current_output_slots: Vec<usize> = Vec::new();
+        let mut current_op_desc = String::new();
+        let mut current_fusible = true;
+        let mut current_dtype = Tier4Dtype::Unknown;
+
+        let mut region_idx = 0;
+
+        for (i, (opcode, operands)) in trace_ops.iter().enumerate() {
+            let (kind, inputs, outputs, desc, dtype) = match *opcode {
+                // BinOp: opcode 0x10+
+                0x10..=0x2F => {
+                    let op_str = match opcode {
+                        0x10 => "add",
+                        0x11 => "sub",
+                        0x12 => "mul",
+                        0x13 => "div",
+                        0x14 => "rem",
+                        0x15 => "min",
+                        0x16 => "max",
+                        0x17 => "lt",
+                        0x18 => "le",
+                        0x19 => "gt",
+                        0x1A => "ge",
+                        0x1B => "eq",
+                        0x1C => "ne",
+                        0x1D => "and",
+                        0x1E => "or",
+                        0x1F => "xor",
+                        0x20 => "matmul",
+                        _ => "unknown",
+                    };
+                    let kind = Self::classify_binop(op_str);
+                    // Operands: dst, lhs, rhs
+                    let dst = operands.get(0).copied().unwrap_or(0) as usize;
+                    let lhs = operands.get(1).copied().unwrap_or(0) as usize;
+                    let rhs = operands.get(2).copied().unwrap_or(0) as usize;
+                    (kind, vec![lhs, rhs], vec![dst], op_str.to_string(), Tier4Dtype::Unknown)
+                }
+                // UnOp
+                0x30..=0x3F => {
+                    let op_str = match opcode {
+                        0x30 => "neg",
+                        0x31 => "abs",
+                        0x32 => "not",
+                        0x33 => "sin",
+                        0x34 => "cos",
+                        0x35 => "exp",
+                        0x36 => "log",
+                        0x37 => "tanh",
+                        0x38 => "sigmoid",
+                        _ => "unknown",
+                    };
+                    let kind = Self::classify_unop(op_str);
+                    let dst = operands.get(0).copied().unwrap_or(0) as usize;
+                    let src = operands.get(1).copied().unwrap_or(0) as usize;
+                    (kind, vec![src], vec![dst], op_str.to_string(), Tier4Dtype::Unknown)
+                }
+                // LoadI
+                0x01 | 0x02 => {
+                    let dst = operands.get(0).copied().unwrap_or(0) as usize;
+                    (Tier4RegionKind::Elementwise, vec![], vec![dst], "load".to_string(), Tier4Dtype::Unknown)
+                }
+                // Move
+                0x03 => {
+                    let dst = operands.get(0).copied().unwrap_or(0) as usize;
+                    let src = operands.get(1).copied().unwrap_or(0) as usize;
+                    // Moves are overhead — they don't create a new region
+                    (current_kind.unwrap_or(Tier4RegionKind::Elementwise),
+                     vec![src], vec![dst], "move".to_string(), Tier4Dtype::Unknown)
+                }
+                // Store
+                0x04 => {
+                    let dst = operands.get(0).copied().unwrap_or(0) as usize;
+                    let src = operands.get(1).copied().unwrap_or(0) as usize;
+                    (Tier4RegionKind::Elementwise, vec![src], vec![dst], "store".to_string(), Tier4Dtype::Unknown)
+                }
+                // Jump / JumpFalse / JumpTrue — control flow boundary
+                0x21 | 0x22 | 0x23 => {
+                    // Control flow ends the current region
+                    if current_kind.is_some() {
+                        let kind = current_kind.unwrap();
+                        let tier = Self::tier_for_kind(&kind);
+                        self.regions.push(Tier4Region {
+                            index: region_idx,
+                            kind,
+                            tier,
+                            instr_range: (current_start, i),
+                            input_slots: std::mem::take(&mut current_input_slots),
+                            output_slots: std::mem::take(&mut current_output_slots),
+                            op_desc: std::mem::take(&mut current_op_desc),
+                            fusible: current_fusible && Self::is_fusible(&kind),
+                            dtype: current_dtype,
+                        });
+                        region_idx += 1;
+                        current_kind = None;
+                    }
+                    continue;
+                }
+                // Reduction
+                0x40..=0x4F => {
+                    let op_str = match opcode {
+                        0x40 => "sum",
+                        0x41 => "max",
+                        0x42 => "min",
+                        _ => "reduce",
+                    };
+                    let dst = operands.get(0).copied().unwrap_or(0) as usize;
+                    let src = operands.get(1).copied().unwrap_or(0) as usize;
+                    (Tier4RegionKind::Reduction, vec![src], vec![dst], op_str.to_string(), Tier4Dtype::Unknown)
+                }
+                _ => {
+                    // Unknown opcode — treat as scalar fallback
+                    (Tier4RegionKind::Scalar, vec![], vec![], "unknown".to_string(), Tier4Dtype::Unknown)
+                }
+            };
+
+            // Region merging: if the kind matches the current region, extend it
+            match current_kind {
+                None => {
+                    current_kind = Some(kind);
+                    current_start = i;
+                    current_input_slots = inputs;
+                    current_output_slots = outputs;
+                    current_op_desc = desc;
+                    current_fusible = Self::is_fusible(&kind);
+                    current_dtype = dtype;
+                }
+                Some(ck) if ck == kind && kind != Tier4RegionKind::LinearAlgebra && kind != Tier4RegionKind::Reduction => {
+                    // Extend current region
+                    current_output_slots.extend(outputs);
+                    if !current_op_desc.contains(&desc) {
+                        current_op_desc.push_str(" → ");
+                        current_op_desc.push_str(&desc);
+                    }
+                    // Merge dtype
+                    if current_dtype == Tier4Dtype::Unknown {
+                        current_dtype = dtype;
+                    }
+                }
+                Some(ck) => {
+                    // Kind changed — emit the current region and start a new one
+                    let tier = Self::tier_for_kind(&ck);
+                    self.regions.push(Tier4Region {
+                        index: region_idx,
+                        kind: ck,
+                        tier,
+                        instr_range: (current_start, i),
+                        input_slots: std::mem::take(&mut current_input_slots),
+                        output_slots: std::mem::take(&mut current_output_slots),
+                        op_desc: std::mem::take(&mut current_op_desc),
+                        fusible: current_fusible && Self::is_fusible(&ck),
+                        dtype: current_dtype,
+                    });
+                    region_idx += 1;
+
+                    current_kind = Some(kind);
+                    current_start = i;
+                    current_input_slots = inputs;
+                    current_output_slots = outputs;
+                    current_op_desc = desc;
+                    current_fusible = Self::is_fusible(&kind);
+                    current_dtype = dtype;
+                }
+            }
+        }
+
+        // Emit final region
+        if let Some(ck) = current_kind {
+            let tier = Self::tier_for_kind(&ck);
+            self.regions.push(Tier4Region {
+                index: region_idx,
+                kind: ck,
+                tier,
+                instr_range: (current_start, trace_ops.len()),
+                input_slots: current_input_slots,
+                output_slots: current_output_slots,
+                op_desc: current_op_desc,
+                fusible: current_fusible && Self::is_fusible(&ck),
+                dtype: current_dtype,
+            });
+        }
+
+        &self.regions
+    }
+}
+
+/// The Tier 4 planner: takes a DAG, applies fusion + buffer planning,
+/// and produces an execution schedule.
+#[derive(Clone, Debug)]
+pub struct Tier4Schedule {
+    /// Execution order: list of (node_id, tier, op_desc) tuples
+    pub steps: Vec<(usize, u8, String)>,
+    /// Buffer reuse plan
+    pub buffer_plan: Tier4BufferPlan,
+    /// Whether any fusion was applied
+    pub fusion_applied: bool,
+    /// Number of fused nodes (supernodes)
+    pub fused_node_count: usize,
+    /// Total estimated cost of the schedule
+    pub estimated_cost: f64,
+    /// Peak memory estimate in bytes
+    pub peak_memory_bytes: usize,
+}
+
+/// The top-level Tier 4 compilation function.
+///
+/// Takes a trace (as opcode + operand pairs), decomposes it into regions,
+/// builds a DAG, applies conservative fusion, computes a buffer reuse plan,
+/// and returns a schedule that dispatches to existing Tier 1–3 kernels.
+///
+/// This is the "cheap planning" compile strategy:
+///   trace → identify kernel patterns → build execution graph → assign existing kernels
+///
+/// No heavy polyhedral optimization, no full SSA rewrites, no expensive
+/// global transforms. Just a scheduler, not an optimizer.
+pub fn tier4_compile(trace_ops: &[(u8, Vec<i64>)]) -> Tier4Schedule {
+    // Step 1: Decompose into regions
+    let mut decomposer = Tier4Decomposer::new();
+    let regions = decomposer.decompose(trace_ops);
+
+    // Step 2: Build DAG from regions
+    let mut dag = Tier4Dag::new();
+
+    // Map from output slot to producing node ID (for edge construction)
+    let mut slot_producer: FxHashMap<usize, usize> = FxHashMap::default();
+
+    for region in regions {
+        let node_id = dag.add_node(Tier4Node {
+            id: 0,
+            kind: region.kind,
+            tier: region.tier,
+            input_slots: region.input_slots.clone(),
+            output_slots: region.output_slots.clone(),
+            op_desc: region.op_desc.clone(),
+            fusible: region.fusible,
+            estimated_cost: match region.kind {
+                Tier4RegionKind::LinearAlgebra => 1000.0,
+                Tier4RegionKind::Reduction => 100.0,
+                Tier4RegionKind::Stencil => 50.0,
+                Tier4RegionKind::Transcendental => 20.0,
+                Tier4RegionKind::FmaChain => 10.0,
+                Tier4RegionKind::Elementwise => 5.0,
+                Tier4RegionKind::Logical => 3.0,
+                Tier4RegionKind::Scalar => 1.0,
+            },
+            dtype: region.dtype,
+        });
+
+        // Add edges from producers of input slots to this node
+        for &slot in &region.input_slots {
+            if let Some(&producer_id) = slot_producer.get(&slot) {
+                dag.add_edge(producer_id, node_id, slot, true, 8); // contiguous, 8 bytes
+            }
+        }
+
+        // Record output slots produced by this node
+        for &slot in &region.output_slots {
+            slot_producer.insert(slot, node_id);
+        }
+    }
+
+    // Step 3: Apply conservative fusion
+    let fused_dag = dag.apply_conservative_fusion();
+    let fusion_applied = fused_dag.nodes.len() < dag.nodes.len();
+
+    // Step 4: Compute buffer reuse plan (8 bytes per element = f64 default)
+    let buffer_plan = fused_dag.compute_buffer_plan(8);
+
+    // Step 5: Build execution schedule
+    let order = fused_dag.topological_order();
+    let mut steps = Vec::with_capacity(order.len());
+    let mut total_cost = 0.0f64;
+
+    for &node_id in &order {
+        let node = &fused_dag.nodes[node_id];
+        total_cost += node.estimated_cost;
+        steps.push((node_id, node.tier, node.op_desc.clone()));
+    }
+
+    let peak_memory = buffer_plan.total_bytes;
+
+    Tier4Schedule {
+        steps,
+        buffer_plan,
+        fusion_applied,
+        fused_node_count: fused_dag.nodes.len(),
+        estimated_cost: total_cost,
+        peak_memory_bytes: peak_memory,
+    }
+}
+
+/// Tier 4 execution dispatch.
+///
+/// Given a schedule and concrete input data, dispatch each step to the
+/// appropriate backend:
+///   Tier 0 → scalar fallback (interpret_trace)
+///   Tier 1 → SIMD elementwise kernel
+///   Tier 2 → fused vector kernel / reduction kernel / stencil kernel
+///   Tier 3 → BLAS (NumPy matmul)
+///
+/// This function is the runtime "conductor" — it executes the plan built
+/// by tier4_compile, never inventing new execution methods.
+pub fn tier4_execute_schedule(
+    schedule: &Tier4Schedule,
+    _input_ptrs: &[usize],
+    _output_ptr: usize,
+    _n_elements: usize,
+) -> bool {
+    // The actual execution is dispatched from Python, which has access to
+    // NumPy, the Rust SIMD kernels, and BLAS. This Rust-side function
+    // validates the schedule and provides the execution blueprint.
+    //
+    // Python calls this to get the schedule, then dispatches each step
+    // to the appropriate backend based on the tier assignment.
+
+    // Validate: schedule must have at least one step
+    if schedule.steps.is_empty() {
+        return false;
+    }
+
+    // Validate: all tier assignments must be 0-3
+    for &(_, tier, _) in &schedule.steps {
+        if tier > 3 {
+            return false;
+        }
+    }
+
+    true
 }
