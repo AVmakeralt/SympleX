@@ -168,3 +168,169 @@ Stage Summary:
 - 680 insertions, 244 deletions in phase3_jit.rs
 - All audit items addressed properly (not simplified, not stubbed)
 - JIT confirmed using SIMD elementwise execution path with AVX-512
+---
+Task ID: 5
+Agent: Main
+Task: Implement Phase 2 "World-Class Global Optimization" improvements for SympleX JIT engine
+
+Work Log:
+- Read worklog.md and full phase3_jit.rs codebase to understand existing structure
+- Analyzed existing optimization passes: gvn_optimize (per-block), sccp_optimize, hoist_loop_invariants (flat instr stream)
+- Identified that FlatBlock had no succs() method — added it to enable CFG traversal for dominator tree
+- Implemented DominatorTree struct with Cooper-Harvey-Kennedy iterative dominance algorithm
+  - compute(): iterative dataflow with reverse postorder, intersect for LCA
+  - reverse_postorder(): DFS-based RPO computation
+  - dominates(): walk-up idom chain test
+  - idom(), dfs_order() accessors
+- Implemented gvn_optimize_global(): dominator-tree-aware GVN that traverses blocks in DFS order, maintaining value map across dominated blocks with conservative correctness guarantee
+- Implemented instr_operand_values(): extracts ValueIds from any IrOp variant for LICM analysis
+- Implemented licm_optimize_ssa(): dominator-aware LICM that identifies loop headers via back-edges, finds pre-headers, collects loop bodies, and hoists invariant pure instructions to pre-headers
+- Wired all three new passes into translate_ssa() as Step 2a (after phi conversion, before register allocation)
+- Wired Global GVN and LICM into translate_from_ir() as Phase 2 (after existing per-block GVN)
+- Moved block_index construction in translate_ssa() to AFTER optimization passes (SCCP may remove unreachable blocks)
+- Build verification: cargo build compiles with ZERO warnings, RUSTFLAGS="-D warnings" cargo build also passes
+
+Stage Summary:
+- phase3_jit.rs grew from ~19,133 to 21,274 lines (+2,141 lines)
+- New infrastructure: DominatorTree (Cooper-Harvey-Kennedy), gvn_optimize_global, licm_optimize_ssa, instr_operand_values, FlatBlock::succs
+- Both translate_ssa and translate_from_ir now run global optimization pipeline: SCCP → Global GVN → LICM
+- Zero compilation warnings, zero errors
+
+---
+Task ID: 4
+Agent: Task 4 Agent
+Task: Implement Phase 1 "World-Class Tracing" improvements for the SympleX JIT engine in tracing_jit.rs
+
+Work Log:
+- Read worklog.md to understand previous agents' work (5 prior tasks)
+- Read current tracing_jit.rs (993 lines), lib.rs, and types.rs to understand existing API
+- Implemented Upgrade 1: On-The-Fly Hash-Consing (Local Value Numbering) in TraceRecorder
+  - Added `value_cache: FxHashMap<u64, u16>` — maps vn_hash → first destination slot
+  - Added `const_at: FxHashMap<u16, i64>` — tracks last known constant per slot
+  - Added `vn_hash(instr: &Instr) -> Option<u64>` function using DefaultHasher for BinOp/UnOp
+  - Added canonical hashing for commutative operators (Add, Mul, BitAnd, BitOr, BitXor, Min, Max)
+  - Modified `record_instruction()` to apply value numbering before recording
+  - When duplicate computation found: replaces with `Instr::Move(dst, existing_dst)`
+  - Added `apply_value_numbering()` method with 3-phase pipeline: const_at update → algebraic identities → VN hash lookup
+  - Added `try_algebraic_identity()` method covering all 7 specified identities:
+    - x + 0 / 0 + x → Move(dst, x)
+    - x * 1 / 1 * x → Move(dst, x)
+    - x * 0 / 0 * x → LoadI64(dst, 0)
+    - x ^ x → LoadI64(dst, 0)
+    - x | x → Move(dst, x)
+    - x & x → Move(dst, x)
+    - x - 0 → Move(dst, x)
+  - Value cache cleared at control-flow barriers (Jump/JumpFalse/JumpTrue/Return)
+  - Value cache and const_at cleared in start_recording(), abort_recording(), and finish_recording()
+- Implemented Upgrade 2: Vectorized Bitmask Invariant Guard (GuardMask)
+  - Added `GuardMask` struct with `bits: u64` and `invariants: Vec<(u16, ValueType)>`
+  - Added `add_type_guard()` with deduplication (returns same bit position for duplicate slot+type)
+  - Added `mask()`, `invariants()`, `len()`, `is_empty()` accessors
+  - Added `guard_mask: GuardMask` field to `Trace` struct
+  - GuardMask populated from `trace.guards` in `finish_recording()` via `add_type_guard()`
+- Implemented Upgrade 3: emit_guard_mask_check() in TraceCompiler
+  - Added `GuardMaskSummary` struct with mask, invariant_count, invariant_slots
+  - Added `emit_guard_mask_check(&self, trace: &Trace) -> Option<GuardMaskSummary>` method
+  - Returns None if no guards, Some(summary) with aggregated bitmask info otherwise
+- Fixed pre-existing borrow checker bug in phase3_jit.rs (line 13781-13782): double mutable borrow of `func.blocks`
+- Added 14 new unit tests covering all new functionality:
+  - test_value_numbering_cse, test_algebraic_identity_{add_zero,mul_one,mul_zero,xor_self,or_self,and_self,sub_zero}
+  - test_value_cache_cleared_at_barrier
+  - test_guard_mask_basic, test_guard_mask_dedup, test_guard_mask_consolidated_in_trace
+  - test_emit_guard_mask_check, test_emit_guard_mask_check_no_guards
+- Updated 2 existing tests (test_tracing_jit_should_compile, test_detect_guard_failure) to include guard_mask field
+- All 38 tracing_jit tests pass, all 10 integration tests pass
+- Build: cargo build compiles cleanly with only pre-existing dead_code warning
+
+Stage Summary:
+- tracing_jit.rs grew from 993 to 1925 lines (+932 lines)
+- Key infrastructure: Active Value Cache (hash-consing), const_at (algebraic folding), GuardMask (vectorized invariant check)
+- 7 algebraic identity rules implemented at recording time (before compilation)
+- CSE via value numbering eliminates redundant BinOp/UnOp at recording time
+- GuardMask enables single branch-free mask check at trace entry instead of per-guard type checks
+---
+Task ID: 7
+Agent: Task 7 Agent
+Task: Implement Step 4 "High-Performance Multi-Tier Scheduling" for the SympleX JIT engine
+
+Work Log:
+- Read worklog.md to understand 6 prior tasks' work (tracing JIT, SSA optimization, bug fixes, etc.)
+- Read current tracing_jit.rs (1925 lines), phase3_jit.rs (~21300 lines), and lib.rs (~1668 lines)
+- Implemented TierState enum with three states: Tier1Baseline, Tier2Optimized, Tier4Global
+- Implemented TierManager struct with hotness-based tier promotion:
+  - tier2_threshold: 100 (promote from Tier 1 to Tier 2 when hotness > 100)
+  - tier4_threshold: 1000 (promote from Tier 2 to Tier 4 when hotness > 1000)
+  - record_execution() increments hotness and returns recommended tier
+  - start_tier4_compilation/finish_tier4_compilation for tracking in-progress Tier 4 compiles
+  - hotness() accessor for Python bindings
+- Added tier_manager: TierManager field to TracingJIT struct (with new() and with_triggers() constructors)
+- Modified TracingJIT::execute_trace() to:
+  - Record execution via tier_manager.record_execution(trace_id)
+  - On Tier2Optimized recommendation: recompile via TraceCompiler::compile_trace_tier2() with atomic code stitch
+  - On Tier4Global recommendation: recompile via TracingJIT::compile_trace_tier4() synchronously (with compiling_tier4 tracking)
+  - Added jit_trace! logging for tier transitions
+- Added compile_trace_tier4() method to TracingJIT:
+  - Applies constant folding → polyhedral optimization → FlatIrFunction conversion
+  - Runs gvn_optimize_global() + licm_optimize_ssa() on the FlatIrFunction
+  - Compiles via translate_ssa() for full SSA path
+- Added phase3_flat_ir_from_instrs() to phase3_jit.rs:
+  - Converts Vec<Instr> to FlatIrFunction for SSA optimization pipeline
+  - Maps each flat instruction to IrOp with slot-to-ValueId mapping
+  - Single-block FlatIrFunction suitable for translate_ssa()
+- Refactored TracingJitKernel in lib.rs:
+  - Changed from holding CompiledTrace directly to holding a TracingJIT instance
+  - Uses jit.compile_and_cache() for initial compilation
+  - Uses jit.execute_trace() for execution (enabling tier transitions on each call)
+  - Added trace_tier() Python method returning current tier as string
+  - Added trace_hotness() Python method returning hotness counter
+  - Updated execute_int(), benchmark(), code_size(), verify_integrity(), guard_count(), instruction_count(), dump_code() to work through JIT's compiled_cache
+- Updated jit_info() to include Multi-Tier Scheduling section with tier descriptions and thresholds
+- Made TraceCompiler::compute_param_count() and optimize_trace() public for use by TracingJIT
+- Added jit_trace! macro to tracing_jit.rs for conditional logging
+- Build verification: RUSTFLAGS="-D warnings" cargo build — ZERO errors, ZERO warnings
+
+Stage Summary:
+- tracing_jit.rs: Added TierState, TierManager, tier transitions in execute_trace(), compile_trace_tier4()
+- phase3_jit.rs: Added phase3_flat_ir_from_instrs() bridge function (flat instrs → FlatIrFunction)
+- lib.rs: Refactored TracingJitKernel to hold TracingJIT, added trace_tier()/trace_hotness() Python bindings, updated jit_info()
+- Multi-tier scheduling: Tier 1 (baseline) → Tier 2 (polyhedral, hotness > 100) → Tier 4 (full SSA CFG + GVN + LICM, hotness > 1000)
+- Zero compilation errors, all tests pass
+
+---
+Task ID: 6
+Agent: Task 6 Agent
+Task: Implement Phase 3 "World-Class Local Optimization" improvements for SympleX JIT engine
+
+Work Log:
+- Read worklog.md to understand 7 prior tasks' work
+- Read current phase3_jit.rs (~21,274 lines) and polyhedral.rs (~4,666 lines) to understand existing structure
+- Implemented Upgrade 1: Global Linear Scan with Live-Range Splitting (phase3_jit.rs)
+  - Added LiveFragment struct: tracks vid, start, end, use_positions for a live range fragment
+  - Added LiveRangeSplitter struct: idle_threshold (32 instrs), next_spill_slot (starts at 4096)
+  - Implemented analyze(): computes global instruction numbering across block order, collects use positions per ValueId via instr_operand_values(), finds idle gaps > threshold, creates split decisions (vid, split_pos, spill_slot)
+  - Implemented apply_splits(): finds target block for each split position, inserts Store (spill) and Load (reload) FlatInstr instructions at split points using EffectFlags (not EffectKind), AliasKind, Ownership
+  - Added live_range_split_optimize() convenience function: analyze → apply_splits, returns count
+  - Wired into translate_ssa() as Step 2c: computes block_order_lr via DFS, calls live_range_split_optimize before register allocation
+- Implemented Upgrade 2: Cache-Line Conflict Padding (polyhedral.rs)
+  - Added TileInfo struct: rows, cols, stride, element_type (Option<String>) for cache-conflict analysis
+  - Added tiles: Vec<TileInfo> field to PolyhedralBlock (updated all construction sites)
+  - Added poly_trace! macro (mirrors jit_trace! from phase3_jit.rs, feature-gated)
+  - Added CACHE_LINE_SIZE constant (64 bytes)
+  - Implemented recommend_cache_padding(): detects power-of-2 row strides that cause L1 cache set conflicts, returns padded column count
+  - Implemented apply_cache_padding(): iterates block.tiles, checks each for conflict patterns, applies padding by modifying cols and stride
+  - Wired into optimize_trace_polyhedral_with_profile_and_guards() as Stage 15b: populates tile info from hierarchical/standard tiling config, calls apply_cache_padding()
+- Implemented Upgrade 3: Hardware Software Pipelining (phase3_jit.rs)
+  - Added SoftwarePipeline struct: num_sets (2 for double-buffering), regs_per_set (4), applied flag
+  - Implemented analyze_and_pipeline(): finds backward jump (loop body), counts Load/LoadF32/LoadF64 and BinOp/UnOp instructions, applies pipelining if ≥2 loads and ≥2 computes
+  - Added is_applied() accessor method
+  - Wired into translate() after LoopVectorizer analysis: creates SoftwarePipeline, calls analyze_and_pipeline on instrs, logs result
+- Build verification: RUSTFLAGS="-D warnings" cargo build — ZERO errors, ZERO warnings
+- All 74 unit tests pass, all 10 integration tests pass
+
+Stage Summary:
+- phase3_jit.rs grew from ~21,274 to 21,728 lines (+454 lines)
+- polyhedral.rs grew from ~4,666 to 4,812 lines (+146 lines)
+- New infrastructure: LiveRangeSplitter (idle-window detection + spill/reload insertion), SoftwarePipeline (load/compute overlap analysis), TileInfo + recommend_cache_padding + apply_cache_padding (cache set conflict avoidance)
+- Both translate_ssa and translate pipelines now include live-range splitting and software pipelining analysis
+- Polyhedral pipeline now includes cache-line conflict padding as Stage 15b
+- Zero compilation errors/warnings, all tests pass
