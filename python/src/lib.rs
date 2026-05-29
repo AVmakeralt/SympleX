@@ -1043,11 +1043,11 @@ fn phase3_compile_ssa<'py>(py: Python<'py>, trace_bytes: Vec<u8>, param_count: u
     let mut flat_instrs = Vec::new();
     for (i, instr) in instructions.iter().enumerate() {
         let result = match instr {
-            Instr::BinOp(d, _, _, _) | Instr::UnOp(d, _, _) => Some(ValueId(i as u32)),
-            Instr::LoadI32(d, _) | Instr::LoadI64(d, _) => Some(ValueId(i as u32)),
-            Instr::LoadF32(d, _) | Instr::LoadF64(d, _) => Some(ValueId(i as u32)),
-            Instr::LoadBool(d, _) => Some(ValueId(i as u32)),
-            Instr::Move(d, _) | Instr::Load(d, _) => Some(ValueId(i as u32)),
+            Instr::BinOp(_d, _, _, _) | Instr::UnOp(_d, _, _) => Some(ValueId(i as u32)),
+            Instr::LoadI32(_d, _) | Instr::LoadI64(_d, _) => Some(ValueId(i as u32)),
+            Instr::LoadF32(_d, _) | Instr::LoadF64(_d, _) => Some(ValueId(i as u32)),
+            Instr::LoadBool(_d, _) => Some(ValueId(i as u32)),
+            Instr::Move(_d, _) | Instr::Load(_d, _) => Some(ValueId(i as u32)),
             _ => None,
         };
 
