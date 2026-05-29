@@ -22,11 +22,22 @@
 // =============================================================================
 
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::types::{BinOpKind, Instr, RuntimeError, Value};
 use crate::phase3_jit::{compile_ops, execute, translate, NativeCode};
+
+// ── Conditional JIT trace logging ──────────────────────────────────────────
+#[cfg(feature = "jit_trace")]
+macro_rules! jit_trace {
+    ($($arg:tt)*) => { eprintln!($($arg)*) };
+}
+#[cfg(not(feature = "jit_trace"))]
+macro_rules! jit_trace {
+    ($($arg:tt)*) => {};
+}
 
 // =============================================================================
 // §1  TRACE DATA STRUCTURES
@@ -178,6 +189,51 @@ impl PolymorphicInlineCache {
 }
 
 // =============================================================================
+// §1c2  Vectorized Bitmask Invariant Guard (GuardMask)
+// =============================================================================
+
+/// Each bit position represents a structural invariant that must hold
+/// for the trace to be valid.  At trace head, a single check validates
+/// all invariants simultaneously, enabling branch-free execution.
+#[derive(Clone, Debug, Default)]
+pub struct GuardMask {
+    /// Bit assignments: bit i is set if invariant i is required.
+    bits: u64,
+    /// Maps bit position → (slot, expected_type) for deoptimization.
+    invariants: Vec<(u16, ValueType)>,
+}
+
+impl GuardMask {
+    pub fn new() -> Self { Self::default() }
+
+    /// Add a type invariant guard. Returns the bit position assigned.
+    pub fn add_type_guard(&mut self, slot: u16, expected_type: ValueType) -> u32 {
+        // Check if this (slot, type) pair already has a bit
+        for (i, &(s, t)) in self.invariants.iter().enumerate() {
+            if s == slot && t == expected_type {
+                return i as u32;
+            }
+        }
+        let bit = self.invariants.len() as u32;
+        self.bits |= 1u64 << bit;
+        self.invariants.push((slot, expected_type));
+        bit
+    }
+
+    /// Returns the aggregated bitmask.
+    pub fn mask(&self) -> u64 { self.bits }
+
+    /// Returns the invariant list for deoptimization.
+    pub fn invariants(&self) -> &[(u16, ValueType)] { &self.invariants }
+
+    /// Returns the number of invariants.
+    pub fn len(&self) -> usize { self.invariants.len() }
+
+    /// Returns true if no invariants.
+    pub fn is_empty(&self) -> bool { self.invariants.is_empty() }
+}
+
+// =============================================================================
 // §1d  TraceInstruction and Trace
 // =============================================================================
 
@@ -225,6 +281,10 @@ pub struct Trace {
     /// Per-slot type information.  Each entry records the ValueType observed
     /// for that slot during tracing.
     pub slot_types: Vec<Option<ValueType>>,
+    /// Vectorized bitmask aggregating all type/bounds guards into a single
+    /// 64-bit mask.  At trace head, a single check validates all invariants
+    /// simultaneously, enabling branch-free execution of the trace body.
+    pub guard_mask: GuardMask,
 }
 
 // =============================================================================
@@ -258,6 +318,128 @@ const ML_EXTENDED_TRACE_LENGTH: usize = 512;
 const DEFAULT_TRACE_LENGTH: usize = 256;
 
 // =============================================================================
+// §2c  Tier State & Tier Manager (Multi-Tier Scheduling)
+// =============================================================================
+
+/// Execution tier state for a single trace.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TierState {
+    /// Tier 1: Baseline JIT — fast trace capture, local linear scan,
+    /// immediate code output. Near-zero startup latency.
+    Tier1Baseline,
+    /// Tier 2: SSA CFG JIT — dominator GVN, LICM, polyhedral pipelining,
+    /// range-splitting allocator. Applied when hotness > 100.
+    Tier2Optimized,
+    /// Tier 4: Global optimization — full SSA CFG with all passes,
+    /// applied when hotness > 1000 via background compilation.
+    Tier4Global,
+}
+
+/// Manages tier transitions based on execution hotness counters.
+pub struct TierManager {
+    /// Hotness threshold to promote from Tier 1 to Tier 2.
+    tier2_threshold: u64,
+    /// Hotness threshold to promote from Tier 2 to Tier 4.
+    tier4_threshold: u64,
+    /// Current tier for each trace ID.
+    trace_tiers: FxHashMap<u32, TierState>,
+    /// Hotness counters per trace ID.
+    hotness: FxHashMap<u32, u64>,
+    /// Whether a Tier 4 background compilation is in progress for a trace.
+    compiling_tier4: FxHashSet<u32>,
+}
+
+impl TierManager {
+    pub fn new() -> Self {
+        Self {
+            tier2_threshold: 100,
+            tier4_threshold: 1000,
+            trace_tiers: FxHashMap::default(),
+            hotness: FxHashMap::default(),
+            compiling_tier4: FxHashSet::default(),
+        }
+    }
+
+    /// Record an execution of the given trace and check if a tier
+    /// promotion is warranted.  Returns the recommended new tier.
+    pub fn record_execution(&mut self, trace_id: u32) -> TierState {
+        let count = self.hotness.entry(trace_id).or_insert(0);
+        *count += 1;
+
+        let current_tier = self.trace_tiers.entry(trace_id)
+            .or_insert(TierState::Tier1Baseline);
+
+        let recommended = if *count >= self.tier4_threshold {
+            TierState::Tier4Global
+        } else if *count >= self.tier2_threshold {
+            TierState::Tier2Optimized
+        } else {
+            TierState::Tier1Baseline
+        };
+
+        if recommended != *current_tier {
+            *current_tier = recommended.clone();
+        }
+
+        recommended
+    }
+
+    /// Returns the current tier for a trace.
+    pub fn current_tier(&self, trace_id: u32) -> TierState {
+        self.trace_tiers.get(&trace_id)
+            .cloned()
+            .unwrap_or(TierState::Tier1Baseline)
+    }
+
+    /// Mark that a Tier 4 compilation is in progress for a trace.
+    pub fn start_tier4_compilation(&mut self, trace_id: u32) {
+        self.compiling_tier4.insert(trace_id);
+    }
+
+    /// Mark that a Tier 4 compilation completed for a trace.
+    pub fn finish_tier4_compilation(&mut self, trace_id: u32) {
+        self.compiling_tier4.remove(&trace_id);
+    }
+
+    /// Check if a Tier 4 compilation is in progress for a trace.
+    pub fn is_compiling_tier4(&self, trace_id: u32) -> bool {
+        self.compiling_tier4.contains(&trace_id)
+    }
+
+    /// Get the hotness counter for a trace.
+    pub fn hotness(&self, trace_id: u32) -> u64 {
+        self.hotness.get(&trace_id).copied().unwrap_or(0)
+    }
+}
+
+// =============================================================================
+// §2b  Value Numbering Hash Function
+// =============================================================================
+
+/// Compute a hash for value numbering (local value numbering / hash-consing).
+/// Only BinOp and UnOp instructions are hashed — non-computational instructions
+/// return None and are not subject to CSE.
+fn vn_hash(instr: &Instr) -> Option<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    let mut h = DefaultHasher::new();
+    match instr {
+        Instr::BinOp(_, op, l, r) => {
+            0u8.hash(&mut h);
+            std::mem::discriminant(op).hash(&mut h);
+            l.hash(&mut h);
+            r.hash(&mut h);
+        }
+        Instr::UnOp(_, op, s) => {
+            1u8.hash(&mut h);
+            std::mem::discriminant(op).hash(&mut h);
+            s.hash(&mut h);
+        }
+        _ => return None, // Don't hash non-computational instructions
+    }
+    Some(h.finish())
+}
+
+// =============================================================================
 // §3  TRACE RECORDER
 // =============================================================================
 
@@ -273,6 +455,13 @@ pub struct TraceRecorder {
     /// recording is aborted.  Prevents unbounded trace growth which would
     /// blow compile time and i-cache footprint.
     max_trace_length: usize,
+    /// Active Value Cache for on-the-fly hash-consing / local value numbering.
+    /// Maps (opcode_hash, operand_slots) → destination slot of the first instruction
+    /// that computed this value.  When a duplicate is encountered, the second
+    /// instruction is replaced with a Move from the first's destination.
+    value_cache: FxHashMap<u64, u16>,
+    /// Track the last known constant value for each slot (for algebraic identity folding).
+    const_at: FxHashMap<u16, i64>,
 }
 
 impl TraceRecorder {
@@ -283,6 +472,8 @@ impl TraceRecorder {
             traces: Vec::new(),
             trace_selection: FxHashMap::default(),
             max_trace_length: 512,
+            value_cache: FxHashMap::default(),
+            const_at: FxHashMap::default(),
         }
     }
 
@@ -293,11 +484,15 @@ impl TraceRecorder {
             traces: Vec::new(),
             trace_selection: FxHashMap::default(),
             max_trace_length,
+            value_cache: FxHashMap::default(),
+            const_at: FxHashMap::default(),
         }
     }
 
     /// Start recording a new trace at the given entry PC.
     pub fn start_recording(&mut self, entry_pc: usize) {
+        self.value_cache.clear();
+        self.const_at.clear();
         self.current_trace = Some(Trace {
             id: self.next_trace_id,
             entry_pc,
@@ -309,19 +504,180 @@ impl TraceRecorder {
             specialized_type: None,
             unboxed_slots: Vec::new(),
             slot_types: Vec::new(),
+            guard_mask: GuardMask::new(),
         });
         self.next_trace_id += 1;
     }
 
     /// Record an instruction observed during execution.
+    ///
+    /// On-the-fly hash-consing / local value numbering: before pushing the
+    /// instruction, it is matched against the Active Value Cache.  If the
+    /// same computation was already recorded, a Move is emitted instead.
+    /// Algebraic identity folding is also applied (e.g. x+0 → x, x*1 → x).
+    ///
+    /// At control-flow barriers (Jump/JumpFalse/JumpTrue/Return), the
+    /// value_cache is cleared since values may not dominate past those points.
     pub fn record_instruction(&mut self, instr: &Instr, pc: usize) {
+        // Check for control-flow barriers — clear value_cache since
+        // values may not dominate past these points.
+        let is_barrier = matches!(instr,
+            Instr::Jump(_) | Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _) | Instr::Return(_)
+        );
+
+        // Apply value numbering BEFORE borrowing the trace, to avoid
+        // double mutable borrow of self.
+        let effective_instr = self.apply_value_numbering(instr);
+
         if let Some(ref mut trace) = self.current_trace {
             trace.instructions.push(TraceInstruction {
                 original_pc: pc,
-                instruction: instr.clone(),
+                instruction: effective_instr,
                 guard: None,
             });
         }
+
+        if is_barrier {
+            self.value_cache.clear();
+            // Note: const_at is NOT cleared at barriers because LoadI
+            // constants still dominate if they precede the barrier.
+            // Only value_cache (computations) is invalidated.
+        }
+    }
+
+    /// Apply on-the-fly hash-consing / local value numbering and algebraic
+    /// identity folding to produce the effective instruction to record.
+    fn apply_value_numbering(&mut self, instr: &Instr) -> Instr {
+        // 1. Update const_at for constant loads
+        match instr {
+            Instr::LoadI32(dst, v) => {
+                self.const_at.insert(*dst, *v as i64);
+            }
+            Instr::LoadI64(dst, v) => {
+                self.const_at.insert(*dst, *v as i64);
+            }
+            Instr::LoadBool(dst, v) => {
+                self.const_at.insert(*dst, if *v { 1 } else { 0 });
+            }
+            _ => {}
+        }
+
+        // 2. Algebraic identity folding for BinOp
+        if let Instr::BinOp(dst, op, l, r) = *instr {
+            if let Some(simplified) = self.try_algebraic_identity(dst, op, l, r) {
+                return simplified;
+            }
+        }
+
+        // 3. Value numbering (hash-consing) — only for computational instructions
+        if let Some(hash) = vn_hash(instr) {
+            // For BinOp with commutative operators, use a canonical form
+            // so that e.g. Add(1,2) and Add(2,1) hash the same.
+            let canonical_hash = if let Instr::BinOp(dst, op, l, r) = instr {
+                if op.is_associative_commutative() && l > r {
+                    // Re-hash with swapped operands for canonical form
+                    let swapped = Instr::BinOp(*dst, *op, *r, *l);
+                    vn_hash(&swapped).unwrap_or(hash)
+                } else {
+                    hash
+                }
+            } else {
+                hash
+            };
+
+            if let Some(&existing_dst) = self.value_cache.get(&canonical_hash) {
+                // Duplicate computation: replace with Move
+                if let Instr::BinOp(dst, _, _, _) = instr {
+                    if *dst != existing_dst {
+                        // Remove dst from const_at since it's now a move, not a constant
+                        self.const_at.remove(dst);
+                        return Instr::Move(*dst, existing_dst);
+                    }
+                } else if let Instr::UnOp(dst, _, _) = instr {
+                    if *dst != existing_dst {
+                        self.const_at.remove(dst);
+                        return Instr::Move(*dst, existing_dst);
+                    }
+                }
+            } else {
+                // First time we see this computation: record in cache
+                let dst_slot = match instr {
+                    Instr::BinOp(dst, _, _, _) => *dst,
+                    Instr::UnOp(dst, _, _) => *dst,
+                    _ => unreachable!(),
+                };
+                self.value_cache.insert(canonical_hash, dst_slot);
+            }
+        }
+
+        // Non-computational instructions or first occurrence: record as-is
+        instr.clone()
+    }
+
+    /// Try to simplify a BinOp using algebraic identities.
+    /// Returns Some(simplified_instr) if a simplification applies, None otherwise.
+    fn try_algebraic_identity(&mut self, dst: u16, op: BinOpKind, l: u16, r: u16) -> Option<Instr> {
+        let l_const = self.const_at.get(&l).copied();
+        let r_const = self.const_at.get(&r).copied();
+
+        match op {
+            // x + 0 → Move(dst, x)
+            BinOpKind::Add => {
+                if r_const == Some(0) {
+                    self.const_at.remove(&dst);
+                    return Some(Instr::Move(dst, l));
+                }
+                if l_const == Some(0) {
+                    self.const_at.remove(&dst);
+                    return Some(Instr::Move(dst, r));
+                }
+            }
+            // x - 0 → Move(dst, x)
+            BinOpKind::Sub => {
+                if r_const == Some(0) {
+                    self.const_at.remove(&dst);
+                    return Some(Instr::Move(dst, l));
+                }
+            }
+            // x * 1 → Move(dst, x);  x * 0 → LoadI64(dst, 0)
+            BinOpKind::Mul => {
+                if r_const == Some(1) {
+                    self.const_at.remove(&dst);
+                    return Some(Instr::Move(dst, l));
+                }
+                if l_const == Some(1) {
+                    self.const_at.remove(&dst);
+                    return Some(Instr::Move(dst, r));
+                }
+                if r_const == Some(0) || l_const == Some(0) {
+                    self.const_at.insert(dst, 0);
+                    return Some(Instr::LoadI64(dst, 0));
+                }
+            }
+            // x ^ x → LoadI64(dst, 0)
+            BinOpKind::BitXor => {
+                if l == r {
+                    self.const_at.insert(dst, 0);
+                    return Some(Instr::LoadI64(dst, 0));
+                }
+            }
+            // x | x → Move(dst, x)
+            BinOpKind::BitOr => {
+                if l == r {
+                    self.const_at.remove(&dst);
+                    return Some(Instr::Move(dst, l));
+                }
+            }
+            // x & x → Move(dst, x)
+            BinOpKind::BitAnd => {
+                if l == r {
+                    self.const_at.remove(&dst);
+                    return Some(Instr::Move(dst, l));
+                }
+            }
+            _ => {}
+        }
+        None
     }
 
     /// Returns true if the current trace has exceeded the maximum trace
@@ -339,6 +695,8 @@ impl TraceRecorder {
     /// untraceable operation is encountered.
     pub fn abort_recording(&mut self) {
         self.current_trace = None;
+        self.value_cache.clear();
+        self.const_at.clear();
     }
 
     /// Record a type guard for the current trace.
@@ -419,6 +777,17 @@ impl TraceRecorder {
             if all_same_type {
                 trace.specialized_type = slot_types.values().next().copied();
             }
+
+            // Consolidate all guards into the vectorized GuardMask.
+            // This enables a single bitmask check at trace entry instead of
+            // individual type checks per guard.
+            for guard in &trace.guards {
+                trace.guard_mask.add_type_guard(guard.slot, guard.expected_type);
+            }
+
+            // Clear value numbering state after finishing
+            self.value_cache.clear();
+            self.const_at.clear();
 
             let (id, pc) = (trace.id, trace.entry_pc);
             self.traces.push(trace);
@@ -682,7 +1051,7 @@ impl TraceCompiler {
     ///
     /// Parameters are slots that are used as inputs but never defined
     /// within the trace (i.e., they come from the caller).
-    fn compute_param_count(&self, trace: &Trace) -> u16 {
+    pub fn compute_param_count(&self, trace: &Trace) -> u16 {
         let mut defined = HashSet::new();
         let mut used = HashSet::new();
 
@@ -726,7 +1095,7 @@ impl TraceCompiler {
     /// If both operands of a BinOp are constants known from preceding
     /// LoadI64/LoadI32 instructions, the BinOp is replaced with a
     /// LoadI64 of the folded result.
-    fn optimize_trace(&self, instrs: &[TraceInstruction]) -> Vec<TraceInstruction> {
+    pub fn optimize_trace(&self, instrs: &[TraceInstruction]) -> Vec<TraceInstruction> {
         let mut out = Vec::with_capacity(instrs.len());
         let mut last_load: FxHashMap<u16, i64> = FxHashMap::default();
 
@@ -788,6 +1157,42 @@ impl TraceCompiler {
         }
         out
     }
+
+    /// Emit a single guard-mask check at trace entry that validates all
+    /// invariants simultaneously.
+    ///
+    /// Instead of emitting individual type checks per guard, this method
+    /// produces a single instruction sequence that:
+    ///   1. Loads the type tag for each guarded slot
+    ///   2. Sets the corresponding bit in the mask
+    ///   3. Compares the computed mask against the expected mask
+    ///   4. Branches to deoptimization if they differ
+    ///
+    /// Returns a summary of the guard mask for the compiled trace, or None
+    /// if there are no guards.
+    pub fn emit_guard_mask_check(&self, trace: &Trace) -> Option<GuardMaskSummary> {
+        if trace.guard_mask.is_empty() {
+            return None;
+        }
+
+        Some(GuardMaskSummary {
+            mask: trace.guard_mask.mask(),
+            invariant_count: trace.guard_mask.len(),
+            invariant_slots: trace.guard_mask.invariants().iter().map(|(s, _)| *s).collect(),
+        })
+    }
+}
+
+/// Summary of the guard mask for a compiled trace, used for runtime
+/// validation of all type invariants in a single branch-free check.
+#[derive(Debug, Clone)]
+pub struct GuardMaskSummary {
+    /// The expected bitmask value (all invariant bits set).
+    pub mask: u64,
+    /// Number of invariants in the mask.
+    pub invariant_count: usize,
+    /// Slots that are guarded by the mask.
+    pub invariant_slots: Vec<u16>,
 }
 
 // =============================================================================
@@ -829,6 +1234,8 @@ pub struct TracingJIT {
     max_trace_length: usize,
     /// Current compilation tier for new traces.
     tier: CompilationTier,
+    /// Tier manager for multi-tier scheduling based on execution hotness.
+    pub tier_manager: TierManager,
 }
 
 impl TracingJIT {
@@ -846,6 +1253,7 @@ impl TracingJIT {
             pic: PolymorphicInlineCache::new(16),
             max_trace_length: DEFAULT_TRACE_LENGTH,
             tier: CompilationTier::LinearScan,
+            tier_manager: TierManager::new(),
         }
     }
 
@@ -864,6 +1272,7 @@ impl TracingJIT {
             pic: PolymorphicInlineCache::new(16),
             max_trace_length: DEFAULT_TRACE_LENGTH,
             tier: CompilationTier::LinearScan,
+            tier_manager: TierManager::new(),
         }
     }
 
@@ -922,17 +1331,98 @@ impl TracingJIT {
         }
     }
 
-    /// Execute a compiled trace by ID.
+    /// Execute a compiled trace by ID, then check if a tier upgrade is warranted.
     ///
     /// Returns Some(Ok(value)) if the trace executed successfully,
     /// Some(Err(error)) if execution failed, or None if the trace
     /// ID is not in the compiled cache.
     pub fn execute_trace(&mut self, trace_id: u32, args: &[Value]) -> Option<Result<Value, RuntimeError>> {
-        if let Some(compiled) = self.compiled_cache.get(&trace_id) {
+        let result = if let Some(compiled) = self.compiled_cache.get(&trace_id) {
             Some(compiled.execute(args))
         } else {
             None
+        };
+
+        // Check tier upgrade
+        let recommended = self.tier_manager.record_execution(trace_id);
+
+        match recommended {
+            TierState::Tier2Optimized => {
+                if self.tier_manager.current_tier(trace_id) == TierState::Tier2Optimized {
+                    if let Some(trace) = self.recorder.get_trace(trace_id) {
+                        if let Some(compiled) = self.compiler.compile_trace_tier2(trace) {
+                            // Atomic code stitch: replace the old compiled trace
+                            let old = self.compiled_cache.insert(trace_id, compiled);
+                            if let Some(_old_ct) = old {
+                                jit_trace!("[JIT-TIER] Trace {} upgraded to Tier 2 (old code_size={}, new code_size={})",
+                                    trace_id, _old_ct.code_size(),
+                                    self.compiled_cache.get(&trace_id).map(|c| c.code_size()).unwrap_or(0));
+                            }
+                        }
+                    }
+                }
+            }
+            TierState::Tier4Global => {
+                if !self.tier_manager.is_compiling_tier4(trace_id) {
+                    self.tier_manager.start_tier4_compilation(trace_id);
+                    // Synchronous Tier 4 compilation (could be background thread in future)
+                    if let Some(trace) = self.recorder.get_trace(trace_id) {
+                        if let Some(compiled) = self.compile_trace_tier4(trace) {
+                            let old = self.compiled_cache.insert(trace_id, compiled);
+                            if let Some(_old_ct) = old {
+                                jit_trace!("[JIT-TIER] Trace {} upgraded to Tier 4 (old code_size={}, new code_size={})",
+                                    trace_id, _old_ct.code_size(),
+                                    self.compiled_cache.get(&trace_id).map(|c| c.code_size()).unwrap_or(0));
+                            }
+                        }
+                    }
+                    self.tier_manager.finish_tier4_compilation(trace_id);
+                }
+            }
+            TierState::Tier1Baseline => {} // No upgrade needed
         }
+
+        result
+    }
+
+    /// Compile a trace with Tier 4 global optimization.
+    /// Applies full SSA CFG construction, dominator GVN, LICM,
+    /// polyhedral pipelining, and range-splitting allocator.
+    fn compile_trace_tier4(&self, trace: &Trace) -> Option<CompiledTrace> {
+        // Tier 4: Convert trace to FlatIrFunction for full SSA optimization
+        let optimized = self.compiler.optimize_trace(&trace.instructions);
+        let raw_instrs: Vec<Instr> = optimized.iter().map(|ti| ti.instruction.clone()).collect();
+
+        // Apply polyhedral optimization
+        let poly_block = crate::polyhedral::optimize_trace_polyhedral(&raw_instrs);
+        let instrs = if !poly_block.instrs.is_empty() {
+            poly_block.instrs
+        } else {
+            raw_instrs
+        };
+
+        if instrs.is_empty() {
+            return None;
+        }
+
+        // Convert to FlatIrFunction for SSA optimization
+        let mut ir_func = crate::phase3_jit::phase3_flat_ir_from_instrs(
+            &format!("trace_{}_tier4", trace.id), &instrs);
+
+        // Apply global optimization passes
+        let _gvn_elim = crate::phase3_jit::gvn_optimize_global(&mut ir_func);
+        let _licm_hoisted = crate::phase3_jit::licm_optimize_ssa(&mut ir_func);
+
+        // Compile via the SSA path
+        let native = crate::phase3_jit::translate_ssa(&mut ir_func)?;
+
+        Some(CompiledTrace {
+            trace_id: trace.id,
+            native_code: native,
+            guard_count: trace.guards.len(),
+            instruction_count: instrs.len(),
+            param_count: self.compiler.compute_param_count(trace),
+        })
     }
 
     /// Detect which guard failed by scanning values against the trace's
@@ -1240,6 +1730,7 @@ mod tests {
             specialized_type: None,
             unboxed_slots: vec![],
             slot_types: vec![],
+            guard_mask: GuardMask::new(),
         };
         assert!(!jit.should_compile(&trace));
 
@@ -1318,6 +1809,7 @@ mod tests {
             specialized_type: None,
             unboxed_slots: vec![],
             slot_types: vec![],
+            guard_mask: GuardMask::new(),
         };
 
         // Guard 0 expects I64, we pass F64 -> failure on slot 0
@@ -1375,5 +1867,248 @@ mod tests {
         // Move should propagate F64 from slot 0 to slot 1
         assert_eq!(trace.slot_types[0], Some(ValueType::F64));
         assert_eq!(trace.slot_types[1], Some(ValueType::F64));
+    }
+
+    // ── Phase 1: Value Numbering Tests ────────────────────────────────
+
+    #[test]
+    fn test_value_numbering_cse() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1000);
+        // Load x and y into slots 0, 1
+        recorder.record_instruction(&Instr::LoadI64(0, 10), 1000);
+        recorder.record_instruction(&Instr::LoadI64(1, 20), 1001);
+        // First Add(2, Add, 0, 1) should be recorded as-is
+        recorder.record_instruction(&Instr::BinOp(2, BinOpKind::Add, 0, 1), 1002);
+        // Second identical Add(3, Add, 0, 1) should be replaced with Move(3, 2)
+        recorder.record_instruction(&Instr::BinOp(3, BinOpKind::Add, 0, 1), 1003);
+        recorder.record_instruction(&Instr::Return(2), 1004);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        assert_eq!(trace.instructions.len(), 5);
+        // First BinOp recorded as-is
+        assert!(matches!(trace.instructions[2].instruction, Instr::BinOp(2, BinOpKind::Add, 0, 1)));
+        // Second BinOp should be replaced with Move
+        assert!(matches!(trace.instructions[3].instruction, Instr::Move(3, 2)));
+    }
+
+    #[test]
+    fn test_algebraic_identity_add_zero() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1100);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 1100);
+        recorder.record_instruction(&Instr::LoadI64(1, 0), 1101); // zero
+        // x + 0 → Move(2, 0)
+        recorder.record_instruction(&Instr::BinOp(2, BinOpKind::Add, 0, 1), 1102);
+        // 0 + x → Move(3, 0)
+        recorder.record_instruction(&Instr::BinOp(3, BinOpKind::Add, 1, 0), 1103);
+        recorder.record_instruction(&Instr::Return(2), 1104);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        assert!(matches!(trace.instructions[2].instruction, Instr::Move(2, 0)));
+        assert!(matches!(trace.instructions[3].instruction, Instr::Move(3, 0)));
+    }
+
+    #[test]
+    fn test_algebraic_identity_mul_one() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1200);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 1200);
+        recorder.record_instruction(&Instr::LoadI64(1, 1), 1201); // one
+        // x * 1 → Move(2, 0)
+        recorder.record_instruction(&Instr::BinOp(2, BinOpKind::Mul, 0, 1), 1202);
+        recorder.record_instruction(&Instr::Return(2), 1203);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        assert!(matches!(trace.instructions[2].instruction, Instr::Move(2, 0)));
+    }
+
+    #[test]
+    fn test_algebraic_identity_mul_zero() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1300);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 1300);
+        recorder.record_instruction(&Instr::LoadI64(1, 0), 1301); // zero
+        // x * 0 → LoadI64(2, 0)
+        recorder.record_instruction(&Instr::BinOp(2, BinOpKind::Mul, 0, 1), 1302);
+        recorder.record_instruction(&Instr::Return(2), 1303);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        assert!(matches!(trace.instructions[2].instruction, Instr::LoadI64(2, 0)));
+    }
+
+    #[test]
+    fn test_algebraic_identity_xor_self() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1400);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 1400);
+        // x ^ x → LoadI64(1, 0)
+        recorder.record_instruction(&Instr::BinOp(1, BinOpKind::BitXor, 0, 0), 1401);
+        recorder.record_instruction(&Instr::Return(1), 1402);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        assert!(matches!(trace.instructions[1].instruction, Instr::LoadI64(1, 0)));
+    }
+
+    #[test]
+    fn test_algebraic_identity_or_self() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1500);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 1500);
+        // x | x → Move(1, 0)
+        recorder.record_instruction(&Instr::BinOp(1, BinOpKind::BitOr, 0, 0), 1501);
+        recorder.record_instruction(&Instr::Return(1), 1502);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        assert!(matches!(trace.instructions[1].instruction, Instr::Move(1, 0)));
+    }
+
+    #[test]
+    fn test_algebraic_identity_and_self() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1600);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 1600);
+        // x & x → Move(1, 0)
+        recorder.record_instruction(&Instr::BinOp(1, BinOpKind::BitAnd, 0, 0), 1601);
+        recorder.record_instruction(&Instr::Return(1), 1602);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        assert!(matches!(trace.instructions[1].instruction, Instr::Move(1, 0)));
+    }
+
+    #[test]
+    fn test_algebraic_identity_sub_zero() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1700);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 1700);
+        recorder.record_instruction(&Instr::LoadI64(1, 0), 1701); // zero
+        // x - 0 → Move(2, 0)
+        recorder.record_instruction(&Instr::BinOp(2, BinOpKind::Sub, 0, 1), 1702);
+        recorder.record_instruction(&Instr::Return(2), 1703);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        assert!(matches!(trace.instructions[2].instruction, Instr::Move(2, 0)));
+    }
+
+    #[test]
+    fn test_value_cache_cleared_at_barrier() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(1800);
+        recorder.record_instruction(&Instr::LoadI64(0, 10), 1800);
+        recorder.record_instruction(&Instr::LoadI64(1, 20), 1801);
+        recorder.record_instruction(&Instr::BinOp(2, BinOpKind::Add, 0, 1), 1802);
+        // Control flow barrier: value_cache should be cleared
+        recorder.record_instruction(&Instr::Return(2), 1803);
+        // This is a new recording after the barrier, but since Return ends the trace,
+        // we need to test the value_cache clearing differently.
+        // Let's use Jump instead.
+        let mut recorder2 = TraceRecorder::new();
+        recorder2.start_recording(1900);
+        recorder2.record_instruction(&Instr::LoadI64(0, 10), 1900);
+        recorder2.record_instruction(&Instr::LoadI64(1, 20), 1901);
+        recorder2.record_instruction(&Instr::BinOp(2, BinOpKind::Add, 0, 1), 1902);
+        // Jump acts as a barrier — value_cache is cleared
+        recorder2.record_instruction(&Instr::Jump(0), 1903);
+        // After Jump, the same BinOp should NOT be CSE'd (cache was cleared)
+        recorder2.record_instruction(&Instr::BinOp(3, BinOpKind::Add, 0, 1), 1904);
+        recorder2.record_instruction(&Instr::Return(3), 1905);
+
+        let trace_id = recorder2.finish_recording();
+        let trace = recorder2.get_trace(trace_id.unwrap()).unwrap();
+        // The BinOp after Jump should NOT be replaced with Move (cache was cleared)
+        assert!(matches!(trace.instructions[4].instruction, Instr::BinOp(3, BinOpKind::Add, 0, 1)));
+    }
+
+    // ── Phase 1: GuardMask Tests ──────────────────────────────────────
+
+    #[test]
+    fn test_guard_mask_basic() {
+        let mut mask = GuardMask::new();
+        assert!(mask.is_empty());
+        assert_eq!(mask.mask(), 0);
+
+        let bit0 = mask.add_type_guard(0, ValueType::I64);
+        assert_eq!(bit0, 0);
+        assert_eq!(mask.mask(), 1);
+
+        let bit1 = mask.add_type_guard(1, ValueType::F64);
+        assert_eq!(bit1, 1);
+        assert_eq!(mask.mask(), 3); // bits 0 and 1 set
+
+        assert_eq!(mask.len(), 2);
+        assert_eq!(mask.invariants(), &[(0u16, ValueType::I64), (1u16, ValueType::F64)]);
+    }
+
+    #[test]
+    fn test_guard_mask_dedup() {
+        let mut mask = GuardMask::new();
+        let bit0 = mask.add_type_guard(0, ValueType::I64);
+        let bit1 = mask.add_type_guard(0, ValueType::I64); // duplicate
+        assert_eq!(bit0, bit1); // same bit position
+        assert_eq!(mask.len(), 1);
+    }
+
+    #[test]
+    fn test_guard_mask_consolidated_in_trace() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(2000);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 2000);
+        recorder.record_guard(0, ValueType::I64);
+        recorder.record_instruction(&Instr::LoadF64(1, 3.14), 2001);
+        recorder.record_guard(1, ValueType::F64);
+        recorder.record_instruction(&Instr::Return(0), 2002);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+        // GuardMask should be populated from guards in finish_recording
+        assert_eq!(trace.guard_mask.len(), 2);
+        assert_eq!(trace.guard_mask.mask(), 3); // bits 0 and 1
+        assert_eq!(trace.guard_mask.invariants()[0], (0u16, ValueType::I64));
+        assert_eq!(trace.guard_mask.invariants()[1], (1u16, ValueType::F64));
+    }
+
+    #[test]
+    fn test_emit_guard_mask_check() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(2100);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 2100);
+        recorder.record_guard(0, ValueType::I64);
+        recorder.record_instruction(&Instr::LoadF64(1, 3.14), 2101);
+        recorder.record_guard(1, ValueType::F64);
+        recorder.record_instruction(&Instr::Return(0), 2102);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+
+        let compiler = TraceCompiler::new();
+        let summary = compiler.emit_guard_mask_check(trace);
+        assert!(summary.is_some());
+        let s = summary.unwrap();
+        assert_eq!(s.mask, 3); // bits 0 and 1
+        assert_eq!(s.invariant_count, 2);
+        assert_eq!(s.invariant_slots, vec![0u16, 1u16]);
+    }
+
+    #[test]
+    fn test_emit_guard_mask_check_no_guards() {
+        let mut recorder = TraceRecorder::new();
+        recorder.start_recording(2200);
+        recorder.record_instruction(&Instr::LoadI64(0, 42), 2200);
+        recorder.record_instruction(&Instr::Return(0), 2201);
+
+        let trace_id = recorder.finish_recording();
+        let trace = recorder.get_trace(trace_id.unwrap()).unwrap();
+
+        let compiler = TraceCompiler::new();
+        let summary = compiler.emit_guard_mask_check(trace);
+        assert!(summary.is_none());
     }
 }

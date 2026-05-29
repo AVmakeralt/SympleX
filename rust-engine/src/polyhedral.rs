@@ -27,6 +27,16 @@
 
 use crate::types::{BinOpKind, Instr};
 
+/// Polyhedral tracing macro — same as jit_trace in phase3_jit.rs.
+#[cfg(feature = "jit_trace")]
+macro_rules! poly_trace {
+    ($($arg:tt)*) => { eprintln!($($arg)*) };
+}
+#[cfg(not(feature = "jit_trace"))]
+macro_rules! poly_trace {
+    ($($arg:tt)*) => {};
+}
+
 // =============================================================================
 // §1. CONSTANTS & MULTI-DIMENSIONAL AFFINE MATHEMATICS
 // =============================================================================
@@ -2182,11 +2192,27 @@ pub enum SimdHintKind {
     ParametricBoundary { sym_id: u16, coeff: i64 },
 }
 
+/// Tile dimension info for cache-conflict analysis.
+/// Populated by the tiling passes and consumed by `apply_cache_padding`.
+#[derive(Debug, Clone)]
+pub struct TileInfo {
+    /// Number of rows in the tile.
+    pub rows: usize,
+    /// Number of columns in the tile (may differ from stride if padded).
+    pub cols: usize,
+    /// Row stride in elements (distance between row starts).
+    pub stride: usize,
+    /// Element type name ("f32" or "f64").
+    pub element_type: Option<String>,
+}
+
 /// Flat hint table with O(log N) lookup via binary search.
 #[derive(Debug, Clone)]
 pub struct PolyhedralBlock {
     pub instrs: Vec<Instr>,
     pub hints: Vec<(usize, SimdHintKind)>,
+    /// Tile dimension information for cache-conflict padding analysis.
+    pub tiles: Vec<TileInfo>,
 }
 
 impl PolyhedralBlock {
@@ -2308,7 +2334,7 @@ pub fn generate_simd_hints(scop: &Scop, tiled_instrs: &[Instr]) -> PolyhedralBlo
     hints.sort_unstable_by_key(|(pc, _)| *pc);
     hints.dedup_by_key(|(pc, _)| *pc);
 
-    PolyhedralBlock { instrs: tiled_instrs.to_vec(), hints }
+    PolyhedralBlock { instrs: tiled_instrs.to_vec(), hints, tiles: Vec::new() }
 }
 
 // =============================================================================
@@ -2767,6 +2793,94 @@ pub fn pad_to_cache_line(byte_size: usize) -> usize {
     ((byte_size + CACHE_LINE_BYTES - 1) / CACHE_LINE_BYTES) * CACHE_LINE_BYTES
 }
 
+// =============================================================================
+// §15b. CACHE-LINE CONFLICT PADDING
+// =============================================================================
+//
+// When matrix dimensions or tile strides are exact powers of two, parallel
+// memory accesses can hit the same cache set, causing severe conflict misses.
+// This module detects such alignments and recommends virtual padding offsets
+// that shift memory accesses to distinct cache sets.
+//
+// Standard x86-64 cache line = 64 bytes.  L1 cache is typically 32 KB with
+// 8-way associativity, meaning 64 cache sets of 512 bytes each.
+// If two concurrent accesses map to the same set, one evicts the other.
+
+/// The standard cache line size on x86-64.
+pub const CACHE_LINE_SIZE: usize = 64;
+
+/// Recommend virtual padding for a 2D tile to avoid cache-line conflicts.
+///
+/// Returns the recommended row stride (in elements) that avoids conflicts,
+/// or None if no padding is needed.
+pub fn recommend_cache_padding(
+    rows: usize,
+    cols: usize,
+    element_size: usize, // bytes per element (4 for f32, 8 for f64)
+) -> Option<usize> {
+    let row_bytes = cols * element_size;
+
+    // Check if row_bytes is a multiple of the cache line size
+    // AND is a power-of-two multiple (most dangerous for conflicts)
+    if row_bytes % CACHE_LINE_SIZE != 0 {
+        return None; // Not aligned, no conflict risk
+    }
+
+    // Check if multiple rows map to the same cache set
+    // L1 has 64 sets × 8 ways. Cache set index = (addr / 64) % 64
+    // If row_bytes is a multiple of 64*64 = 4096, rows hit the same set
+    // More generally, if row_bytes is a power of 2 and >= 64, conflicts occur
+    let row_stride_sets = row_bytes / CACHE_LINE_SIZE;
+
+    // If row_stride_sets is a power of 2, rows will cycle through the same
+    // small set of cache sets, causing conflicts
+    if row_stride_sets > 0 && (row_stride_sets & (row_stride_sets - 1)) == 0 {
+        // Add 1 cache line of padding
+        let padded_row_bytes = row_bytes + CACHE_LINE_SIZE;
+        let padded_cols = padded_row_bytes / element_size;
+        return Some(padded_cols);
+    }
+
+    // Check if the number of rows × row_bytes exceeds L1 cache (32KB)
+    // with power-of-2 strides — this causes conflicts in L2 as well
+    let total_bytes = rows * row_bytes;
+    if total_bytes > 32 * 1024 && row_bytes > 0 && (row_bytes & (row_bytes - 1)) == 0 {
+        let padded_row_bytes = row_bytes + CACHE_LINE_SIZE;
+        let padded_cols = padded_row_bytes / element_size;
+        return Some(padded_cols);
+    }
+
+    None
+}
+
+/// Apply cache-line conflict padding to a PolyhedralBlock's tile configuration.
+///
+/// Modifies the tile dimensions and strides to include virtual padding when
+/// cache conflicts are detected.  Returns the number of paddings applied.
+pub fn apply_cache_padding(block: &mut PolyhedralBlock) -> usize {
+    let mut paddings_applied = 0usize;
+
+    // Check the tile configuration for conflict-inducing strides
+    for tile in &mut block.tiles {
+        let element_size = match tile.element_type {
+            Some(ref ty) if ty == "f64" => 8,
+            Some(ref ty) if ty == "f32" => 4,
+            _ => 8, // default to f64
+        };
+
+        if let Some(padded_cols) = recommend_cache_padding(tile.rows, tile.cols, element_size) {
+            poly_trace!("[POLY] Cache-line conflict padding: tile {}×{} → {}×{} ({}-byte stride)",
+                tile.rows, tile.cols, tile.rows, padded_cols,
+                padded_cols * element_size);
+            tile.cols = padded_cols;
+            tile.stride = padded_cols;
+            paddings_applied += 1;
+        }
+    }
+
+    paddings_applied
+}
+
 /// Alignment hint attached to a base array slot.
 #[derive(Debug, Clone, Copy)]
 pub struct AlignmentHint {
@@ -3110,7 +3224,7 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
     // ── Stage 1: SCoP extraction ──────────────────────────────────────────
     let mut scop = match extract_scop(instrs) {
         Some(s) => s,
-        None => return PolyhedralBlock { instrs: instrs.to_vec(), hints: Vec::new() },
+        None => return PolyhedralBlock { instrs: instrs.to_vec(), hints: Vec::new(), tiles: Vec::new() },
     };
 
     {
@@ -3387,6 +3501,38 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
 
     // ── Stage 14: SIMD/AMX Hint Emission ──────────────────────────────────
     let mut block = generate_simd_hints(&scop, &tiled_ir);
+
+    // Populate tile info from tiling configuration for cache-conflict analysis.
+    // Derive tile dimensions from the hierarchical tiling parameters used above.
+    if use_hierarchical {
+        let target = HardwareTarget::detect();
+        let ml_config = configure_extreme_ml_kernel(&target, 4 /* FP32 */);
+        block.tiles.push(TileInfo {
+            rows: ml_config.tile_m,
+            cols: ml_config.tile_n,
+            stride: ml_config.tile_n,
+            element_type: Some("f32".to_string()),
+        });
+        block.tiles.push(TileInfo {
+            rows: ml_config.tile_m,
+            cols: ml_config.tile_k,
+            stride: ml_config.tile_k,
+            element_type: Some("f32".to_string()),
+        });
+    } else {
+        block.tiles.push(TileInfo {
+            rows: 32,
+            cols: 32,
+            stride: 32,
+            element_type: Some("f64".to_string()),
+        });
+    }
+
+    // ── Stage 15b: Cache-line conflict padding ───────────────────────────
+    let cache_pads = apply_cache_padding(&mut block);
+    if cache_pads > 0 {
+        poly_trace!("[POLY] Applied {} cache-line conflict paddings", cache_pads);
+    }
 
     // Merge fusion hints
     let mut fusion_hints: Vec<(usize, SimdHintKind)> = Vec::new();

@@ -299,6 +299,10 @@ fn jit_info() -> String {
     info.push_str("  AVX2 Vectorized Elementwise (8-wide)\n");
     info.push_str("\nMulti-threading:\n");
     info.push_str(&format!("  rayon parallel matmul ({} threads)\n", num_cpus::get()));
+    info.push_str("\nMulti-Tier Scheduling:\n");
+    info.push_str("  Tier 1: Baseline JIT (fast compile, linear scan RA)\n");
+    info.push_str("  Tier 2: Optimized JIT (polyhedral + LICM, hotness > 100)\n");
+    info.push_str("  Tier 4: Global optimization (full SSA CFG + GVN + LICM, hotness > 1000)\n");
     info
 }
 
@@ -732,7 +736,11 @@ fn jit_compile_info() -> String {
 /// A compiled trace from the tracing JIT, compiled via phase3_jit
 #[pyclass]
 struct TracingJitKernel {
-    compiled: tracing_jit::CompiledTrace,
+    /// The TracingJIT instance for tier management, compilation, and execution.
+    jit: tracing_jit::TracingJIT,
+    /// The trace ID of the compiled trace.
+    trace_id: u32,
+    /// Trace name for display purposes.
     trace_name: String,
 }
 
@@ -743,7 +751,7 @@ impl TracingJitKernel {
     #[new]
     fn new(serialized_instrs: Vec<u8>) -> PyResult<Self> {
         use crate::types::deserialize_instr;
-        use crate::tracing_jit::{TraceCompiler, TraceInstruction, TraceRecorder};
+        use crate::tracing_jit::{TraceInstruction, TracingJIT};
 
         // Deserialize the instruction stream
         let mut instrs = Vec::new();
@@ -772,68 +780,73 @@ impl TracingJitKernel {
             ));
         }
 
-        // Build a synthetic trace from the instructions
-        let mut recorder = TraceRecorder::new();
-        recorder.start_recording(0);
+        // Build a synthetic trace from the instructions using TracingJIT
+        let mut jit = TracingJIT::new();
+        jit.recorder.start_recording(0);
         for ti in &instrs {
-            recorder.record_instruction(&ti.instruction, ti.original_pc);
+            jit.recorder.record_instruction(&ti.instruction, ti.original_pc);
         }
-        let trace_id = recorder.finish_recording()
+        let trace_id = jit.recorder.finish_recording()
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "Failed to record trace"
             ))?;
 
-        let trace = recorder.get_trace(trace_id).unwrap();
-
-        // Compile via phase3_jit
-        let compiler = TraceCompiler::new();
-        let compiled = compiler.compile_trace(trace)
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Failed to compile trace via phase3_jit"
-            ))?;
+        // Compile and cache via the JIT for tier management
+        let trace_clone = jit.recorder.get_trace(trace_id).cloned();
+        if let Some(trace) = trace_clone {
+            jit.compile_and_cache(&trace)
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to compile and cache trace via phase3_jit"
+                ))?;
+        }
 
         Ok(Self {
-            compiled,
+            jit,
+            trace_id,
             trace_name: format!("trace_{}", trace_id),
         })
     }
 
     /// Execute the compiled trace with integer arguments
-    fn execute_int(&self, args: Vec<i64>) -> i64 {
+    fn execute_int(&mut self, args: Vec<i64>) -> i64 {
         use crate::types::Value;
         let values: Vec<Value> = args.iter().map(|&v| Value::I64(v)).collect();
-        match self.compiled.execute(&values) {
-            Ok(Value::I64(v)) => v,
-            Ok(Value::I32(v)) => v as i64,
+        match self.jit.execute_trace(self.trace_id, &values) {
+            Some(Ok(Value::I64(v))) => v,
+            Some(Ok(Value::I32(v))) => v as i64,
             _ => 0,
         }
     }
 
     /// Benchmark the compiled trace
-    fn benchmark(&self, args: Vec<i64>, iters: usize) -> f64 {
+    fn benchmark(&mut self, args: Vec<i64>, iters: usize) -> f64 {
         use crate::types::Value;
         let values: Vec<Value> = args.iter().map(|&v| Value::I64(v)).collect();
 
         // Warmup
         for _ in 0..100 {
-            let _ = self.compiled.execute(&values);
+            let _ = self.jit.execute_trace(self.trace_id, &values);
         }
 
         let start = std::time::Instant::now();
         for _ in 0..iters {
-            let _ = self.compiled.execute(&values);
+            let _ = self.jit.execute_trace(self.trace_id, &values);
         }
         start.elapsed().as_secs_f64() / iters as f64
     }
 
     /// Get the code size in bytes
     fn code_size(&self) -> usize {
-        self.compiled.code_size()
+        self.jit.compiled_cache.get(&self.trace_id)
+            .map(|ct| ct.code_size())
+            .unwrap_or(0)
     }
 
     /// Verify code integrity
     fn verify_integrity(&self) -> bool {
-        self.compiled.verify_integrity()
+        self.jit.compiled_cache.get(&self.trace_id)
+            .map(|ct| ct.verify_integrity())
+            .unwrap_or(false)
     }
 
     /// Get the trace name
@@ -843,23 +856,45 @@ impl TracingJitKernel {
 
     /// Number of guards
     fn guard_count(&self) -> usize {
-        self.compiled.guard_count
+        self.jit.compiled_cache.get(&self.trace_id)
+            .map(|ct| ct.guard_count)
+            .unwrap_or(0)
     }
 
     /// Number of instructions
     fn instruction_count(&self) -> usize {
-        self.compiled.instruction_count
+        self.jit.compiled_cache.get(&self.trace_id)
+            .map(|ct| ct.instruction_count)
+            .unwrap_or(0)
     }
 
     /// Dump the first bytes of generated machine code as hex
     fn dump_code(&self) -> String {
-        let func_ptr = self.compiled.native_code.mem_entry() as *const u8;
-        let len = self.compiled.code_size().min(64);
-        if len == 0 || func_ptr.is_null() {
-            return "empty".to_string();
+        if let Some(compiled) = self.jit.compiled_cache.get(&self.trace_id) {
+            let func_ptr = compiled.native_code.mem_entry() as *const u8;
+            let len = compiled.code_size().min(64);
+            if len == 0 || func_ptr.is_null() {
+                return "empty".to_string();
+            }
+            let code = unsafe { std::slice::from_raw_parts(func_ptr, len) };
+            code.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+        } else {
+            "not_found".to_string()
         }
-        let code = unsafe { std::slice::from_raw_parts(func_ptr, len) };
-        code.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Get the current tier for the compiled trace.
+    fn trace_tier(&self) -> String {
+        match self.jit.tier_manager.current_tier(self.trace_id) {
+            tracing_jit::TierState::Tier1Baseline => "Tier1-Baseline".to_string(),
+            tracing_jit::TierState::Tier2Optimized => "Tier2-Optimized".to_string(),
+            tracing_jit::TierState::Tier4Global => "Tier4-Global".to_string(),
+        }
+    }
+
+    /// Get the hotness counter for the trace.
+    fn trace_hotness(&self) -> u64 {
+        self.jit.tier_manager.hotness(self.trace_id)
     }
 }
 
