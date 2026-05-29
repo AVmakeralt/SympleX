@@ -1534,6 +1534,14 @@ const REDUCE_MIN: u8 = 2;
 const REDUCE_NONE: u8 = 255;
 
 // ── f32 AVX2 core ──
+//
+// Supports ARBITRARY-LENGTH op chains — not limited to MAX_FUSED_OPS.
+// Intermediates are stored in a Vec<__m256> allocated once outside the
+// element loop.  For short chains (≤ MAX_FUSED_OPS) the compiler keeps
+// intermediates in YMM registers.  For long chains (e.g., 700 ops for
+// Mandelbrot) the compiler spills to the stack but arithmetic stays
+// vectorised (8 f32 per YMM), which is dramatically faster than the
+// scalar Rust fallback.
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -1547,16 +1555,22 @@ unsafe fn fused_elem_f32_avx2_core(
 ) -> f64 {
     use std::arch::x86_64::*;
 
-    let num_ops = ops.len().min(MAX_FUSED_OPS);
+    let num_ops = ops.len();
     if num_ops == 0 || n == 0 { return 0.0; }
 
     let has_reduce = reduce_op != REDUCE_NONE;
+    let zero = _mm256_setzero_ps();
 
     // 4 YMM accumulators for 4x-unrolled reduce
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut acc2 = _mm256_setzero_ps();
-    let mut acc3 = _mm256_setzero_ps();
+    let mut acc0 = zero;
+    let mut acc1 = zero;
+    let mut acc2 = zero;
+    let mut acc3 = zero;
+
+    // Allocate intermediates ONCE — reused across all elements.
+    // For short chains this fits in registers; for long chains the
+    // compiler spills to stack, but every load/store is still 32 bytes.
+    let mut intermediates: Vec<__m256> = vec![zero; num_ops];
 
     // Process 32 f32 per iteration (4 × 8-wide YMM)
     let n_vec4 = n & !31;
@@ -1565,16 +1579,15 @@ unsafe fn fused_elem_f32_avx2_core(
     while i < n_vec4 {
         for u in 0..4usize {
             let base = i + u * 8;
-            let mut intermediates: [__m256; MAX_FUSED_OPS] = [_mm256_setzero_ps(); MAX_FUSED_OPS];
 
-            for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+            for (op_idx, desc) in ops.iter().enumerate() {
                 let lhs = match desc.lhs_src {
                     0 => {
                         let idx = desc.lhs_idx as usize;
                         if idx < input_ptrs.len() {
                             _mm256_loadu_ps(input_ptrs[idx].add(base))
                         } else {
-                            _mm256_setzero_ps()
+                            zero
                         }
                     }
                     1 => {
@@ -1582,14 +1595,14 @@ unsafe fn fused_elem_f32_avx2_core(
                         if idx < constants.len() {
                             _mm256_set1_ps(*constants.get_unchecked(idx))
                         } else {
-                            _mm256_setzero_ps()
+                            zero
                         }
                     }
                     2 => {
                         let idx = desc.lhs_idx as usize;
-                        if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_ps() }
+                        *intermediates.get_unchecked(idx)
                     }
-                    _ => _mm256_setzero_ps(),
+                    _ => zero,
                 };
                 let rhs = match desc.rhs_src {
                     0 => {
@@ -1597,7 +1610,7 @@ unsafe fn fused_elem_f32_avx2_core(
                         if idx < input_ptrs.len() {
                             _mm256_loadu_ps(input_ptrs[idx].add(base))
                         } else {
-                            _mm256_setzero_ps()
+                            zero
                         }
                     }
                     1 => {
@@ -1605,14 +1618,14 @@ unsafe fn fused_elem_f32_avx2_core(
                         if idx < constants.len() {
                             _mm256_set1_ps(*constants.get_unchecked(idx))
                         } else {
-                            _mm256_setzero_ps()
+                            zero
                         }
                     }
                     2 => {
                         let idx = desc.rhs_idx as usize;
-                        if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_ps() }
+                        *intermediates.get_unchecked(idx)
                     }
-                    _ => _mm256_setzero_ps(),
+                    _ => zero,
                 };
 
                 intermediates[op_idx] = match desc.op {
@@ -1660,38 +1673,36 @@ unsafe fn fused_elem_f32_avx2_core(
     // Process remaining 8-element chunks
     let n_vec = n & !7;
     while i < n_vec {
-        let mut intermediates: [__m256; MAX_FUSED_OPS] = [_mm256_setzero_ps(); MAX_FUSED_OPS];
-
-        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+        for (op_idx, desc) in ops.iter().enumerate() {
             let lhs = match desc.lhs_src {
                 0 => {
                     let idx = desc.lhs_idx as usize;
-                    if idx < input_ptrs.len() { _mm256_loadu_ps(input_ptrs[idx].add(i)) } else { _mm256_setzero_ps() }
+                    if idx < input_ptrs.len() { _mm256_loadu_ps(input_ptrs[idx].add(i)) } else { zero }
                 }
                 1 => {
                     let idx = desc.lhs_idx as usize;
-                    if idx < constants.len() { _mm256_set1_ps(*constants.get_unchecked(idx)) } else { _mm256_setzero_ps() }
+                    if idx < constants.len() { _mm256_set1_ps(*constants.get_unchecked(idx)) } else { zero }
                 }
                 2 => {
                     let idx = desc.lhs_idx as usize;
-                    if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_ps() }
+                    *intermediates.get_unchecked(idx)
                 }
-                _ => _mm256_setzero_ps(),
+                _ => zero,
             };
             let rhs = match desc.rhs_src {
                 0 => {
                     let idx = desc.rhs_idx as usize;
-                    if idx < input_ptrs.len() { _mm256_loadu_ps(input_ptrs[idx].add(i)) } else { _mm256_setzero_ps() }
+                    if idx < input_ptrs.len() { _mm256_loadu_ps(input_ptrs[idx].add(i)) } else { zero }
                 }
                 1 => {
                     let idx = desc.rhs_idx as usize;
-                    if idx < constants.len() { _mm256_set1_ps(*constants.get_unchecked(idx)) } else { _mm256_setzero_ps() }
+                    if idx < constants.len() { _mm256_set1_ps(*constants.get_unchecked(idx)) } else { zero }
                 }
                 2 => {
                     let idx = desc.rhs_idx as usize;
-                    if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_ps() }
+                    *intermediates.get_unchecked(idx)
                 }
-                _ => _mm256_setzero_ps(),
+                _ => zero,
             };
 
             intermediates[op_idx] = match desc.op {
@@ -1721,23 +1732,21 @@ unsafe fn fused_elem_f32_avx2_core(
         i += 8;
     }
 
-    // Scalar tail
+    // Scalar tail — also uses Vec for arbitrary-length chains
+    let mut scalar_intermediates: Vec<f32> = vec![0.0; num_ops];
     let mut scalar_acc: f64 = 0.0;
     let mut first_scalar = true;
     while i < n {
-        let mut intermediates: [f32; MAX_FUSED_OPS] = [0.0; MAX_FUSED_OPS];
+        scalar_intermediates.fill(0.0f32);
 
-        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+        for (op_idx, desc) in ops.iter().enumerate() {
             let lhs: f32 = match desc.lhs_src {
                 0 => {
                     let idx = desc.lhs_idx as usize;
                     if idx < input_ptrs.len() { *input_ptrs[idx].add(i) } else { 0.0 }
                 }
                 1 => *constants.get(desc.lhs_idx as usize).unwrap_or(&0.0),
-                2 => {
-                    let idx = desc.lhs_idx as usize;
-                    if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 }
-                }
+                2 => scalar_intermediates[desc.lhs_idx as usize],
                 _ => 0.0,
             };
             let rhs: f32 = match desc.rhs_src {
@@ -1746,14 +1755,11 @@ unsafe fn fused_elem_f32_avx2_core(
                     if idx < input_ptrs.len() { *input_ptrs[idx].add(i) } else { 0.0 }
                 }
                 1 => *constants.get(desc.rhs_idx as usize).unwrap_or(&0.0),
-                2 => {
-                    let idx = desc.rhs_idx as usize;
-                    if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 }
-                }
+                2 => scalar_intermediates[desc.rhs_idx as usize],
                 _ => 0.0,
             };
 
-            intermediates[op_idx] = match desc.op {
+            scalar_intermediates[op_idx] = match desc.op {
                 0 => lhs + rhs,
                 1 => lhs - rhs,
                 2 => lhs * rhs,
@@ -1764,7 +1770,7 @@ unsafe fn fused_elem_f32_avx2_core(
             };
         }
 
-        let final_val = intermediates[num_ops - 1];
+        let final_val = scalar_intermediates[num_ops - 1];
 
         if has_reduce {
             match reduce_op {
@@ -1938,24 +1944,25 @@ pub fn simd_fused_elementwise_f32(
     let ptrs: Vec<*const f32> = input_ptrs.iter().map(|&p| p as *const f32).collect();
     let dst = dst_ptr as *mut f32;
 
-    // For ops that fit in a single batch, use the fast AVX2 path
-    if descs.len() <= MAX_FUSED_OPS {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") {
-                return unsafe {
-                    fused_elem_f32_avx2_core(&descs, &ptrs, &constants, n, reduce_op, dst)
-                };
-            }
+    // Always use AVX2 when available — the kernel now supports
+    // arbitrary-length op chains via Vec<__m256> intermediates.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe {
+                fused_elem_f32_avx2_core(&descs, &ptrs, &constants, n, reduce_op, dst)
+            };
         }
     }
 
-    // For long chains (>MAX_FUSED_OPS) or when AVX2 is not available,
-    // use the scalar path which handles ALL ops correctly.
+    // Scalar fallback for non-AVX2 systems
     unsafe { fused_elem_f32_scalar(&descs, &ptrs, &constants, n, reduce_op, dst) }
 }
 
 // ── f64 AVX2 core ──
+//
+// Supports ARBITRARY-LENGTH op chains — same approach as the f32 core.
+// Vec<__m256d> intermediates allocated once, reused per element.
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -1969,14 +1976,19 @@ unsafe fn fused_elem_f64_avx2_core(
 ) -> f64 {
     use std::arch::x86_64::*;
 
-    let num_ops = ops.len().min(MAX_FUSED_OPS);
+    let num_ops = ops.len();
     if num_ops == 0 || n == 0 { return 0.0; }
 
     let has_reduce = reduce_op != REDUCE_NONE;
-    let mut acc0 = _mm256_setzero_pd();
-    let mut acc1 = _mm256_setzero_pd();
-    let mut acc2 = _mm256_setzero_pd();
-    let mut acc3 = _mm256_setzero_pd();
+    let zero = _mm256_setzero_pd();
+
+    let mut acc0 = zero;
+    let mut acc1 = zero;
+    let mut acc2 = zero;
+    let mut acc3 = zero;
+
+    // Allocate intermediates ONCE — reused across all elements.
+    let mut intermediates: Vec<__m256d> = vec![zero; num_ops];
 
     // Process 16 f64 per iteration (4 × 4-wide YMM)
     let n_vec4 = n & !15;
@@ -1985,38 +1997,37 @@ unsafe fn fused_elem_f64_avx2_core(
     while i < n_vec4 {
         for u in 0..4usize {
             let base = i + u * 4;
-            let mut intermediates: [__m256d; MAX_FUSED_OPS] = [_mm256_setzero_pd(); MAX_FUSED_OPS];
 
-            for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+            for (op_idx, desc) in ops.iter().enumerate() {
                 let lhs = match desc.lhs_src {
                     0 => {
                         let idx = desc.lhs_idx as usize;
-                        if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(base)) } else { _mm256_setzero_pd() }
+                        if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(base)) } else { zero }
                     }
                     1 => {
                         let idx = desc.lhs_idx as usize;
-                        if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { _mm256_setzero_pd() }
+                        if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { zero }
                     }
                     2 => {
                         let idx = desc.lhs_idx as usize;
-                        if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_pd() }
+                        *intermediates.get_unchecked(idx)
                     }
-                    _ => _mm256_setzero_pd(),
+                    _ => zero,
                 };
                 let rhs = match desc.rhs_src {
                     0 => {
                         let idx = desc.rhs_idx as usize;
-                        if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(base)) } else { _mm256_setzero_pd() }
+                        if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(base)) } else { zero }
                     }
                     1 => {
                         let idx = desc.rhs_idx as usize;
-                        if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { _mm256_setzero_pd() }
+                        if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { zero }
                     }
                     2 => {
                         let idx = desc.rhs_idx as usize;
-                        if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_pd() }
+                        *intermediates.get_unchecked(idx)
                     }
-                    _ => _mm256_setzero_pd(),
+                    _ => zero,
                 };
 
                 intermediates[op_idx] = match desc.op {
@@ -2064,20 +2075,18 @@ unsafe fn fused_elem_f64_avx2_core(
     // Remaining 4-element chunks
     let n_vec = n & !3;
     while i < n_vec {
-        let mut intermediates: [__m256d; MAX_FUSED_OPS] = [_mm256_setzero_pd(); MAX_FUSED_OPS];
-
-        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+        for (op_idx, desc) in ops.iter().enumerate() {
             let lhs = match desc.lhs_src {
-                0 => { let idx = desc.lhs_idx as usize; if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(i)) } else { _mm256_setzero_pd() } }
-                1 => { let idx = desc.lhs_idx as usize; if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { _mm256_setzero_pd() } }
-                2 => { let idx = desc.lhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_pd() } }
-                _ => _mm256_setzero_pd(),
+                0 => { let idx = desc.lhs_idx as usize; if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(i)) } else { zero } }
+                1 => { let idx = desc.lhs_idx as usize; if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { zero } }
+                2 => { let idx = desc.lhs_idx as usize; *intermediates.get_unchecked(idx) }
+                _ => zero,
             };
             let rhs = match desc.rhs_src {
-                0 => { let idx = desc.rhs_idx as usize; if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(i)) } else { _mm256_setzero_pd() } }
-                1 => { let idx = desc.rhs_idx as usize; if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { _mm256_setzero_pd() } }
-                2 => { let idx = desc.rhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { _mm256_setzero_pd() } }
-                _ => _mm256_setzero_pd(),
+                0 => { let idx = desc.rhs_idx as usize; if idx < input_ptrs.len() { _mm256_loadu_pd(input_ptrs[idx].add(i)) } else { zero } }
+                1 => { let idx = desc.rhs_idx as usize; if idx < constants.len() { _mm256_set1_pd(*constants.get_unchecked(idx)) } else { zero } }
+                2 => { let idx = desc.rhs_idx as usize; *intermediates.get_unchecked(idx) }
+                _ => zero,
             };
 
             intermediates[op_idx] = match desc.op {
@@ -2105,30 +2114,31 @@ unsafe fn fused_elem_f64_avx2_core(
         i += 4;
     }
 
-    // Scalar tail for f64
+    // Scalar tail for f64 — uses Vec for arbitrary-length chains
+    let mut scalar_intermediates: Vec<f64> = vec![0.0; num_ops];
     let mut scalar_acc: f64 = 0.0;
     let mut first_scalar = true;
     while i < n {
-        let mut intermediates: [f64; MAX_FUSED_OPS] = [0.0; MAX_FUSED_OPS];
-        for (op_idx, desc) in ops.iter().enumerate().take(MAX_FUSED_OPS) {
+        scalar_intermediates.fill(0.0f64);
+        for (op_idx, desc) in ops.iter().enumerate() {
             let lhs: f64 = match desc.lhs_src {
                 0 => { let idx = desc.lhs_idx as usize; if idx < input_ptrs.len() { *input_ptrs[idx].add(i) } else { 0.0 } }
                 1 => *constants.get(desc.lhs_idx as usize).unwrap_or(&0.0),
-                2 => { let idx = desc.lhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 } }
+                2 => scalar_intermediates[desc.lhs_idx as usize],
                 _ => 0.0,
             };
             let rhs: f64 = match desc.rhs_src {
                 0 => { let idx = desc.rhs_idx as usize; if idx < input_ptrs.len() { *input_ptrs[idx].add(i) } else { 0.0 } }
                 1 => *constants.get(desc.rhs_idx as usize).unwrap_or(&0.0),
-                2 => { let idx = desc.rhs_idx as usize; if idx < MAX_FUSED_OPS { intermediates[idx] } else { 0.0 } }
+                2 => scalar_intermediates[desc.rhs_idx as usize],
                 _ => 0.0,
             };
-            intermediates[op_idx] = match desc.op {
+            scalar_intermediates[op_idx] = match desc.op {
                 0 => lhs + rhs, 1 => lhs - rhs, 2 => lhs * rhs, 3 => lhs / rhs,
                 4 => lhs.min(rhs), 5 => lhs.max(rhs), _ => lhs,
             };
         }
-        let val = intermediates[num_ops - 1];
+        let val = scalar_intermediates[num_ops - 1];
         if has_reduce {
             match reduce_op {
                 REDUCE_SUM => scalar_acc += val,
@@ -2186,6 +2196,64 @@ unsafe fn fused_elem_f64_avx2_core(
     0.0
 }
 
+/// Scalar fallback for f64 fused elementwise.
+/// Used when AVX2 is not available. Supports arbitrary-length op chains.
+unsafe fn fused_elem_f64_scalar(
+    ops: &[FusedOpDesc],
+    input_ptrs: &[*const f64],
+    constants: &[f64],
+    n: usize,
+    reduce_op: u8,
+    dst_ptr: *mut f64,
+) -> f64 {
+    let num_ops = ops.len();
+    let has_reduce = reduce_op != REDUCE_NONE;
+    let mut acc: f64 = 0.0;
+    let mut first = true;
+
+    let mut intermediates: Vec<f64> = vec![0.0; num_ops];
+
+    for i in 0..n {
+        intermediates.fill(0.0);
+        for (op_idx, desc) in ops.iter().enumerate() {
+            let lhs: f64 = match desc.lhs_src {
+                0 => if (desc.lhs_idx as usize) < input_ptrs.len() { *input_ptrs[desc.lhs_idx as usize].add(i) } else { 0.0 },
+                1 => *constants.get(desc.lhs_idx as usize).unwrap_or(&0.0),
+                2 => if (desc.lhs_idx as usize) < num_ops { intermediates[desc.lhs_idx as usize] } else { 0.0 },
+                _ => 0.0,
+            };
+            let rhs: f64 = match desc.rhs_src {
+                0 => if (desc.rhs_idx as usize) < input_ptrs.len() { *input_ptrs[desc.rhs_idx as usize].add(i) } else { 0.0 },
+                1 => *constants.get(desc.rhs_idx as usize).unwrap_or(&0.0),
+                2 => if (desc.rhs_idx as usize) < num_ops { intermediates[desc.rhs_idx as usize] } else { 0.0 },
+                _ => 0.0,
+            };
+            intermediates[op_idx] = match desc.op {
+                0 => lhs + rhs,
+                1 => lhs - rhs,
+                2 => lhs * rhs,
+                3 => lhs / rhs,
+                4 => lhs.min(rhs),
+                5 => lhs.max(rhs),
+                _ => lhs,
+            };
+        }
+        let val = intermediates[num_ops - 1];
+        if has_reduce {
+            match reduce_op {
+                REDUCE_SUM => acc += val,
+                REDUCE_MAX => acc = if first { val } else { acc.max(val) },
+                REDUCE_MIN => acc = if first { val } else { acc.min(val) },
+                _ => {}
+            }
+            first = false;
+        } else {
+            *dst_ptr.add(i) = val;
+        }
+    }
+    acc
+}
+
 /// Execute a fused chain of elementwise operations in a single pass for f64 arrays.
 pub fn simd_fused_elementwise_f64(
     ops: Vec<(u8, u8, u16, u8, u16)>,
@@ -2203,59 +2271,17 @@ pub fn simd_fused_elementwise_f64(
     let ptrs: Vec<*const f64> = input_ptrs.iter().map(|&p| p as *const f64).collect();
     let dst = dst_ptr as *mut f64;
 
-    // For ops that fit in a single batch, use the fast AVX2 path
-    if descs.len() <= MAX_FUSED_OPS {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") {
-                return unsafe {
-                    fused_elem_f64_avx2_core(&descs, &ptrs, &constants, n, reduce_op, dst)
-                };
-            }
+    // Always use AVX2 when available — the kernel now supports
+    // arbitrary-length op chains via Vec<__m256d> intermediates.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe {
+                fused_elem_f64_avx2_core(&descs, &ptrs, &constants, n, reduce_op, dst)
+            };
         }
     }
 
-    // Scalar fallback for f64 — supports arbitrary-length chains
-    unsafe {
-        let num_ops = descs.len();
-        let has_reduce = reduce_op != REDUCE_NONE;
-        let mut acc: f64 = 0.0;
-        let mut first = true;
-        // Allocate intermediates once outside the loop — reused for each element.
-        let mut intermediates: Vec<f64> = vec![0.0; num_ops];
-        for i in 0..n {
-            intermediates.fill(0.0);
-            for (op_idx, desc) in descs.iter().enumerate() {
-                let lhs: f64 = match desc.lhs_src {
-                    0 => { let idx = desc.lhs_idx as usize; if idx < ptrs.len() { *ptrs[idx].add(i) } else { 0.0 } }
-                    1 => *constants.get(desc.lhs_idx as usize).unwrap_or(&0.0),
-                    2 => { let idx = desc.lhs_idx as usize; if idx < num_ops { intermediates[idx] } else { 0.0 } }
-                    _ => 0.0,
-                };
-                let rhs: f64 = match desc.rhs_src {
-                    0 => { let idx = desc.rhs_idx as usize; if idx < ptrs.len() { *ptrs[idx].add(i) } else { 0.0 } }
-                    1 => *constants.get(desc.rhs_idx as usize).unwrap_or(&0.0),
-                    2 => { let idx = desc.rhs_idx as usize; if idx < num_ops { intermediates[idx] } else { 0.0 } }
-                    _ => 0.0,
-                };
-                intermediates[op_idx] = match desc.op {
-                    0 => lhs + rhs, 1 => lhs - rhs, 2 => lhs * rhs, 3 => lhs / rhs,
-                    4 => lhs.min(rhs), 5 => lhs.max(rhs), _ => lhs,
-                };
-            }
-            let val = intermediates[num_ops - 1];
-            if has_reduce {
-                match reduce_op {
-                    REDUCE_SUM => acc += val,
-                    REDUCE_MAX => acc = if first { val } else { acc.max(val) },
-                    REDUCE_MIN => acc = if first { val } else { acc.min(val) },
-                    _ => {}
-                }
-                first = false;
-            } else {
-                *dst.add(i) = val;
-            }
-        }
-        acc
-    }
+    // Scalar fallback for non-AVX2 systems
+    unsafe { fused_elem_f64_scalar(&descs, &ptrs, &constants, n, reduce_op, dst) }
 }
