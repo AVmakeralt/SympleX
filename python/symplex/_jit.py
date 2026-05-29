@@ -26,16 +26,15 @@ Performance optimizations:
 
 from __future__ import annotations
 import functools
-import inspect
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ._errors import ImpureFunctionError, TracerError, CompilationError, ShapeError
+from ._errors import ImpureFunctionError, CompilationError
 from ._ast_checker import check_purity
-from ._tracer import TracerVal, SlotAllocator, trace_function
-from ._array import DeviceArray, _raw
+from ._tracer import SlotAllocator, trace_function
+from ._array import DeviceArray
 
 
 # ── Pre-built dispatch tables for fast interpretation ────────────────────────
@@ -867,317 +866,6 @@ def _segment_trace_at_matmul(trace):
     return segments
 
 
-def _transform_segment_for_phase3(elem_instrs):
-    """Transform an elementwise segment into a Phase 3-compilable sub-trace.
-
-    The Phase 3 Rust backend only supports specific opcodes:
-      - binop: add, sub, mul, div, min, max, rem, eq, ne, lt, le, gt, ge,
-               and, or, bitand, bitor, bitxor, shl, shr
-      - unop: neg, not, bitnot, abs
-      - load_f64, load_f32, load_i64, load_i32, load_bool
-      - move, store, nop
-
-    Unsupported unops (relu, sigmoid, tanh) must be rewritten:
-      - relu(x) → max(x, 0)
-      - sigmoid(x) → 1 / (1 + exp(-x))  [approximated as-is, will fail]
-      - tanh(x) → not supported, skip Phase 3
-
-    Returns (success, sub_trace, input_slots, output_slot) where:
-      - success: True if the segment can be compiled
-      - sub_trace: list of instruction tuples with remapped slots
-      - input_slots: set of original slot indices that are inputs
-      - output_slot: the original slot index of the final output
-    """
-    # Collect all referenced slots
-    all_slots = set()
-    written_slots = set()
-    for instr in elem_instrs:
-        op = instr[0]
-        if op == "binop":
-            _, dst, binop, lhs, rhs = instr
-            all_slots.update([dst, lhs, rhs])
-            written_slots.add(dst)
-            # Check for unsupported binops
-            if binop not in ("add", "sub", "mul", "div", "min", "max", "rem"):
-                return False, [], set(), None
-        elif op == "unop":
-            _, dst, unop, src = instr
-            all_slots.update([dst, src])
-            written_slots.add(dst)
-            # sigmoid/tanh not supported by Rust serialize_instructions
-            if unop in ("sigmoid", "tanh"):
-                return False, [], set(), None
-        elif op in ("load_f64", "load_f32", "load_i64", "load_i32", "load_bool"):
-            _, slot, _ = instr
-            all_slots.add(slot)
-            written_slots.add(slot)
-        elif op == "move":
-            _, dst, src = instr
-            all_slots.update([dst, src])
-            written_slots.add(dst)
-        elif op == "reduce":
-            # Reduce not supported by Rust Phase 3 backend —
-            # handled by the SIMD elementwise path instead
-            return False, [], set(), None
-
-    if not all_slots:
-        return False, [], set(), None
-
-    # Input slots = read before written (or never written)
-    input_slots = set()
-    for instr in elem_instrs:
-        op = instr[0]
-        if op == "binop":
-            _, _, _, lhs, rhs = instr
-            if lhs not in written_slots:
-                input_slots.add(lhs)
-            if rhs not in written_slots:
-                input_slots.add(rhs)
-        elif op == "unop":
-            _, _, _, src = instr
-            if src not in written_slots:
-                input_slots.add(src)
-        elif op == "move":
-            _, _, src = instr
-            if src not in written_slots:
-                input_slots.add(src)
-
-    # Output slot = last written slot
-    output_slot = None
-    for instr in reversed(elem_instrs):
-        op = instr[0]
-        if op == "binop":
-            output_slot = instr[1]
-            break
-        elif op == "unop":
-            output_slot = instr[1]
-            break
-        elif op == "move":
-            output_slot = instr[1]
-            break
-
-    # Build a slot remapping: original_slot → new_slot (compact from 0)
-    # Input slots come first (these become Phase 3 params), then
-    # written slots in order of appearance.
-    slot_map = {}
-    next_slot = 0
-
-    # Map input slots first (these become the param_count inputs)
-    sorted_inputs = sorted(input_slots)
-    for s in sorted_inputs:
-        slot_map[s] = next_slot
-        next_slot += 1
-
-    # Now transform each instruction, remapping slots and
-    # rewriting unsupported unops.
-    sub_trace = []
-    next_const_slot = 100  # Fresh slots for injected constants
-
-    for instr in elem_instrs:
-        op = instr[0]
-        if op == "binop":
-            _, dst, binop, lhs, rhs = instr
-            if dst not in slot_map:
-                slot_map[dst] = next_slot
-                next_slot += 1
-            sub_trace.append(("binop", slot_map[dst], binop,
-                              slot_map.get(lhs, lhs), slot_map.get(rhs, rhs)))
-        elif op == "unop":
-            _, dst, unop, src = instr
-            if dst not in slot_map:
-                slot_map[dst] = next_slot
-                next_slot += 1
-            if unop == "relu":
-                # Rewrite relu(x) → max(x, 0.0)
-                # Inject a load_f64 constant for 0.0
-                zero_slot = next_const_slot
-                next_const_slot += 1
-                sub_trace.append(("load_f64", zero_slot, 0.0))
-                sub_trace.append(("binop", slot_map[dst], "max",
-                                  slot_map.get(src, src), zero_slot))
-            elif unop == "neg":
-                # Rewrite neg(x) → sub(0, x)
-                zero_slot = next_const_slot
-                next_const_slot += 1
-                sub_trace.append(("load_f64", zero_slot, 0.0))
-                sub_trace.append(("binop", slot_map[dst], "sub",
-                                  zero_slot, slot_map.get(src, src)))
-            elif unop == "abs":
-                # abs not directly supported in serialize_instructions
-                # but UnOpKind::Abs IS supported — keep it
-                sub_trace.append(("unop", slot_map[dst], "abs",
-                                  slot_map.get(src, src)))
-            else:
-                # Unsupported unop — can't compile
-                return False, [], set(), None
-        elif op in ("load_f64", "load_f32", "load_i64", "load_i32", "load_bool"):
-            _, slot, val = instr
-            if slot not in slot_map:
-                slot_map[slot] = next_slot
-                next_slot += 1
-            sub_trace.append((op, slot_map[slot], val))
-        elif op == "move":
-            _, dst, src = instr
-            if dst not in slot_map:
-                slot_map[dst] = next_slot
-                next_slot += 1
-            sub_trace.append(("move", slot_map[dst], slot_map.get(src, src)))
-        else:
-            # Unsupported instruction type
-            return False, [], set(), None
-
-    # Remap input_slots and output_slot
-    remapped_inputs = [slot_map[s] for s in sorted_inputs]
-    remapped_output = slot_map.get(output_slot) if output_slot is not None else None
-
-    # Ensure the result ends up in slot 0 (the return value slot).
-    # p3::execute returns RAX which is loaded from regs[0] via the Return
-    # instruction. Without Return, the JIT epilogue XORs RAX to 0.
-    if remapped_output is not None and remapped_output != 0:
-        sub_trace.append(("move", 0, remapped_output))
-
-    # Add Return(0) instruction so the JIT loads regs[0] into RAX before RET
-    sub_trace.append(("return", 0))
-
-    return True, sub_trace, input_slots, output_slot
-
-
-def _create_segmented_phase3_executor(trace, allocator, phase3_segments_info):
-    """Create a segmented Phase 3 executor that uses SIMD for elementwise and BLAS for matmul.
-
-    phase3_segments_info is a list of tuples:
-      - For elementwise segments: ("phase3", kernel_id, param_count, input_slots, output_slot)
-      - For matmul segments: ("matmul", dst_slot, lhs_slot, rhs_slot)
-      - For other segments: ("other", instruction_tuple)
-
-    The executor manages the slot state and passes data between segments.
-    """
-    arg_slot_map = _build_slot_for_arg_map(allocator)
-
-    # Pre-compute the execution plan for the hybrid executor
-    # (matmul steps + other steps that don't go through Phase 3)
-    plan = phase3_segments_info
-
-    def _segmented_exec(inputs):
-        from ._symplex_core import phase3_execute_arrays
-
-        slots = {}
-
-        # Load input arrays into their slots
-        for i, arr in enumerate(inputs):
-            if isinstance(arr, DeviceArray):
-                arr = arr._data
-            elif not isinstance(arr, np.ndarray):
-                arr = np.asarray(arr, dtype=np.float64)
-            s = arg_slot_map.get(i)
-            if s is not None:
-                slots[s] = arr
-
-        # Execute each segment
-        for seg in plan:
-            seg_type = seg[0]
-
-            if seg_type == "matmul":
-                # Delegate to NumPy's BLAS backend
-                _, dst_slot, lhs_slot, rhs_slot = seg
-                lhs_val = slots.get(lhs_slot, 0)
-                rhs_val = slots.get(rhs_slot, 0)
-                if isinstance(lhs_val, DeviceArray):
-                    lhs_val = lhs_val._data
-                if isinstance(rhs_val, DeviceArray):
-                    rhs_val = rhs_val._data
-                slots[dst_slot] = np.matmul(lhs_val, rhs_val)
-
-            elif seg_type == "phase3":
-                # Execute elementwise segment via Phase 3 SIMD kernel
-                _, kernel_id, param_count, input_slots, output_slot = seg
-
-                # Find the primary array to determine element count
-                primary_arr = None
-                for s in sorted(input_slots):
-                    val = slots.get(s)
-                    if isinstance(val, np.ndarray) and val.ndim >= 1:
-                        primary_arr = val
-                        break
-
-                if primary_arr is None:
-                    # No array input — skip (scalar-only segment)
-                    continue
-
-                n_elements = primary_arr.size
-
-                # Build input arrays in slot order
-                input_arrays = []
-                for slot_idx in range(param_count):
-                    # Find which original slot maps to this param index
-                    # (input_slots are sorted, so slot_idx 0 = first input, etc.)
-                    sorted_inputs = sorted(input_slots)
-                    if slot_idx < len(sorted_inputs):
-                        orig_slot = sorted_inputs[slot_idx]
-                        val = slots.get(orig_slot, 0)
-                    else:
-                        val = 0
-
-                    if isinstance(val, np.ndarray):
-                        if val.dtype != np.float64:
-                            val = np.ascontiguousarray(val, dtype=np.float64)
-                        elif not val.flags['C_CONTIGUOUS']:
-                            val = np.ascontiguousarray(val, dtype=np.float64)
-                        if val.ndim > 1:
-                            val = val.ravel()
-                        # Broadcast scalar arrays to match
-                        if val.size < n_elements:
-                            if val.size == 1:
-                                val = np.full(n_elements, val.flat[0], dtype=np.float64)
-                    elif isinstance(val, (int, float, np.floating, np.integer)):
-                        val = np.full(n_elements, float(val), dtype=np.float64)
-                    else:
-                        val = np.full(n_elements, float(val), dtype=np.float64)
-
-                    input_arrays.append(val)
-
-                # Allocate output buffer
-                output = np.empty(n_elements, dtype=np.float64)
-
-                # Build pointer lists
-                input_ptrs = [arr.ctypes.data for arr in input_arrays]
-                output_ptr = output.ctypes.data
-
-                # Execute
-                phase3_execute_arrays(kernel_id, input_ptrs, output_ptr,
-                                      n_elements, param_count)
-
-                # Reshape output to match primary array shape
-                if primary_arr.ndim > 1:
-                    output = output.reshape(primary_arr.shape)
-
-                # Store result in the output slot
-                slots[output_slot] = output
-
-            elif seg_type == "other":
-                # Move, store, nop
-                instr = seg[1]
-                op = instr[0]
-                if op == "move":
-                    _, dst, src = instr
-                    slots[dst] = slots.get(src, 0)
-                elif op == "store":
-                    _, slot, val = instr
-                    slots[slot] = slots.get(val, 0)
-                elif op == "nop":
-                    pass
-
-        # Return value is in slot 0
-        result = slots.get(0)
-        if result is not None:
-            if isinstance(result, np.ndarray):
-                return DeviceArray._wrap(result)
-            return result
-        return None
-
-    return _segmented_exec
-
-
 # ── Tier 4: Composition / Orchestration Layer ────────────────────────────────
 #
 # Tier 4 is NOT a new execution engine. It is a smart scheduler that breaks
@@ -1414,11 +1102,12 @@ def _tier4_create_executor(trace, allocator):
     simd_elem_fn = None
     simd_reduce_fn = None
     try:
-        from ._symplex_core import simd_elementwise_f64, simd_reduce_f64
-        simd_elem_fn = simd_elementwise_f64
-        simd_reduce_fn = simd_reduce_f64
+        from ._symplex_core import simd_fused_elementwise_f64, simd_fused_elementwise_f32, simd_elementwise_isa
+        simd_elem_fn = simd_fused_elementwise_f64  # fused kernel works for elementwise too
+        simd_reduce_fn = None  # reductions handled via numpy
     except ImportError:
-        pass
+        simd_elem_fn = None
+        simd_reduce_fn = None
 
     # Step 6: Create the executor that dispatches to existing backends
     # Track which slots contain user-provided input arrays (never mutate these)
@@ -1601,8 +1290,139 @@ def _tier4_dispatch_transcendental(instrs, slots, slots_get):
 def _tier4_dispatch_elementwise(instrs, slots, slots_get, simd_elem_fn):
     """Dispatch Tier 1/2 elementwise operations.
 
-    Tries Rust SIMD kernels first if available, falls back to NumPy.
+    Tries Rust SIMD fused kernels first if available, falls back to NumPy.
+    When simd_elem_fn is a fused elementwise kernel, we build a fused op
+    schedule from the instruction stream and execute all ops in a single pass.
     """
+    # ── Fast path: try fused SIMD kernel for supported binop chains ──
+    if simd_elem_fn is not None:
+        _SIMD_BINOP_MAP = {"add": 0, "sub": 1, "mul": 2, "div": 3, "min": 4, "max": 5}
+        fused_ops = []
+        fused_inputs = []  # list of (slot, ndarray_or_scalar)
+        const_list = []
+        slot_to_input_idx = {}
+        slot_to_const_idx = {}
+        slot_to_op_idx = {}
+        all_simd = True
+
+        for instr in instrs:
+            op = instr[0]
+            if op == "binop" and len(instr) >= 5:
+                _, dst, binop, lhs, rhs = instr[:5]
+                if binop not in _SIMD_BINOP_MAP:
+                    all_simd = False
+                    break
+                op_code = _SIMD_BINOP_MAP[binop]
+
+                # Classify lhs
+                if lhs in slot_to_input_idx:
+                    lhs_src, lhs_idx = 0, slot_to_input_idx[lhs]
+                elif lhs in slot_to_const_idx:
+                    lhs_src, lhs_idx = 1, slot_to_const_idx[lhs]
+                elif lhs in slot_to_op_idx:
+                    lhs_src, lhs_idx = 2, slot_to_op_idx[lhs]
+                else:
+                    lhs_val = slots_get(lhs, 0)
+                    if isinstance(lhs_val, DeviceArray):
+                        lhs_val = lhs_val._data
+                    if isinstance(lhs_val, np.ndarray) and lhs_val.ndim > 0:
+                        arr_idx = len(fused_inputs)
+                        fused_inputs.append((lhs, lhs_val))
+                        slot_to_input_idx[lhs] = arr_idx
+                        lhs_src, lhs_idx = 0, arr_idx
+                    else:
+                        cidx = len(const_list)
+                        const_list.append(float(lhs_val))
+                        slot_to_const_idx[lhs] = cidx
+                        lhs_src, lhs_idx = 1, cidx
+
+                # Classify rhs
+                if rhs in slot_to_input_idx:
+                    rhs_src, rhs_idx = 0, slot_to_input_idx[rhs]
+                elif rhs in slot_to_const_idx:
+                    rhs_src, rhs_idx = 1, slot_to_const_idx[rhs]
+                elif rhs in slot_to_op_idx:
+                    rhs_src, rhs_idx = 2, slot_to_op_idx[rhs]
+                else:
+                    rhs_val = slots_get(rhs, 0)
+                    if isinstance(rhs_val, DeviceArray):
+                        rhs_val = rhs_val._data
+                    if isinstance(rhs_val, np.ndarray) and rhs_val.ndim > 0:
+                        arr_idx = len(fused_inputs)
+                        fused_inputs.append((rhs, rhs_val))
+                        slot_to_input_idx[rhs] = arr_idx
+                        rhs_src, rhs_idx = 0, arr_idx
+                    else:
+                        cidx = len(const_list)
+                        const_list.append(float(rhs_val))
+                        slot_to_const_idx[rhs] = cidx
+                        rhs_src, rhs_idx = 1, cidx
+
+                op_idx = len(fused_ops)
+                fused_ops.append((op_code, lhs_src, lhs_idx, rhs_src, rhs_idx))
+                slot_to_op_idx[dst] = op_idx
+            elif op in ("load_f64", "load_f32"):
+                _, slot, val = instr[:3]
+                cidx = len(const_list)
+                const_list.append(float(val))
+                slot_to_const_idx[slot] = cidx
+            elif op == "move":
+                _, dst, src = instr[:3]
+                # Moves can be handled as identity in the fused schedule
+                # by mapping dst to the same source as src
+                if src in slot_to_input_idx:
+                    slot_to_input_idx[dst] = slot_to_input_idx[src]
+                elif src in slot_to_const_idx:
+                    slot_to_const_idx[dst] = slot_to_const_idx[src]
+                elif src in slot_to_op_idx:
+                    slot_to_op_idx[dst] = slot_to_op_idx[src]
+            else:
+                all_simd = False
+                break
+
+        if all_simd and fused_ops:
+            # Determine element count from the first input array
+            n = 0
+            input_ptr_list = []
+            target_dtype = np.float64
+            for (slot, arr) in fused_inputs:
+                if isinstance(arr, np.ndarray) and arr.ndim > 0:
+                    if arr.dtype == np.float32:
+                        target_dtype = np.float32
+                    flat = np.ascontiguousarray(arr, dtype=target_dtype).ravel()
+                    if n == 0:
+                        n = flat.size
+                    input_ptr_list.append(flat.ctypes.data)
+                    # Keep reference to prevent GC
+                    slots[f"_simd_ref_{slot}"] = flat
+
+            if n > 0:
+                last_dst_slot = None
+                for instr in reversed(instrs):
+                    if instr[0] == "binop":
+                        last_dst_slot = instr[1]
+                        break
+
+                dst_arr = np.empty(n, dtype=target_dtype)
+                try:
+                    if target_dtype == np.float32:
+                        from ._symplex_core import simd_fused_elementwise_f32
+                        simd_fused_elementwise_f32(
+                            fused_ops, input_ptr_list,
+                            [float(c) for c in const_list],
+                            n, 255, dst_arr.ctypes.data)
+                    else:
+                        simd_fused_elementwise_f64(
+                            fused_ops, input_ptr_list,
+                            [float(c) for c in const_list],
+                            n, 255, dst_arr.ctypes.data)
+                    if last_dst_slot is not None:
+                        slots[last_dst_slot] = dst_arr
+                    return
+                except Exception:
+                    pass  # Fall through to NumPy
+
+    # ── Fallback: NumPy dispatch ──
     for instr in instrs:
         op = instr[0]
         if op == "binop" and len(instr) >= 5:
@@ -1639,19 +1459,144 @@ def _tier4_dispatch_fused_elementwise(instrs, slots, slots_get, simd_elem_fn,
     """Dispatch a fused elementwise chain — execute ops in sequence,
     reusing intermediate buffers to avoid materializing temporaries.
 
-    This is the hot path for fused chains like add → mul → tanh where
-    the output of one op feeds directly into the next. The key optimization
-    is that intermediate results don't get wrapped in DeviceArray — they
-    stay as raw ndarrays until the final output.
+    When simd_elem_fn is a fused elementwise kernel, we build a fused op
+    schedule from the instruction stream and execute all ops in a single
+    pass via Rust SIMD, eliminating intermediate array allocations.
 
-    Buffer reuse: for intermediate results (not user inputs), we can
-    write the next op's output directly into the previous op's output
-    buffer when safe, avoiding allocation. We NEVER write into slots
-    that contain user-provided input arrays.
+    Fallback to NumPy when SIMD is not available.
     """
     if input_slot_ids is None:
         input_slot_ids = set()
 
+    # ── Fast path: try fused SIMD kernel for supported binop chains ──
+    if simd_elem_fn is not None:
+        _SIMD_BINOP_MAP = {"add": 0, "sub": 1, "mul": 2, "div": 3, "min": 4, "max": 5}
+        fused_ops = []
+        fused_inputs = []
+        const_list = []
+        slot_to_input_idx = {}
+        slot_to_const_idx = {}
+        slot_to_op_idx = {}
+        all_simd = True
+
+        for instr in instrs:
+            op = instr[0]
+            if op == "binop" and len(instr) >= 5:
+                _, dst, binop, lhs, rhs = instr[:5]
+                if binop not in _SIMD_BINOP_MAP:
+                    all_simd = False
+                    break
+                op_code = _SIMD_BINOP_MAP[binop]
+
+                # Classify lhs
+                if lhs in slot_to_input_idx:
+                    lhs_src, lhs_idx = 0, slot_to_input_idx[lhs]
+                elif lhs in slot_to_const_idx:
+                    lhs_src, lhs_idx = 1, slot_to_const_idx[lhs]
+                elif lhs in slot_to_op_idx:
+                    lhs_src, lhs_idx = 2, slot_to_op_idx[lhs]
+                else:
+                    lhs_val = slots_get(lhs, 0)
+                    if isinstance(lhs_val, DeviceArray):
+                        lhs_val = lhs_val._data
+                    if isinstance(lhs_val, np.ndarray) and lhs_val.ndim > 0:
+                        arr_idx = len(fused_inputs)
+                        fused_inputs.append((lhs, lhs_val))
+                        slot_to_input_idx[lhs] = arr_idx
+                        lhs_src, lhs_idx = 0, arr_idx
+                    else:
+                        cidx = len(const_list)
+                        const_list.append(float(lhs_val))
+                        slot_to_const_idx[lhs] = cidx
+                        lhs_src, lhs_idx = 1, cidx
+
+                # Classify rhs
+                if rhs in slot_to_input_idx:
+                    rhs_src, rhs_idx = 0, slot_to_input_idx[rhs]
+                elif rhs in slot_to_const_idx:
+                    rhs_src, rhs_idx = 1, slot_to_const_idx[rhs]
+                elif rhs in slot_to_op_idx:
+                    rhs_src, rhs_idx = 2, slot_to_op_idx[rhs]
+                else:
+                    rhs_val = slots_get(rhs, 0)
+                    if isinstance(rhs_val, DeviceArray):
+                        rhs_val = rhs_val._data
+                    if isinstance(rhs_val, np.ndarray) and rhs_val.ndim > 0:
+                        arr_idx = len(fused_inputs)
+                        fused_inputs.append((rhs, rhs_val))
+                        slot_to_input_idx[rhs] = arr_idx
+                        rhs_src, rhs_idx = 0, arr_idx
+                    else:
+                        cidx = len(const_list)
+                        const_list.append(float(rhs_val))
+                        slot_to_const_idx[rhs] = cidx
+                        rhs_src, rhs_idx = 1, cidx
+
+                op_idx = len(fused_ops)
+                fused_ops.append((op_code, lhs_src, lhs_idx, rhs_src, rhs_idx))
+                slot_to_op_idx[dst] = op_idx
+            elif op in ("load_f64", "load_f32"):
+                _, slot, val = instr[:3]
+                cidx = len(const_list)
+                const_list.append(float(val))
+                slot_to_const_idx[slot] = cidx
+            elif op == "move":
+                _, dst, src = instr[:3]
+                if src in slot_to_input_idx:
+                    slot_to_input_idx[dst] = slot_to_input_idx[src]
+                elif src in slot_to_const_idx:
+                    slot_to_const_idx[dst] = slot_to_const_idx[src]
+                elif src in slot_to_op_idx:
+                    slot_to_op_idx[dst] = slot_to_op_idx[src]
+            elif op == "unop":
+                # Unops are not supported by the fused SIMD kernel
+                all_simd = False
+                break
+            else:
+                all_simd = False
+                break
+
+        if all_simd and fused_ops:
+            n = 0
+            input_ptr_list = []
+            target_dtype = np.float64
+            for (slot, arr) in fused_inputs:
+                if isinstance(arr, np.ndarray) and arr.ndim > 0:
+                    if arr.dtype == np.float32:
+                        target_dtype = np.float32
+                    flat = np.ascontiguousarray(arr, dtype=target_dtype).ravel()
+                    if n == 0:
+                        n = flat.size
+                    input_ptr_list.append(flat.ctypes.data)
+                    slots[f"_simd_ref_{slot}"] = flat
+
+            if n > 0:
+                last_dst_slot = None
+                for instr in reversed(instrs):
+                    if instr[0] == "binop":
+                        last_dst_slot = instr[1]
+                        break
+
+                dst_arr = np.empty(n, dtype=target_dtype)
+                try:
+                    if target_dtype == np.float32:
+                        from ._symplex_core import simd_fused_elementwise_f32
+                        simd_fused_elementwise_f32(
+                            fused_ops, input_ptr_list,
+                            [float(c) for c in const_list],
+                            n, 255, dst_arr.ctypes.data)
+                    else:
+                        simd_fused_elementwise_f64(
+                            fused_ops, input_ptr_list,
+                            [float(c) for c in const_list],
+                            n, 255, dst_arr.ctypes.data)
+                    if last_dst_slot is not None:
+                        slots[last_dst_slot] = dst_arr
+                    return
+                except Exception:
+                    pass  # Fall through to NumPy
+
+    # ── Fallback: NumPy dispatch with buffer reuse ──
     # Track which slot values are safe to mutate (not user inputs)
     # and which arrays are intermediate temporaries we own
     intermediate_arrays = set()  # id() of arrays we created
@@ -2295,7 +2240,7 @@ class JitFunction:
             # Instead, we analyze the trace and use the x86_emitter SIMD
             # kernels which correctly emit ADDSD/VADDPD etc.
             try:
-                from ._symplex_core import simd_elementwise_f64, simd_elementwise_isa
+                from ._symplex_core import simd_fused_elementwise_f64, simd_fused_elementwise_f32, simd_elementwise_isa
 
                 simd_info = _analyze_elem_for_simd(self._trace)
                 if simd_info is not None:
@@ -2316,7 +2261,7 @@ class JitFunction:
             # (via x86_emitter, which correctly emits ADDSD/VADDPD etc.),
             # while matmul ops delegate to NumPy's BLAS backend.
             try:
-                from ._symplex_core import simd_elementwise_f64, simd_elementwise_isa
+                from ._symplex_core import simd_fused_elementwise_f64, simd_fused_elementwise_f32, simd_elementwise_isa
 
                 segments = _segment_trace_at_matmul(self._trace)
                 segment_plan = []
@@ -2842,18 +2787,24 @@ class JitFunction:
 
                 # Remap trace for Rust serialization:
                 # - matmul → mul (Rust doesn't have matmul opcode in BinOp)
-                # - sigmoid/tanh → expand into supported ops
+                # - sigmoid/tanh → skip Rust optimizer (unsupported unops)
                 #   (Rust's serialize_instructions only supports neg/not/bitnot/abs unops)
+                has_unsupported_unop = False
                 rust_trace = []
                 for instr in self._trace:
                     if instr[0] == "binop" and instr[2] == "matmul":
                         rust_trace.append((instr[0], instr[1], "mul", instr[3], instr[4]))
                     elif instr[0] == "unop" and instr[2] == "sigmoid":
-                        _, dst, _, src = instr
-                        rust_trace.append(("binop", dst, "max", src, src))  # placeholder
+                        # sigmoid is not supported by Rust serialize_instructions;
+                        # skip the Rust optimizer for traces containing sigmoid
+                        # and rely on the fast-path executor instead
+                        has_unsupported_unop = True
+                        break
                     elif instr[0] == "unop" and instr[2] == "tanh":
-                        _, dst, _, src = instr
-                        rust_trace.append(("binop", dst, "max", src, src))  # placeholder
+                        # tanh is not supported by Rust serialize_instructions;
+                        # skip the Rust optimizer for traces containing tanh
+                        has_unsupported_unop = True
+                        break
                     elif instr[0] == "reduce":
                         # Reductions are handled by the SIMD fast-path or NumPy
                         # fallback; the Rust phase3_jit backend doesn't support
@@ -2873,32 +2824,35 @@ class JitFunction:
                     else:
                         rust_trace.append(instr)
 
-                # Serialize the trace
-                trace_bytes = serialize_instructions(rust_trace)
+                # Serialize the trace (skip if trace has unsupported unops)
+                if not has_unsupported_unop and rust_trace:
+                    trace_bytes = serialize_instructions(rust_trace)
 
-                # Run the polyhedral optimizer
-                if self._specialize:
-                    self._optimized_result = optimize_specialized(
-                        trace_bytes,
-                        target=self._target,
-                        element_type=self._element_type,
-                        enable_flash_attention=self._enable_flash_attention,
-                        enable_transcendental_fusion=self._enable_transcendental_fusion,
-                        enable_double_buffering=self._enable_double_buffering,
-                        enable_mixed_precision=self._enable_mixed_precision,
-                        enable_ad=self._enable_ad,
-                    )
+                    # Run the polyhedral optimizer
+                    if self._specialize:
+                        self._optimized_result = optimize_specialized(
+                            trace_bytes,
+                            target=self._target,
+                            element_type=self._element_type,
+                            enable_flash_attention=self._enable_flash_attention,
+                            enable_transcendental_fusion=self._enable_transcendental_fusion,
+                            enable_double_buffering=self._enable_double_buffering,
+                            enable_mixed_precision=self._enable_mixed_precision,
+                            enable_ad=self._enable_ad,
+                        )
+                    else:
+                        self._optimized_result = optimize_trace(
+                            trace_bytes,
+                            target=self._target,
+                            element_type=self._element_type,
+                            enable_flash_attention=self._enable_flash_attention,
+                            enable_transcendental_fusion=self._enable_transcendental_fusion,
+                            enable_double_buffering=self._enable_double_buffering,
+                            enable_mixed_precision=self._enable_mixed_precision,
+                            enable_ad=self._enable_ad,
+                        )
                 else:
-                    self._optimized_result = optimize_trace(
-                        trace_bytes,
-                        target=self._target,
-                        element_type=self._element_type,
-                        enable_flash_attention=self._enable_flash_attention,
-                        enable_transcendental_fusion=self._enable_transcendental_fusion,
-                        enable_double_buffering=self._enable_double_buffering,
-                        enable_mixed_precision=self._enable_mixed_precision,
-                        enable_ad=self._enable_ad,
-                    )
+                    self._optimized_result = None
             except ImportError:
                 self._optimized_result = None
 
@@ -3320,7 +3274,8 @@ def grad(func: Callable, *, target: str = "server", element_type: str = "fp32") 
             result = rust_grad(trace_bytes, target=target, element_type=element_type)
 
             if result.get("success", False):
-                pass  # Fall back to numerical for now
+                # Rust grad succeeded — store the adjoint trace for future use
+                self._grad_result = result
         except ImportError:
             pass
 

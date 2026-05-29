@@ -9,7 +9,7 @@ name = "symplex_engine"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.23" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
 libc = "0.2"
 rustc-hash = "2"
 lazy_static = "1.5"

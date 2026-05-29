@@ -227,6 +227,16 @@ impl ElementwiseKernel {
     }
 }
 
+/// Get the SIMD ISA level used for elementwise kernels (short string: "avx512", "avx2", "sse2", "scalar")
+#[pyfunction]
+fn simd_elementwise_isa() -> String {
+    match detect_isa_level() {
+        ISALevel::AVX512 => "avx512",
+        ISALevel::AVX2 => "avx2",
+        ISALevel::SSE => "sse2",
+    }.to_string()
+}
+
 /// Check AVX2 availability
 #[pyfunction]
 fn has_avx2() -> bool {
@@ -1045,12 +1055,12 @@ fn phase3_compile_ssa(serialized_instrs: Vec<u8>, param_count: Option<u16>) -> P
     let mut flat_instrs = Vec::new();
     for (i, instr) in instrs.iter().enumerate() {
         let result = match instr {
-            crate::types::Instr::BinOp(d, _, _, _) => Some(ValueId(i as u32)),
-            crate::types::Instr::UnOp(d, _, _) => Some(ValueId(i as u32)),
-            crate::types::Instr::LoadI32(d, _) | crate::types::Instr::LoadI64(d, _) => Some(ValueId(i as u32)),
-            crate::types::Instr::LoadF32(d, _) | crate::types::Instr::LoadF64(d, _) => Some(ValueId(i as u32)),
-            crate::types::Instr::LoadBool(d, _) => Some(ValueId(i as u32)),
-            crate::types::Instr::Move(d, _) | crate::types::Instr::Load(d, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::BinOp(_d, _, _, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::UnOp(_d, _, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::LoadI32(_d, _) | crate::types::Instr::LoadI64(_d, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::LoadF32(_d, _) | crate::types::Instr::LoadF64(_d, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::LoadBool(_d, _) => Some(ValueId(i as u32)),
+            crate::types::Instr::Move(_d, _) | crate::types::Instr::Load(_d, _) => Some(ValueId(i as u32)),
             _ => None,
         };
 
@@ -1062,7 +1072,7 @@ fn phase3_compile_ssa(serialized_instrs: Vec<u8>, param_count: Option<u16>) -> P
             crate::types::Instr::UnOp(_, op, s) => IrOp::UnOp { op: *op, operand: ValueId(*s as u32) },
             crate::types::Instr::Move(_, s) => IrOp::Move { src: ValueId(*s as u32) },
             crate::types::Instr::Return(s) => IrOp::Ret { value: Some(ValueId(*s as u32)) },
-            crate::types::Instr::Jump(off) => IrOp::Jump { target: BlockId(0), args: Vec::new() },
+            crate::types::Instr::Jump(_off) => IrOp::Jump { target: BlockId(0), args: Vec::new() },
             crate::types::Instr::JumpFalse(_, _) | crate::types::Instr::JumpTrue(_, _) => IrOp::Nop,
             _ => IrOp::Nop,
         };
@@ -1622,6 +1632,7 @@ fn symplex_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Phase3CompiledKernel>()?;
     m.add_function(wrap_pyfunction!(has_avx2, m)?)?;
     m.add_function(wrap_pyfunction!(has_avx512, m)?)?;
+    m.add_function(wrap_pyfunction!(simd_elementwise_isa, m)?)?;
     m.add_function(wrap_pyfunction!(detect_isa, m)?)?;
     m.add_function(wrap_pyfunction!(vec_width, m)?)?;
     m.add_function(wrap_pyfunction!(num_cores, m)?)?;
