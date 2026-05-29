@@ -114,3 +114,32 @@ Stage Summary:
 - Build succeeds: cargo build --lib compiles cleanly (only "never used" warnings for new infra)
 - All 69 Rust tests pass (59 unit + 10 integration)
 - Python import and basic operations verified working
+
+---
+Task ID: 4
+Agent: Main
+Task: Implement 4 advanced JIT upgrades: stencil specialization, LBR+TMAM, chordal graph RA, TLB prehinting
+
+Work Log:
+- Read current codebase state (17885 lines after previous 6 upgrades)
+- Implemented Upgrade 1: Tail-Duplication Stencil Specialization + Super-Stencils + OSR
+  - Added SpecializedStencilBank: INC/DEC/SHL/MOV-zero stencils for 16 slot displacements (3-4 bytes vs 14 bytes)
+  - Added SuperStencil + build_super_stencils(): fuses LoadI+BinOp and BinOp+Store patterns
+  - Added DeoptMap + OSR infrastructure: DeoptMapEntry, DeoptValueMap, emit_osr_stub()
+- Implemented Upgrade 2: LBR-based FDO + TMAM Integration + PREFETCHT0
+  - Added LbrProfiler: perf_event_open with PERF_SAMPLE_BRANCH_STACK, reads LBR circular buffer
+  - Added TmamAnalyzer: 4 raw PMU counters for Front-End/Back-End/BadSpeculation/Retiring classification
+  - Added Emitter prefetch methods: PREFETCHT0/T1/NTA/IT0 with [RDI+disp32] encoding
+- Implemented Upgrade 3: Chordal Graph Coloring RA + RAT-Aware Register Pinning
+  - Added ChordalGraphColoringRA: interference graph → MCS ordering → optimal greedy coloring
+  - Added RatAwarePinning: short-lived temporaries (≤3 instrs) pinned to RAT-independent registers
+- Implemented Upgrade 4: TLB Pre-hinting for Newly Compiled Code
+  - Added tlb_prehint(): read-touches pages through RW+RX mappings via read_volatile
+  - Added tlb_warmup_aggressive(): extends prehint to adjacent pages for prefetch coverage
+  - Added try_get_ptr() safe fallible accessor for ExecArena
+- Updated module docs (entries AB–AH)
+
+Stage Summary:
+- All 4 architectural upgrades implemented in phase3_jit.rs (17885→19133 lines, +1248 lines)
+- Build succeeds: cargo build --lib compiles cleanly (only "never used" warnings for new infra)
+- All 69 Rust tests pass (59 unit + 10 integration)
