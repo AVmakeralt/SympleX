@@ -83,7 +83,7 @@ impl Value {
             Value::F64(_) => ValueType::F64,
             Value::Bool(_) => ValueType::Bool,
             Value::Unit => ValueType::Unit,
-            Value::Tensor(_) | Value::TensorFast(_) => ValueType::Tensor,
+            Value::Tensor(_) | Value::TensorF32(_) | Value::TensorFast(_) => ValueType::Tensor,
         }
     }
 }

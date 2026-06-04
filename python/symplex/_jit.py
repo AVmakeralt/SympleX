@@ -79,7 +79,8 @@ def _serialize_tensor_instrs(trace, allocator, arg_shapes, arg_dtypes):
             binop_u8 = BINOP_TO_U8.get(binop_name, 0)
             ty_u8 = DTYPE_TO_SCALAR.get(dtype, 10)  # default F64
             ndim = len(shape)
-            buf.extend(struct.pack('<BHBBHB', 0xA0, dst, binop_u8, lhs, rhs, ty_u8, ndim))
+            # Format: [0xA0:u8] [dst:u16] [op:u8] [lhs:u16] [rhs:u16] [element_ty:u8] [ndim:u16]
+            buf.extend(struct.pack('<BHBHHBH', 0xA0, dst, binop_u8, lhs, rhs, ty_u8, ndim))
             for dim in shape:
                 buf.extend(struct.pack('<Q', dim))
             for s in strides_lhs:
@@ -93,7 +94,8 @@ def _serialize_tensor_instrs(trace, allocator, arg_shapes, arg_dtypes):
             ty_u8 = DTYPE_TO_SCALAR.get(dtype, 9)  # default F32
             lhs_l = LAYOUT_TO_U8.get(lhs_layout, 0)
             rhs_l = LAYOUT_TO_U8.get(rhs_layout, 0)
-            buf.extend(struct.pack('<BHHHQQQBHH', 0xA2, dst, lhs, rhs, 
+            # Format: [0xA2:u8] [dst:u16] [lhs:u16] [rhs:u16] [m:u64] [n:u64] [k:u64] [element_ty:u8] [lhs_layout:u8] [rhs_layout:u8]
+            buf.extend(struct.pack('<BHHHQQQBBB', 0xA2, dst, lhs, rhs,
                                    m, n, k, ty_u8, lhs_l, rhs_l))
             
         elif op == "tensor_reduce":
@@ -102,7 +104,8 @@ def _serialize_tensor_instrs(trace, allocator, arg_shapes, arg_dtypes):
             red_u8 = REDUCE_TO_U8.get(reduce_op, 0)
             ty_u8 = DTYPE_TO_SCALAR.get(dtype, 10)
             ndim = len(src_shape)
-            buf.extend(struct.pack('<BHBHQHB', 0xA1, dst, red_u8, src, 
+            # Format: [0xA1:u8] [dst:u16] [op:u8] [src:u16] [axis:u64] [element_ty:u8] [ndim:u16]
+            buf.extend(struct.pack('<BHBHQBH', 0xA1, dst, red_u8, src,
                                    axis, ty_u8, ndim))
             for dim in src_shape:
                 buf.extend(struct.pack('<Q', dim))
@@ -863,7 +866,8 @@ def _create_hybrid_executor(trace, allocator):
             if isinstance(arr, DeviceArray):
                 arr = arr._data
             elif not isinstance(arr, np.ndarray):
-                arr = np.array(arr, dtype=np.float64)
+                # Respect input dtype — don't force f64
+                arr = np.asarray(arr)
             s = arg_slot_map.get(i)
             if s is not None:
                 slots[s] = arr
@@ -1300,7 +1304,8 @@ def _tier4_create_executor(trace, allocator):
             if isinstance(arr, DeviceArray):
                 arr = arr._data
             elif not isinstance(arr, np.ndarray):
-                arr = np.array(arr, dtype=np.float64)
+                # Respect input dtype — don't force f64
+                arr = np.asarray(arr)
             s = _arg_map.get(i)
             if s is not None:
                 slots[s] = arr
@@ -1887,7 +1892,8 @@ def interpret_trace(
         if isinstance(arr, DeviceArray):
             arr = arr._data
         elif not isinstance(arr, np.ndarray):
-            arr = np.array(arr, dtype=np.float64)
+            # Respect input dtype — don't force f64
+            arr = np.asarray(arr)
         s = arg_slot_map.get(i)
         if s is not None:
             slots[s] = arr
@@ -2095,7 +2101,8 @@ def _create_fused_elementwise_executor(trace, allocator):
             if isinstance(arr, DeviceArray):
                 arr = arr._data
             elif not isinstance(arr, np.ndarray):
-                arr = np.asarray(arr, dtype=np.float64)
+                # Respect input dtype — don't force f64
+                arr = np.asarray(arr)
             s = arg_slot_map.get(i)
             if s is not None:
                 slots[s] = arr
@@ -3142,7 +3149,13 @@ class JitFunction:
                         inputs.append(a)
                         arg_shapes.append(a.shape)
                     else:
-                        inputs.append(np.asarray(a, dtype=np.float64))
+                        # Respect input dtype — don't force f64
+                        if isinstance(a, float):
+                            inputs.append(np.asarray(a, dtype=np.float64))
+                        elif isinstance(a, int):
+                            inputs.append(np.asarray(a, dtype=np.int64))
+                        else:
+                            inputs.append(np.asarray(a))
                         arg_shapes.append(())
                 return self._fast_path(inputs)
 
@@ -3272,6 +3285,19 @@ class JitFunction:
         # Create a list of input arrays in slot order
         # Each param slot corresponds to an input argument
         input_arrays = []
+        # Detect the predominant dtype from input arrays — respect f32 data
+        # instead of forcing everything to f64 (which halves SIMD throughput).
+        target_dtype = np.float64
+        for inp in inputs:
+            if isinstance(inp, np.ndarray):
+                if inp.dtype == np.float32:
+                    target_dtype = np.float32
+                    break
+            elif isinstance(inp, DeviceArray):
+                if inp.dtype == np.float32:
+                    target_dtype = np.float32
+                    break
+
         for slot_idx in range(n_params):
             # Find which input argument maps to this slot
             arg_idx = None
@@ -3282,31 +3308,31 @@ class JitFunction:
             if arg_idx is not None and arg_idx < len(inputs):
                 arr = inputs[arg_idx]
                 if isinstance(arr, np.ndarray):
-                    # Ensure contiguous f64
-                    if arr.dtype != np.float64:
-                        arr = np.ascontiguousarray(arr, dtype=np.float64)
+                    # Ensure contiguous with the correct dtype — respect f32!
+                    if arr.dtype != target_dtype:
+                        arr = np.ascontiguousarray(arr, dtype=target_dtype)
                     elif not arr.flags['C_CONTIGUOUS']:
-                        arr = np.ascontiguousarray(arr, dtype=np.float64)
+                        arr = np.ascontiguousarray(arr, dtype=target_dtype)
                     # Flatten multi-dimensional arrays for element-wise processing
                     if arr.ndim > 1:
                         arr = arr.ravel()
                 else:
-                    # Scalar — broadcast to array
-                    arr = np.full(n_elements, float(arr), dtype=np.float64)
+                    # Scalar — broadcast to array with the target dtype
+                    arr = np.full(n_elements, float(arr), dtype=target_dtype)
                 input_arrays.append(arr)
             else:
                 # Slot with no input argument — fill with zeros
-                input_arrays.append(np.zeros(n_elements, dtype=np.float64))
+                input_arrays.append(np.zeros(n_elements, dtype=target_dtype))
 
         # Ensure all input arrays have the same number of elements
         for i, arr in enumerate(input_arrays):
             if arr.size < n_elements:
                 # Broadcast scalar-like arrays
                 if arr.size == 1:
-                    input_arrays[i] = np.full(n_elements, arr.flat[0], dtype=np.float64)
+                    input_arrays[i] = np.full(n_elements, arr.flat[0], dtype=target_dtype)
 
-        # Allocate output buffer
-        output = np.empty(n_elements, dtype=np.float64)
+        # Allocate output buffer with the correct dtype
+        output = np.empty(n_elements, dtype=target_dtype)
 
         # Build pointer lists
         input_ptrs = [arr.ctypes.data for arr in input_arrays]
@@ -3499,10 +3525,11 @@ def grad(func: Callable, *, target: str = "server", element_type: str = "fp32") 
             elif isinstance(a, np.ndarray):
                 inputs.append(a.copy())
             else:
-                inputs.append(np.array(a, dtype=np.float64))
+                # Preserve dtype — don't force f64
+                inputs.append(np.asarray(a))
 
         # Compute numerical gradient w.r.t. first argument
-        x = inputs[0].astype(np.float64)
+        x = inputs[0].astype(inputs[0].dtype if inputs[0].dtype.kind == 'f' else np.float64)
         grad_result = np.zeros_like(x)
 
         it = np.nditer(x, flags=["multi_index"])

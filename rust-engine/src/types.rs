@@ -207,6 +207,7 @@ pub enum Value {
     Bool(bool),
     Unit,
     Tensor(Vec<f64>),
+    TensorF32(Vec<f32>),
     TensorFast(Box<[f64]>),
 }
 
@@ -232,6 +233,36 @@ impl Value {
             Value::F32(v) => Some(*v as f64),
             Value::I64(v) => Some(*v as f64),
             _ => None,
+        }
+    }
+
+    pub fn to_f32(&self) -> Option<f32> {
+        match self {
+            Value::F32(v) => Some(*v),
+            Value::F64(v) => Some(*v as f32),
+            Value::I64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    /// Returns the ScalarType of this value, or None for Unit/tensors.
+    pub fn scalar_type(&self) -> Option<ScalarType> {
+        match self {
+            Value::I8(_) => Some(ScalarType::I8),
+            Value::I16(_) => Some(ScalarType::I16),
+            Value::I32(_) => Some(ScalarType::I32),
+            Value::I64(_) => Some(ScalarType::I64),
+            Value::U8(_) => Some(ScalarType::U8),
+            Value::U16(_) => Some(ScalarType::U16),
+            Value::U32(_) => Some(ScalarType::U32),
+            Value::U64(_) => Some(ScalarType::U64),
+            Value::F32(_) => Some(ScalarType::F32),
+            Value::F64(_) => Some(ScalarType::F64),
+            Value::Bool(_) => Some(ScalarType::Bool),
+            Value::Tensor(_) => Some(ScalarType::F64),
+            Value::TensorF32(_) => Some(ScalarType::F32),
+            Value::TensorFast(_) => Some(ScalarType::F64),
+            Value::Unit => None,
         }
     }
 }

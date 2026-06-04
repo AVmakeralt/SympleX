@@ -11748,7 +11748,17 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     if matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge) {
                         type_at.set(*d, SlotType::I64);
                     } else {
-                        type_at.set(*d, SlotType::F64);
+                        // Infer float result type from operands — F32 + F32 = F32.
+                        // Previously hardcoded to F64, which forced all float ops
+                        // through addsd/mulsd, wasting half the SIMD width for f32 data.
+                        let lt = type_at.get(*l);
+                        let rt = type_at.get(*r);
+                        let result_ty = if lt == SlotType::F32 || rt == SlotType::F32 {
+                            SlotType::F32
+                        } else {
+                            SlotType::F64
+                        };
+                        type_at.set(*d, result_ty);
                     }
                 } else {
                     // Integer BinOp path
@@ -12753,7 +12763,17 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     dst, lhs, rhs);
 
                 const_at.clear();
-                type_at.set(*dst, SlotType::F64); // matmul produces float results
+                // Infer type from operands — if either operand is F32, result is F32.
+                // This is critical: previously hardcoded F64 meant the JIT emitted addsd/mulsd
+                // (1 op/cycle) even for f32 data, wasting half the SIMD width.
+                let lhs_ty = type_at.get(*lhs);
+                let rhs_ty = type_at.get(*rhs);
+                let result_ty = if lhs_ty == SlotType::F32 || rhs_ty == SlotType::F32 {
+                    SlotType::F32
+                } else {
+                    SlotType::F64
+                };
+                type_at.set(*dst, result_ty);
             }
 
             // ── TensorMatMul — BLAS dispatch or cache-tiled fallback ─────────
@@ -12843,10 +12863,14 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 }
 
                 const_at.clear();
-                if element_ty.is_float() {
-                    type_at.set(*dst, SlotType::F64);
-                } else {
-                    type_at.set(*dst, SlotType::I64);
+                // Set result type based on element_ty — F32 stays F32, F64 stays F64.
+                // Previously hardcoded to F64, which forced f32 matmul results through
+                // addsd/mulsd (half SIMD throughput) instead of addps/mulps.
+                match element_ty {
+                    ScalarType::F32 => type_at.set(*dst, SlotType::F32),
+                    ScalarType::F64 => type_at.set(*dst, SlotType::F64),
+                    ScalarType::I32 => type_at.set(*dst, SlotType::I32),
+                    _ => type_at.set(*dst, SlotType::I64),
                 }
             }
 
@@ -12939,10 +12963,12 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 em.extend_from_slice(&[0x4C, 0x89, 0xFF]); // MOV RDI, R15
 
                 const_at.clear();
-                if element_ty.is_float() {
-                    type_at.set(*dst, SlotType::F64);
-                } else {
-                    type_at.set(*dst, SlotType::I64);
+                // Respect element_ty for type tracking — F32 stays F32.
+                match element_ty {
+                    ScalarType::F32 => type_at.set(*dst, SlotType::F32),
+                    ScalarType::F64 => type_at.set(*dst, SlotType::F64),
+                    ScalarType::I32 => type_at.set(*dst, SlotType::I32),
+                    _ => type_at.set(*dst, SlotType::I64),
                 }
             }
 
@@ -13050,10 +13076,12 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 em.extend_from_slice(&[0x4C, 0x89, 0xFF]); // MOV RDI, R15
 
                 const_at.clear();
-                if element_ty.is_float() {
-                    type_at.set(*dst, SlotType::F64);
-                } else {
-                    type_at.set(*dst, SlotType::I64);
+                // Respect element_ty for type tracking — F32 stays F32.
+                match element_ty {
+                    ScalarType::F32 => type_at.set(*dst, SlotType::F32),
+                    ScalarType::F64 => type_at.set(*dst, SlotType::F64),
+                    ScalarType::I32 => type_at.set(*dst, SlotType::I32),
+                    _ => type_at.set(*dst, SlotType::I64),
                 }
             }
 
@@ -16493,7 +16521,7 @@ pub fn execute(native: &NativeCode, args: &[Value]) -> Result<Value, RuntimeErro
                 Value::Bool(v) => i64::from(*v),
                 Value::F64(v) => v.to_bits() as i64,
                 Value::F32(v) => v.to_bits() as i64,
-                _ => 0i64, // Unit, Tensor, TensorFast — not supported in JIT
+                _ => 0i64, // Unit, Tensor, TensorF32, TensorFast — not supported in JIT
             };
         }
         let f = native.mem.entry();

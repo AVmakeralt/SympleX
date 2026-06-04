@@ -56,7 +56,10 @@ class DeviceArray:
         elif isinstance(data, np.ndarray):
             self._data = data.copy()
         else:
-            self._data = np.array(data, dtype=np.float64)
+            # Preserve input dtype — don't force f64.
+            # np.array infers dtype from the input, so passing [1.0, 2.0] gives
+            # float64 (Python float is f64), but np.float32([1.0, 2.0]) stays f32.
+            self._data = np.array(data)
 
     @classmethod
     def _wrap(cls, data: np.ndarray) -> 'DeviceArray':
