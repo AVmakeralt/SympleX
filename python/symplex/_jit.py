@@ -734,6 +734,22 @@ def _analyze_elem_for_simd(elem_instrs):
             _, slot, _ = instr
             all_slots.add(slot)
             written_by_binop.add(slot)  # constants are "written" before use
+        elif op == "tensor_binop":
+            _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr
+            if binop not in _SIMD_SUPPORTED_BINOPS:
+                return None
+            all_slots.update([dst, lhs, rhs])
+            written_by_binop.add(dst)
+            ops.append((binop, lhs, rhs, dst))
+        elif op == "tensor_reduce":
+            _, dst_slot, reduce_op, src_slot, _axis, _dtype, _shape = instr
+            if reduce_op not in _SIMD_SUPPORTED_REDUCE_OPS:
+                return None
+            if reduce_info is not None:
+                return None
+            all_slots.update([dst_slot, src_slot])
+            written_by_binop.add(dst_slot)
+            reduce_info = (reduce_op, src_slot, dst_slot)
         elif op == "move":
             # Don't add dst to written_by_binop — moves just copy
             _, dst, src = instr
@@ -762,6 +778,18 @@ def _analyze_elem_for_simd(elem_instrs):
             written_so_far.add(instr[1])  # dst
         elif op == "reduce":
             _, dst_slot, _, src_slot = instr
+            if src_slot not in written_so_far:
+                input_slots.add(src_slot)
+            written_so_far.add(dst_slot)
+        elif op == "tensor_binop":
+            _, _, _, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr
+            if lhs not in written_so_far:
+                input_slots.add(lhs)
+            if rhs not in written_so_far:
+                input_slots.add(rhs)
+            written_so_far.add(instr[1])
+        elif op == "tensor_reduce":
+            _, dst_slot, _, src_slot, _axis, _dtype, _shape = instr
             if src_slot not in written_so_far:
                 input_slots.add(src_slot)
             written_so_far.add(dst_slot)
@@ -798,7 +826,13 @@ def _analyze_elem_for_simd(elem_instrs):
         elif op == "reduce":
             output_slot = instr[1]  # dst_slot of the reduce
             break
+        elif op == "tensor_reduce":
+            output_slot = instr[1]
+            break
         elif op == "binop":
+            output_slot = instr[1]
+            break
+        elif op == "tensor_binop":
             output_slot = instr[1]
             break
 
@@ -1200,6 +1234,17 @@ def _tier4_serialize_trace(trace, allocator):
             _, dst, reduce_name, src = instr
             opcode = _T4_OPCODE_MAP.get(f"reduce_{reduce_name}", 0x40)
             ops.append((opcode, [dst, src]))
+        elif op == "tensor_binop":
+            _, dst, binop_name, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr
+            opcode = _T4_OPCODE_MAP.get(f"binop_{binop_name}", 0x10)
+            ops.append((opcode, [dst, lhs, rhs]))
+        elif op == "tensor_matmul":
+            _, dst, lhs, rhs, _m, _n, _k, _dtype, _ll, _rl = instr
+            ops.append((0x20, [dst, lhs, rhs]))
+        elif op == "tensor_reduce":
+            _, dst, reduce_name, src, _axis, _dtype, _shape = instr
+            opcode = _T4_OPCODE_MAP.get(f"reduce_{reduce_name}", 0x40)
+            ops.append((opcode, [dst, src]))
         else:
             # Unknown — skip
             pass
@@ -1387,6 +1432,28 @@ def _tier4_dispatch_blas(instrs, slots, slots_get):
                 fn = _BINOP_DISPATCH.get(binop)
                 if fn is not None:
                     slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_binop" and len(instr) >= 9:
+            _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr[:9]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_matmul" and len(instr) >= 10:
+            _, dst, lhs, rhs, _m, _n, _k, _dtype, _ll, _rl = instr[:10]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            lhs_val = np.ascontiguousarray(lhs_val) if isinstance(lhs_val, np.ndarray) else lhs_val
+            rhs_val = np.ascontiguousarray(rhs_val) if isinstance(rhs_val, np.ndarray) else rhs_val
+            slots[dst] = np.matmul(lhs_val, rhs_val)
         elif op in ("load_f64", "load_f32"):
             _, slot, val = instr[:3]
             slots[slot] = float(val)
@@ -1407,9 +1474,28 @@ def _tier4_dispatch_reduction(instrs, slots, slots_get, simd_reduce_fn):
             reduce_fn = _REDUCE_DISPATCH.get(reduce_name)
             if reduce_fn is not None:
                 slots[dst] = reduce_fn(src_val)
+        elif op == "tensor_reduce" and len(instr) >= 7:
+            _, dst, reduce_name, src, _axis, _dtype, _shape = instr[:7]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            reduce_fn = _REDUCE_DISPATCH.get(reduce_name)
+            if reduce_fn is not None:
+                slots[dst] = reduce_fn(src_val, axis=_axis)
         elif op == "binop" and len(instr) >= 5:
             # Reduction region may contain elementwise ops too
             _, dst, binop, lhs, rhs = instr[:5]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_binop" and len(instr) >= 9:
+            _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr[:9]
             lhs_val = slots_get(lhs, 0)
             rhs_val = slots_get(rhs, 0)
             if isinstance(lhs_val, DeviceArray):
@@ -1440,6 +1526,17 @@ def _tier4_dispatch_transcendental(instrs, slots, slots_get):
                 slots[dst] = _UNOP_DISPATCH[unop_name](src_val)
         elif op == "binop" and len(instr) >= 5:
             _, dst, binop, lhs, rhs = instr[:5]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_binop" and len(instr) >= 9:
+            _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr[:9]
             lhs_val = slots_get(lhs, 0)
             rhs_val = slots_get(rhs, 0)
             if isinstance(lhs_val, DeviceArray):
@@ -1536,6 +1633,60 @@ def _tier4_dispatch_elementwise(instrs, slots, slots_get, simd_elem_fn):
                 cidx = len(const_list)
                 const_list.append(float(val))
                 slot_to_const_idx[slot] = cidx
+            elif op == "tensor_binop" and len(instr) >= 9:
+                _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr[:9]
+                if binop not in _SIMD_BINOP_MAP:
+                    all_simd = False
+                    break
+                op_code = _SIMD_BINOP_MAP[binop]
+
+                # Classify lhs
+                if lhs in slot_to_input_idx:
+                    lhs_src, lhs_idx = 0, slot_to_input_idx[lhs]
+                elif lhs in slot_to_const_idx:
+                    lhs_src, lhs_idx = 1, slot_to_const_idx[lhs]
+                elif lhs in slot_to_op_idx:
+                    lhs_src, lhs_idx = 2, slot_to_op_idx[lhs]
+                else:
+                    lhs_val = slots_get(lhs, 0)
+                    if isinstance(lhs_val, DeviceArray):
+                        lhs_val = lhs_val._data
+                    if isinstance(lhs_val, np.ndarray) and lhs_val.ndim > 0:
+                        arr_idx = len(fused_inputs)
+                        fused_inputs.append((lhs, lhs_val))
+                        slot_to_input_idx[lhs] = arr_idx
+                        lhs_src, lhs_idx = 0, arr_idx
+                    else:
+                        cidx = len(const_list)
+                        const_list.append(float(lhs_val))
+                        slot_to_const_idx[lhs] = cidx
+                        lhs_src, lhs_idx = 1, cidx
+
+                # Classify rhs
+                if rhs in slot_to_input_idx:
+                    rhs_src, rhs_idx = 0, slot_to_input_idx[rhs]
+                elif rhs in slot_to_const_idx:
+                    rhs_src, rhs_idx = 1, slot_to_const_idx[rhs]
+                elif rhs in slot_to_op_idx:
+                    rhs_src, rhs_idx = 2, slot_to_op_idx[rhs]
+                else:
+                    rhs_val = slots_get(rhs, 0)
+                    if isinstance(rhs_val, DeviceArray):
+                        rhs_val = rhs_val._data
+                    if isinstance(rhs_val, np.ndarray) and rhs_val.ndim > 0:
+                        arr_idx = len(fused_inputs)
+                        fused_inputs.append((rhs, rhs_val))
+                        slot_to_input_idx[rhs] = arr_idx
+                        rhs_src, rhs_idx = 0, arr_idx
+                    else:
+                        cidx = len(const_list)
+                        const_list.append(float(rhs_val))
+                        slot_to_const_idx[rhs] = cidx
+                        rhs_src, rhs_idx = 1, cidx
+
+                op_idx = len(fused_ops)
+                fused_ops.append((op_code, lhs_src, lhs_idx, rhs_src, rhs_idx))
+                slot_to_op_idx[dst] = op_idx
             elif op == "move":
                 _, dst, src = instr[:3]
                 # Moves can be handled as identity in the fused schedule
@@ -1569,7 +1720,7 @@ def _tier4_dispatch_elementwise(instrs, slots, slots_get, simd_elem_fn):
             if n > 0:
                 last_dst_slot = None
                 for instr in reversed(instrs):
-                    if instr[0] == "binop":
+                    if instr[0] in ("binop", "tensor_binop"):
                         last_dst_slot = instr[1]
                         break
 
@@ -1606,6 +1757,36 @@ def _tier4_dispatch_elementwise(instrs, slots, slots_get, simd_elem_fn):
             fn = _BINOP_DISPATCH.get(binop)
             if fn is not None:
                 slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_binop" and len(instr) >= 9:
+            _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr[:9]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_matmul" and len(instr) >= 10:
+            _, dst, lhs, rhs, _m, _n, _k, _dtype, _ll, _rl = instr[:10]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            lhs_val = np.ascontiguousarray(lhs_val) if isinstance(lhs_val, np.ndarray) else lhs_val
+            rhs_val = np.ascontiguousarray(rhs_val) if isinstance(rhs_val, np.ndarray) else rhs_val
+            slots[dst] = np.matmul(lhs_val, rhs_val)
+        elif op == "tensor_reduce" and len(instr) >= 7:
+            _, dst, reduce_name, src, _axis, _dtype, _shape = instr[:7]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            reduce_fn = _REDUCE_DISPATCH.get(reduce_name)
+            if reduce_fn is not None:
+                slots[dst] = reduce_fn(src_val, axis=_axis)
         elif op == "unop" and len(instr) >= 4:
             _, dst, unop_name, src = instr[:4]
             src_val = slots_get(src, 0)
@@ -1710,6 +1891,60 @@ def _tier4_dispatch_fused_elementwise(instrs, slots, slots_get, simd_elem_fn,
                 cidx = len(const_list)
                 const_list.append(float(val))
                 slot_to_const_idx[slot] = cidx
+            elif op == "tensor_binop" and len(instr) >= 9:
+                _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr[:9]
+                if binop not in _SIMD_BINOP_MAP:
+                    all_simd = False
+                    break
+                op_code = _SIMD_BINOP_MAP[binop]
+
+                # Classify lhs
+                if lhs in slot_to_input_idx:
+                    lhs_src, lhs_idx = 0, slot_to_input_idx[lhs]
+                elif lhs in slot_to_const_idx:
+                    lhs_src, lhs_idx = 1, slot_to_const_idx[lhs]
+                elif lhs in slot_to_op_idx:
+                    lhs_src, lhs_idx = 2, slot_to_op_idx[lhs]
+                else:
+                    lhs_val = slots_get(lhs, 0)
+                    if isinstance(lhs_val, DeviceArray):
+                        lhs_val = lhs_val._data
+                    if isinstance(lhs_val, np.ndarray) and lhs_val.ndim > 0:
+                        arr_idx = len(fused_inputs)
+                        fused_inputs.append((lhs, lhs_val))
+                        slot_to_input_idx[lhs] = arr_idx
+                        lhs_src, lhs_idx = 0, arr_idx
+                    else:
+                        cidx = len(const_list)
+                        const_list.append(float(lhs_val))
+                        slot_to_const_idx[lhs] = cidx
+                        lhs_src, lhs_idx = 1, cidx
+
+                # Classify rhs
+                if rhs in slot_to_input_idx:
+                    rhs_src, rhs_idx = 0, slot_to_input_idx[rhs]
+                elif rhs in slot_to_const_idx:
+                    rhs_src, rhs_idx = 1, slot_to_const_idx[rhs]
+                elif rhs in slot_to_op_idx:
+                    rhs_src, rhs_idx = 2, slot_to_op_idx[rhs]
+                else:
+                    rhs_val = slots_get(rhs, 0)
+                    if isinstance(rhs_val, DeviceArray):
+                        rhs_val = rhs_val._data
+                    if isinstance(rhs_val, np.ndarray) and rhs_val.ndim > 0:
+                        arr_idx = len(fused_inputs)
+                        fused_inputs.append((rhs, rhs_val))
+                        slot_to_input_idx[rhs] = arr_idx
+                        rhs_src, rhs_idx = 0, arr_idx
+                    else:
+                        cidx = len(const_list)
+                        const_list.append(float(rhs_val))
+                        slot_to_const_idx[rhs] = cidx
+                        rhs_src, rhs_idx = 1, cidx
+
+                op_idx = len(fused_ops)
+                fused_ops.append((op_code, lhs_src, lhs_idx, rhs_src, rhs_idx))
+                slot_to_op_idx[dst] = op_idx
             elif op == "move":
                 _, dst, src = instr[:3]
                 if src in slot_to_input_idx:
@@ -1743,7 +1978,7 @@ def _tier4_dispatch_fused_elementwise(instrs, slots, slots_get, simd_elem_fn,
             if n > 0:
                 last_dst_slot = None
                 for instr in reversed(instrs):
-                    if instr[0] == "binop":
+                    if instr[0] in ("binop", "tensor_binop"):
                         last_dst_slot = instr[1]
                         break
 
@@ -1807,6 +2042,56 @@ def _tier4_dispatch_fused_elementwise(instrs, slots, slots_get, simd_elem_fn,
                         continue
                 slots[dst] = result
                 intermediate_arrays.add(id(result))
+        elif op == "tensor_binop" and len(instr) >= 9:
+            _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr[:9]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                result = fn(lhs_val, rhs_val)
+                # In-place buffer reuse for tensor_binop (same as binop)
+                lhs_is_intermediate = id(lhs_val) in intermediate_arrays
+                lhs_is_input = lhs in input_slot_ids
+                if (lhs_is_intermediate
+                        and not lhs_is_input
+                        and isinstance(lhs_val, np.ndarray)
+                        and isinstance(result, np.ndarray)
+                        and lhs_val.dtype == result.dtype
+                        and lhs_val.shape == result.shape
+                        and lhs_val is not rhs_val
+                        and lhs_val.flags.writeable):
+                    lhs_refcount = sum(1 for s in slots.values()
+                                       if s is lhs_val or (isinstance(s, np.ndarray) and s.base is lhs_val))
+                    if lhs_refcount <= 1:
+                        np.copyto(lhs_val, result)
+                        slots[dst] = lhs_val
+                        intermediate_arrays.add(id(lhs_val))
+                        continue
+                slots[dst] = result
+                intermediate_arrays.add(id(result))
+        elif op == "tensor_matmul" and len(instr) >= 10:
+            _, dst, lhs, rhs, _m, _n, _k, _dtype, _ll, _rl = instr[:10]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            lhs_val = np.ascontiguousarray(lhs_val) if isinstance(lhs_val, np.ndarray) else lhs_val
+            rhs_val = np.ascontiguousarray(rhs_val) if isinstance(rhs_val, np.ndarray) else rhs_val
+            slots[dst] = np.matmul(lhs_val, rhs_val)
+        elif op == "tensor_reduce" and len(instr) >= 7:
+            _, dst, reduce_name, src, _axis, _dtype, _shape = instr[:7]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            reduce_fn = _REDUCE_DISPATCH.get(reduce_name)
+            if reduce_fn is not None:
+                slots[dst] = reduce_fn(src_val, axis=_axis)
         elif op == "unop" and len(instr) >= 4:
             _, dst, unop_name, src = instr[:4]
             src_val = slots_get(src, 0)
@@ -1840,6 +2125,36 @@ def _tier4_dispatch_scalar(instrs, slots, slots_get):
             fn = _BINOP_DISPATCH.get(binop)
             if fn is not None:
                 slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_binop" and len(instr) >= 9:
+            _, dst, binop, lhs, rhs, _dtype, _shape, _slhs, _srhs = instr[:9]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            fn = _BINOP_DISPATCH.get(binop)
+            if fn is not None:
+                slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_matmul" and len(instr) >= 10:
+            _, dst, lhs, rhs, _m, _n, _k, _dtype, _ll, _rl = instr[:10]
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            lhs_val = np.ascontiguousarray(lhs_val) if isinstance(lhs_val, np.ndarray) else lhs_val
+            rhs_val = np.ascontiguousarray(rhs_val) if isinstance(rhs_val, np.ndarray) else rhs_val
+            slots[dst] = np.matmul(lhs_val, rhs_val)
+        elif op == "tensor_reduce" and len(instr) >= 7:
+            _, dst, reduce_name, src, _axis, _dtype, _shape = instr[:7]
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            reduce_fn = _REDUCE_DISPATCH.get(reduce_name)
+            if reduce_fn is not None:
+                slots[dst] = reduce_fn(src_val, axis=_axis)
         elif op == "unop" and len(instr) >= 4:
             _, dst, unop_name, src = instr[:4]
             src_val = slots_get(src, 0)
