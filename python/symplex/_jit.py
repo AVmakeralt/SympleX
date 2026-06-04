@@ -37,6 +37,118 @@ from ._tracer import SlotAllocator, trace_function
 from ._array import DeviceArray
 
 
+def _serialize_tensor_instrs(trace, allocator, arg_shapes, arg_dtypes):
+    """Serialize a Python trace with tensor type information into binary format.
+    
+    This extends the existing _tier4_serialize_trace with support for
+    tensor_binop, tensor_matmul, and tensor_reduce instructions that carry
+    shape/stride/dtype metadata.
+    
+    Returns bytes that can be deserialized by the Rust engine.
+    """
+    import struct
+    
+    # Map Python dtype strings to ScalarType u8 values
+    DTYPE_TO_SCALAR = {
+        "int8": 0, "int16": 1, "int32": 2, "int64": 3,
+        "uint8": 4, "uint16": 5, "uint32": 6, "uint64": 7,
+        "float16": 8, "float32": 9, "fp32": 9, "float64": 10, "fp64": 10,
+        "bfloat16": 11, "bf16": 11, "bool": 12,
+    }
+    
+    # Map Python binop names to BinOpKind u8 values
+    BINOP_TO_U8 = {
+        "add": 0, "sub": 1, "mul": 2, "div": 3, "rem": 4,
+        "bitand": 5, "bitor": 6, "bitxor": 7, "shl": 8, "shr": 9,
+        "eq": 10, "ne": 11, "lt": 12, "le": 13, "gt": 14, "ge": 15,
+        "and": 16, "or": 17, "min": 18, "max": 19, "floordiv": 20,
+        "matmul": 2,  # matmul serialized as mul in BinOpKind context
+    }
+    
+    REDUCE_TO_U8 = {"sum": 0, "max": 1, "min": 2, "mean": 3}
+    LAYOUT_TO_U8 = {"row_major": 0, "col_major": 1}
+    
+    buf = bytearray()
+    
+    for instr in trace:
+        op = instr[0]
+        
+        if op == "tensor_binop":
+            # ("tensor_binop", dst, binop_name, lhs, rhs, dtype, shape, strides_lhs, strides_rhs)
+            _, dst, binop_name, lhs, rhs, dtype, shape, strides_lhs, strides_rhs = instr
+            binop_u8 = BINOP_TO_U8.get(binop_name, 0)
+            ty_u8 = DTYPE_TO_SCALAR.get(dtype, 10)  # default F64
+            ndim = len(shape)
+            buf.extend(struct.pack('<BHBBHB', 0xA0, dst, binop_u8, lhs, rhs, ty_u8, ndim))
+            for dim in shape:
+                buf.extend(struct.pack('<Q', dim))
+            for s in strides_lhs:
+                buf.extend(struct.pack('<Q', s))
+            for s in strides_rhs:
+                buf.extend(struct.pack('<Q', s))
+                
+        elif op == "tensor_matmul":
+            # ("tensor_matmul", dst, lhs, rhs, m, n, k, dtype, lhs_layout, rhs_layout)
+            _, dst, lhs, rhs, m, n, k, dtype, lhs_layout, rhs_layout = instr
+            ty_u8 = DTYPE_TO_SCALAR.get(dtype, 9)  # default F32
+            lhs_l = LAYOUT_TO_U8.get(lhs_layout, 0)
+            rhs_l = LAYOUT_TO_U8.get(rhs_layout, 0)
+            buf.extend(struct.pack('<BHHHQQQBHH', 0xA2, dst, lhs, rhs, 
+                                   m, n, k, ty_u8, lhs_l, rhs_l))
+            
+        elif op == "tensor_reduce":
+            # ("tensor_reduce", dst, reduce_op, src, axis, dtype, src_shape)
+            _, dst, reduce_op, src, axis, dtype, src_shape = instr
+            red_u8 = REDUCE_TO_U8.get(reduce_op, 0)
+            ty_u8 = DTYPE_TO_SCALAR.get(dtype, 10)
+            ndim = len(src_shape)
+            buf.extend(struct.pack('<BHBHQHB', 0xA1, dst, red_u8, src, 
+                                   axis, ty_u8, ndim))
+            for dim in src_shape:
+                buf.extend(struct.pack('<Q', dim))
+                
+        elif op == "binop":
+            _, dst, binop_name, lhs, rhs = instr
+            binop_u8 = BINOP_TO_U8.get(binop_name, 0)
+            buf.extend(struct.pack('<BHBBH', 0x10, dst, binop_u8, lhs, rhs))
+            
+        elif op == "unop":
+            _, dst, unop_name, src = instr
+            unop_u8 = {"neg": 0, "not": 1, "bitnot": 2, "abs": 3}.get(unop_name, 0)
+            buf.extend(struct.pack('<BHBH', 0x11, dst, unop_u8, src))
+            
+        elif op == "load_f64":
+            _, slot, val = instr
+            buf.extend(struct.pack('<BHd', 0x03, slot, float(val)))
+            
+        elif op == "load_f32":
+            _, slot, val = instr
+            buf.extend(struct.pack('<BHf', 0x04, slot, float(val)))
+            
+        elif op == "load_i64":
+            _, slot, val = instr
+            buf.extend(struct.pack('<BHq', 0x01, slot, int(val)))
+            
+        elif op == "load_i32":
+            _, slot, val = instr
+            buf.extend(struct.pack('<BHi', 0x02, slot, int(val)))
+            
+        elif op == "move":
+            _, dst, src = instr
+            buf.extend(struct.pack('<BHH', 0x20, dst, src))
+            
+        elif op == "store":
+            _, slot, val = instr
+            buf.extend(struct.pack('<BHH', 0x21, slot, val))
+            
+        elif op == "reduce":
+            _, dst, reduce_name, src = instr
+            red_u8 = REDUCE_TO_U8.get(reduce_name, 0)
+            buf.extend(struct.pack('<BHBH', 0xA1, dst, red_u8, src))
+    
+    return bytes(buf)
+
+
 # ── Pre-built dispatch tables for fast interpretation ────────────────────────
 
 _BINOP_DISPATCH = {
@@ -109,10 +221,7 @@ def _try_jit_native(binop_op, inputs, allocator, arg_shapes):
         if used:
             return result, True
 
-    # ── Matmul pattern: always use BLAS (NumPy) ──
-    # NumPy's matmul is backed by optimized BLAS (OpenBLAS, MKL, Apple Accelerate)
-    # which delivers near-peak GEMM performance. JIT matmul is slower and has
-    # encoding bugs that cause corruption/crashes on some CPUs.
+    # ── Matmul pattern: use BLAS via Rust engine or NumPy fallback ──
     if binop_op == "matmul" and len(inputs) == 2:
         a = inputs[0]
         b = inputs[1]
@@ -120,6 +229,8 @@ def _try_jit_native(binop_op, inputs, allocator, arg_shapes):
             a = a._data
         if isinstance(b, DeviceArray):
             b = b._data
+        a = np.ascontiguousarray(a)
+        b = np.ascontiguousarray(b)
         return DeviceArray._wrap(np.matmul(a, b)), True
 
     # ── Element-wise binary pattern: use NumPy (reliable, fast with BLAS) ──
@@ -357,6 +468,13 @@ def _detect_simple_pattern(trace, allocator, arg_shapes=None):
         if hybrid is not None:
             return hybrid
 
+    # ── Tensor matmul pattern: use hybrid executor with BLAS ──
+    has_tensor_matmul = any(t[0] == "tensor_matmul" for t in trace)
+    if has_tensor_matmul:
+        hybrid = _create_hybrid_executor(trace, allocator)
+        if hybrid is not None:
+            return hybrid
+
     # Count binops and non-move ops
     binops = [t for t in trace if t[0] == "binop"]
     moves = [t for t in trace if t[0] == "move"]
@@ -543,7 +661,7 @@ def _build_slot_for_arg_map(allocator):
 
 
 def _contains_matmul(trace):
-    """Check if a trace contains any matmul operations.
+    """Check if a trace contains any matmul operations (plain or tensor).
     
     Matmul operations must NEVER be fused into the polyhedral engine's
     loop structure — they must always be delegated to NumPy's BLAS backend
@@ -554,7 +672,10 @@ def _contains_matmul(trace):
     it replaces these world-class GEMM kernels with naive nested loops,
     causing catastrophic performance regression (0.58x vs NumPy).
     """
-    return any(t[0] == "binop" and t[2] == "matmul" for t in trace)
+    return any(
+        (t[0] == "binop" and t[2] == "matmul") or t[0] == "tensor_matmul" 
+        for t in trace
+    )
 
 
 def _analyze_elem_for_simd(elem_instrs):
@@ -724,7 +845,7 @@ def _create_hybrid_executor(trace, allocator):
     # and build an optimized execution plan
     matmul_indices = []
     for i, t in enumerate(trace):
-        if t[0] == "binop" and t[2] == "matmul":
+        if (t[0] == "binop" and t[2] == "matmul") or t[0] == "tensor_matmul":
             matmul_indices.append(i)
     
     if not matmul_indices:
@@ -804,6 +925,44 @@ def _create_hybrid_executor(trace, allocator):
                 slots[instr[1]] = slots_get(instr[2], 0)
             elif op == "nop":
                 pass
+            elif op == "tensor_binop":
+                # tensor_binop: (_, dst, binop, lhs, rhs, dtype, shape, strides_lhs, strides_rhs)
+                _, dst, binop, lhs, rhs, dtype, shape, strides_lhs, strides_rhs = instr
+                fn = binop_dispatch.get(binop)
+                if fn is None:
+                    raise CompilationError(f"Unknown tensor binop: {binop}")
+                lhs_val = slots_get(lhs, 0)
+                rhs_val = slots_get(rhs, 0)
+                if isinstance(lhs_val, DeviceArray):
+                    lhs_val = lhs_val._data
+                if isinstance(rhs_val, DeviceArray):
+                    rhs_val = rhs_val._data
+                result = fn(lhs_val, rhs_val)
+                slots[dst] = result
+
+            elif op == "tensor_matmul":
+                # tensor_matmul: (_, dst, lhs, rhs, m, n, k, dtype, lhs_layout, rhs_layout)
+                _, dst, lhs, rhs, m, n, k, dtype, lhs_layout, rhs_layout = instr
+                lhs_val = slots_get(lhs, 0)
+                rhs_val = slots_get(rhs, 0)
+                if isinstance(lhs_val, DeviceArray):
+                    lhs_val = lhs_val._data
+                if isinstance(rhs_val, DeviceArray):
+                    rhs_val = rhs_val._data
+                lhs_val = np.ascontiguousarray(lhs_val) if isinstance(lhs_val, np.ndarray) else lhs_val
+                rhs_val = np.ascontiguousarray(rhs_val) if isinstance(rhs_val, np.ndarray) else rhs_val
+                slots[dst] = np.matmul(lhs_val, rhs_val)
+
+            elif op == "tensor_reduce":
+                # tensor_reduce: (_, dst, reduce_op, src, axis, dtype, src_shape)
+                _, dst, reduce_op, src, axis, dtype, src_shape = instr
+                reduce_fn = _REDUCE_DISPATCH.get(reduce_op)
+                if reduce_fn is None:
+                    raise CompilationError(f"Unknown tensor reduce op: {reduce_op}")
+                src_val = slots_get(src, 0)
+                if isinstance(src_val, DeviceArray):
+                    src_val = src_val._data
+                slots[dst] = reduce_fn(src_val, axis=axis)
             else:
                 raise CompilationError(f"Unknown instruction: {op}")
         
@@ -847,12 +1006,18 @@ def _segment_trace_at_matmul(trace):
         if op == "binop" and instr[2] == "matmul":
             flush_elem()
             segments.append(("matmul", instr))
-        elif op in ("binop", "unop"):
+        elif op == "tensor_matmul":
+            flush_elem()
+            segments.append(("matmul", instr))
+        elif op in ("binop", "unop", "tensor_binop"):
             # Elementwise operation — add to current elementwise segment
             current_elem.append(instr)
         elif op == "reduce":
             # Reduce is part of an elementwise segment (it consumes the
             # elementwise result and produces a scalar)
+            current_elem.append(instr)
+        elif op == "tensor_reduce":
+            # TensorReduce is part of an elementwise segment
             current_elem.append(instr)
         elif op in ("load_f64", "load_f32", "load_i64", "load_i32", "load_bool"):
             # Constants can be part of an elementwise segment
@@ -1768,6 +1933,38 @@ def interpret_trace(
             slots[instr[1]] = slots_get(instr[2], 0)
         elif op == "nop":
             pass
+        elif op == "tensor_binop":
+            _, dst, binop, lhs, rhs, dtype, shape, strides_lhs, strides_rhs = instr
+            fn = binop_dispatch.get(binop)
+            if fn is None:
+                raise CompilationError(f"Unknown tensor binop: {binop}")
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            slots[dst] = fn(lhs_val, rhs_val)
+        elif op == "tensor_matmul":
+            _, dst, lhs, rhs, m, n, k, dtype, lhs_layout, rhs_layout = instr
+            lhs_val = slots_get(lhs, 0)
+            rhs_val = slots_get(rhs, 0)
+            if isinstance(lhs_val, DeviceArray):
+                lhs_val = lhs_val._data
+            if isinstance(rhs_val, DeviceArray):
+                rhs_val = rhs_val._data
+            lhs_val = np.ascontiguousarray(lhs_val) if isinstance(lhs_val, np.ndarray) else lhs_val
+            rhs_val = np.ascontiguousarray(rhs_val) if isinstance(rhs_val, np.ndarray) else rhs_val
+            slots[dst] = np.matmul(lhs_val, rhs_val)
+        elif op == "tensor_reduce":
+            _, dst, reduce_op, src, axis, dtype, src_shape = instr
+            reduce_fn = _REDUCE_DISPATCH.get(reduce_op)
+            if reduce_fn is None:
+                raise CompilationError(f"Unknown tensor reduce op: {reduce_op}")
+            src_val = slots_get(src, 0)
+            if isinstance(src_val, DeviceArray):
+                src_val = src_val._data
+            slots[dst] = reduce_fn(src_val, axis=axis)
         else:
             raise CompilationError(f"Unknown instruction: {op}")
 
@@ -1810,6 +2007,11 @@ def _is_elementwise_trace(trace, allocator):
                 # in the sense we want — they produce booleans, not floats
                 return False, 0
             n_ops += 1
+        elif op == "tensor_binop":
+            binop = instr[2]
+            if binop not in elementwise_binops:
+                return False, 0
+            n_ops += 1
         elif op == "unop":
             unop = instr[2]
             if unop not in elementwise_unops:
@@ -1818,11 +2020,14 @@ def _is_elementwise_trace(trace, allocator):
         elif op == "reduce":
             # reduce is allowed in elementwise traces (it comes at the end)
             n_ops += 1
+        elif op == "tensor_reduce":
+            # tensor_reduce is allowed in elementwise traces (it comes at the end)
+            n_ops += 1
         elif op in ("load_f32", "load_f64", "load_i32", "load_i64",
                      "load_bool", "move", "store", "nop"):
             pass
         else:
-            # Any other opcode (jumps, etc.) disqualifies
+            # Any other opcode (jumps, tensor_matmul, etc.) disqualifies
             return False, 0
     return n_ops >= 2, n_ops
 
@@ -1857,11 +2062,17 @@ def _create_fused_elementwise_executor(trace, allocator):
         if op == "binop":
             _, dst, binop, lhs, rhs = instr
             plan.append(("binop", dst, binop, lhs, rhs))
+        elif op == "tensor_binop":
+            _, dst, binop, lhs, rhs, dtype, shape, strides_lhs, strides_rhs = instr
+            plan.append(("binop", dst, binop, lhs, rhs))
         elif op == "unop":
             _, dst, unop, src = instr
             plan.append(("unop", dst, unop, src))
         elif op == "reduce":
             _, dst_slot, reduce_op, src_slot = instr
+            plan.append(("reduce", dst_slot, reduce_op, src_slot))
+        elif op == "tensor_reduce":
+            _, dst_slot, reduce_op, src_slot, axis, dtype, src_shape = instr
             plan.append(("reduce", dst_slot, reduce_op, src_slot))
         elif op in ("load_f32", "load_f64"):
             _, slot, val = instr

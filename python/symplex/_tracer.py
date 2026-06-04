@@ -75,9 +75,36 @@ class TracerVal:
             allocator.alloc(self)
 
     def _emit_binop(self, op: str, other: 'TracerVal', result_shape: Tuple[int, ...] = ()) -> 'TracerVal':
-        """Emit a binary operation instruction."""
+        """Emit a binary operation instruction.
+        
+        When both operands are tensors (have non-empty shapes), emits a
+        TensorBinOp instruction that carries shape/stride/dtype metadata
+        for the Rust JIT to use for SIMD vectorization and fusion decisions.
+        Otherwise emits a plain binop for scalar operations.
+        """
         result = TracerVal(self.allocator, self.trace, shape=result_shape or self.shape, dtype=self.dtype)
-        self.trace.append(("binop", result.slot, op, self.slot, other.slot))
+        
+        # Emit TensorBinOp for tensor operations (non-empty shapes)
+        if result_shape or (self.shape and other.shape):
+            shape = result_shape or self._broadcast_shape(other)
+            # Compute default row-major strides
+            def _row_major_strides(shape):
+                if not shape:
+                    return ()
+                strides = [1] * len(shape)
+                for i in range(len(shape) - 2, -1, -1):
+                    strides[i] = strides[i + 1] * shape[i + 1]
+                return tuple(strides)
+            
+            strides_lhs = _row_major_strides(self.shape) if self.shape else ()
+            strides_rhs = _row_major_strides(other.shape) if other.shape else ()
+            
+            self.trace.append(("tensor_binop", result.slot, op, self.slot, other.slot,
+                              self.dtype, shape, strides_lhs, strides_rhs))
+        else:
+            # Scalar operation — use plain binop
+            self.trace.append(("binop", result.slot, op, self.slot, other.slot))
+        
         return result
 
     def _emit_unop(self, op: str) -> 'TracerVal':
@@ -180,11 +207,15 @@ class TracerVal:
             raise TracerError("matmul requires TracerVal operand")
         # matmul: (..., M, K) @ (..., K, N) -> (..., M, N)
         m = self.shape[-2] if len(self.shape) >= 2 else 1
+        k = self.shape[-1] if len(self.shape) >= 1 else 1
         n = other.shape[-1] if len(other.shape) >= 1 else 1
         result_shape = self.shape[:-2] + (m, n)
         result = TracerVal(self.allocator, self.trace, shape=result_shape, dtype=self.dtype)
-        # Use a special "matmul" opcode so the interpreter can distinguish from mul
-        self.trace.append(("binop", result.slot, "matmul", self.slot, other.slot))
+        
+        # Emit TensorMatMul with full shape/layout info
+        # Default: both matrices are RowMajor
+        self.trace.append(("tensor_matmul", result.slot, self.slot, other.slot,
+                          m, n, k, self.dtype, "row_major", "row_major"))
         return result
 
     def __neg__(self) -> 'TracerVal':
@@ -240,22 +271,24 @@ class TracerVal:
     # ── Reduction methods ────────────────────────────────────────────────
 
     def sum(self, axis=None, keepdims=False) -> 'TracerVal':
-        """Sum reduction — emits a proper reduce instruction.
-
-        The 'reduce' instruction is distinct from 'binop':
-        - binop(add, x, x) means elementwise x+x (doubles each element)
-        - reduce(sum, x) means horizontal summation → scalar result
-
-        This distinction is critical for the JIT backend:
-        - Elementwise ops → SIMD elementwise kernel (one output per input)
-        - Reductions → SIMD reduction kernel (N inputs → 1 output)
-        """
-        result = TracerVal(
-            self.allocator, self.trace,
-            shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
-            dtype=self.dtype,
-        )
-        self.trace.append(("reduce", result.slot, "sum", self.slot))
+        """Sum reduction — emits a TensorReduce instruction when shape is available."""
+        if axis is not None and self.shape:
+            result = TracerVal(
+                self.allocator, self.trace,
+                shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
+                dtype=self.dtype,
+            )
+            # Emit TensorReduce with shape info
+            self.trace.append(("tensor_reduce", result.slot, "sum", self.slot,
+                              axis, self.dtype, self.shape))
+        else:
+            # Scalar or full reduction
+            result = TracerVal(
+                self.allocator, self.trace,
+                shape=() if not keepdims else tuple(1 for _ in self.shape),
+                dtype=self.dtype,
+            )
+            self.trace.append(("reduce", result.slot, "sum", self.slot))
         return result
 
     def mean(self, axis=None, keepdims=False) -> 'TracerVal':
@@ -267,23 +300,45 @@ class TracerVal:
         return result
 
     def max(self, axis=None, keepdims=False) -> 'TracerVal':
-        """Max reduction — emits a proper reduce instruction."""
-        result = TracerVal(
-            self.allocator, self.trace,
-            shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
-            dtype=self.dtype,
-        )
-        self.trace.append(("reduce", result.slot, "max", self.slot))
+        """Max reduction — emits a TensorReduce instruction when shape is available."""
+        if axis is not None and self.shape:
+            result = TracerVal(
+                self.allocator, self.trace,
+                shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
+                dtype=self.dtype,
+            )
+            # Emit TensorReduce with shape info
+            self.trace.append(("tensor_reduce", result.slot, "max", self.slot,
+                              axis, self.dtype, self.shape))
+        else:
+            # Scalar or full reduction
+            result = TracerVal(
+                self.allocator, self.trace,
+                shape=() if not keepdims else tuple(1 for _ in self.shape),
+                dtype=self.dtype,
+            )
+            self.trace.append(("reduce", result.slot, "max", self.slot))
         return result
 
     def min(self, axis=None, keepdims=False) -> 'TracerVal':
-        """Min reduction — emits a proper reduce instruction."""
-        result = TracerVal(
-            self.allocator, self.trace,
-            shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
-            dtype=self.dtype,
-        )
-        self.trace.append(("reduce", result.slot, "min", self.slot))
+        """Min reduction — emits a TensorReduce instruction when shape is available."""
+        if axis is not None and self.shape:
+            result = TracerVal(
+                self.allocator, self.trace,
+                shape=() if not keepdims else tuple(1 if i == axis else s for i, s in enumerate(self.shape)),
+                dtype=self.dtype,
+            )
+            # Emit TensorReduce with shape info
+            self.trace.append(("tensor_reduce", result.slot, "min", self.slot,
+                              axis, self.dtype, self.shape))
+        else:
+            # Scalar or full reduction
+            result = TracerVal(
+                self.allocator, self.trace,
+                shape=() if not keepdims else tuple(1 for _ in self.shape),
+                dtype=self.dtype,
+            )
+            self.trace.append(("reduce", result.slot, "min", self.slot))
         return result
 
     def __lt__(self, other) -> 'TracerVal':

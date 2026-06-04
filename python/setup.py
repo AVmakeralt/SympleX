@@ -63,7 +63,7 @@ ext = Extension(
 
 setup(
     name="simplex-tensor",
-    version="1.2.0",
+    version="1.3.0",
     packages=["symplex"],
     ext_modules=[ext],
     cmdclass={"build_ext": CMakeBuild},

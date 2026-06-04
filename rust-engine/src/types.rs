@@ -92,6 +92,103 @@ pub enum AmxOpCode {
 }
 
 // =============================================================================
+// ScalarType — Exact scalar type classification for typed IR operations
+// =============================================================================
+
+/// Scalar type classification for typed IR operations.
+/// Replaces the heuristic `compute_float_slots()` approach with exact type info.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ScalarType {
+    I8 = 0, I16 = 1, I32 = 2, I64 = 3,
+    U8 = 4, U16 = 5, U32 = 6, U64 = 7,
+    F16 = 8, F32 = 9, F64 = 10,
+    BF16 = 11,
+    Bool = 12,
+}
+
+impl ScalarType {
+    pub fn size_bytes(&self) -> usize {
+        match self {
+            ScalarType::I8 | ScalarType::U8 | ScalarType::Bool => 1,
+            ScalarType::I16 | ScalarType::U16 | ScalarType::F16 | ScalarType::BF16 => 2,
+            ScalarType::I32 | ScalarType::U32 | ScalarType::F32 => 4,
+            ScalarType::I64 | ScalarType::U64 | ScalarType::F64 => 8,
+        }
+    }
+    pub fn is_float(&self) -> bool {
+        matches!(self, ScalarType::F16 | ScalarType::F32 | ScalarType::F64 | ScalarType::BF16)
+    }
+    pub fn is_integer(&self) -> bool {
+        matches!(self, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+                       | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64)
+    }
+    pub fn is_signed(&self) -> bool {
+        matches!(self, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)
+    }
+    pub fn f32_lanes(&self, has_avx512: bool, has_avx2: bool) -> usize {
+        let vector_width = if has_avx512 { 512 } else if has_avx2 { 256 } else { 128 };
+        vector_width / (self.size_bytes() * 8)
+    }
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(ScalarType::I8), 1 => Some(ScalarType::I16), 2 => Some(ScalarType::I32), 3 => Some(ScalarType::I64),
+            4 => Some(ScalarType::U8), 5 => Some(ScalarType::U16), 6 => Some(ScalarType::U32), 7 => Some(ScalarType::U64),
+            8 => Some(ScalarType::F16), 9 => Some(ScalarType::F32), 10 => Some(ScalarType::F64),
+            11 => Some(ScalarType::BF16), 12 => Some(ScalarType::Bool),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// ConstValue — Typed constant value for LoadConst instructions
+// =============================================================================
+
+/// Typed constant value for LoadConst instructions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstValue {
+    I64(i64),
+    I32(i32),
+    F32(f32),
+    F64(f64),
+    BF16(u16),  // Raw BF16 bits
+    Bool(bool),
+}
+
+// =============================================================================
+// MatrixLayout — Matrix memory layout for TensorMatMul
+// =============================================================================
+
+/// Matrix memory layout for TensorMatMul.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MatrixLayout {
+    RowMajor = 0,
+    ColMajor = 1,
+}
+
+// =============================================================================
+// ReduceOp — Reduction operation for TensorReduce
+// =============================================================================
+
+/// Reduction operation for TensorReduce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ReduceOp {
+    Sum = 0,
+    Max = 1,
+    Min = 2,
+    Mean = 3,
+}
+
+impl ReduceOp {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v { 0 => Some(ReduceOp::Sum), 1 => Some(ReduceOp::Max), 2 => Some(ReduceOp::Min), 3 => Some(ReduceOp::Mean), _ => None }
+    }
+}
+
+// =============================================================================
 // Value — Runtime value representation
 // =============================================================================
 
@@ -219,6 +316,44 @@ pub enum Instr {
     // ── Tensor/math ops ──────────────────────────────────────────────────
     PowOp(u16, u16, u16),          // (dst, base, exp)
     MatMulInstr(u16, u16, u16),    // (dst, lhs, rhs)
+
+    // ── Tensor-level operations with shape/stride info ──────────────────
+    /// Typed binary operation on tensor elements. Shape info enables
+    /// SIMD vectorization at the correct width and trip count.
+    TensorBinOp {
+        dst: u16,
+        op: BinOpKind,
+        lhs: u16,
+        rhs: u16,
+        element_ty: ScalarType,
+        shape: Vec<usize>,
+        strides_lhs: Vec<usize>,
+        strides_rhs: Vec<usize>,
+    },
+    /// Typed reduction along an axis. Shape info enables proper
+    /// vectorized reduction kernel emission.
+    TensorReduce {
+        dst: u16,
+        op: ReduceOp,
+        src: u16,
+        axis: usize,
+        element_ty: ScalarType,
+        src_shape: Vec<usize>,
+    },
+    /// Typed matrix multiplication with shape/layout info.
+    /// When BLAS is available, dispatches directly to cblas_sgemm/cblas_dgemm.
+    /// Otherwise uses the cache-tiled custom kernel.
+    TensorMatMul {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        m: usize,
+        n: usize,
+        k: usize,
+        element_ty: ScalarType,
+        lhs_layout: MatrixLayout,
+        rhs_layout: MatrixLayout,
+    },
 
     // ── Return ────────────────────────────────────────────────────────
     Return(u16),
@@ -407,6 +542,42 @@ pub fn serialize_instr(instr: &Instr) -> Vec<u8> {
             buf.extend_from_slice(&lhs.to_le_bytes());
             buf.extend_from_slice(&rhs.to_le_bytes());
         }
+        Instr::TensorBinOp { dst, op, lhs, rhs, element_ty, shape, strides_lhs, strides_rhs } => {
+            buf.push(0xA0);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.push(*op as u8);
+            buf.extend_from_slice(&lhs.to_le_bytes());
+            buf.extend_from_slice(&rhs.to_le_bytes());
+            buf.push(*element_ty as u8);
+            let ndim = shape.len() as u16;
+            buf.extend_from_slice(&ndim.to_le_bytes());
+            for &d in shape { buf.extend_from_slice(&(d as u64).to_le_bytes()); }
+            for &s in strides_lhs { buf.extend_from_slice(&(s as u64).to_le_bytes()); }
+            for &s in strides_rhs { buf.extend_from_slice(&(s as u64).to_le_bytes()); }
+        }
+        Instr::TensorReduce { dst, op, src, axis, element_ty, src_shape } => {
+            buf.push(0xA1);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.push(*op as u8);
+            buf.extend_from_slice(&src.to_le_bytes());
+            buf.extend_from_slice(&(*axis as u64).to_le_bytes());
+            buf.push(*element_ty as u8);
+            let ndim = src_shape.len() as u16;
+            buf.extend_from_slice(&ndim.to_le_bytes());
+            for &d in src_shape { buf.extend_from_slice(&(d as u64).to_le_bytes()); }
+        }
+        Instr::TensorMatMul { dst, lhs, rhs, m, n, k, element_ty, lhs_layout, rhs_layout } => {
+            buf.push(0xA2);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.extend_from_slice(&lhs.to_le_bytes());
+            buf.extend_from_slice(&rhs.to_le_bytes());
+            buf.extend_from_slice(&(*m as u64).to_le_bytes());
+            buf.extend_from_slice(&(*n as u64).to_le_bytes());
+            buf.extend_from_slice(&(*k as u64).to_le_bytes());
+            buf.push(*element_ty as u8);
+            buf.push(*lhs_layout as u8);
+            buf.push(*rhs_layout as u8);
+        }
         Instr::Return(slot) => {
             buf.push(0x70);
             buf.extend_from_slice(&slot.to_le_bytes());
@@ -522,6 +693,78 @@ pub fn deserialize_instr(data: &[u8]) -> Option<(Instr, usize)> {
         0x61 if data.len() >= 3 => {
             let slot = u16::from_le_bytes([data[1], data[2]]);
             Some((Instr::ForceRegisterUnlock { slot }, 3))
+        }
+        0xA0 => {
+            // TensorBinOp: [0xA0] [dst:u16] [op:u8] [lhs:u16] [rhs:u16] [element_ty:u8] [ndim:u16] [shape: ndim×u64] [strides_lhs: ndim×u64] [strides_rhs: ndim×u64]
+            if data.len() < 10 { return None; }
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let op = BinOpKind::from_u8(data[3])?;
+            let lhs = u16::from_le_bytes([data[4], data[5]]);
+            let rhs = u16::from_le_bytes([data[6], data[7]]);
+            let element_ty = ScalarType::from_u8(data[8])?;
+            let ndim = u16::from_le_bytes([data[9], data[10]]) as usize;
+            let base = 11;
+            let dims_bytes = ndim * 8;
+            if data.len() < base + 3 * dims_bytes { return None; }
+            let mut shape = Vec::with_capacity(ndim);
+            for i in 0..ndim {
+                let off = base + i * 8;
+                shape.push(u64::from_le_bytes(data[off..off+8].try_into().ok()?) as usize);
+            }
+            let mut strides_lhs = Vec::with_capacity(ndim);
+            for i in 0..ndim {
+                let off = base + dims_bytes + i * 8;
+                strides_lhs.push(u64::from_le_bytes(data[off..off+8].try_into().ok()?) as usize);
+            }
+            let mut strides_rhs = Vec::with_capacity(ndim);
+            for i in 0..ndim {
+                let off = base + 2 * dims_bytes + i * 8;
+                strides_rhs.push(u64::from_le_bytes(data[off..off+8].try_into().ok()?) as usize);
+            }
+            let total_len = base + 3 * dims_bytes;
+            Some((Instr::TensorBinOp { dst, op, lhs, rhs, element_ty, shape, strides_lhs, strides_rhs }, total_len))
+        }
+        0xA1 => {
+            // TensorReduce: [0xA1] [dst:u16] [op:u8] [src:u16] [axis:u64] [element_ty:u8] [ndim:u16] [src_shape: ndim×u64]
+            if data.len() < 16 { return None; }
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let op = ReduceOp::from_u8(data[3])?;
+            let src = u16::from_le_bytes([data[4], data[5]]);
+            let axis = u64::from_le_bytes(data[6..14].try_into().ok()?) as usize;
+            let element_ty = ScalarType::from_u8(data[14])?;
+            let ndim = u16::from_le_bytes([data[15], data[16]]) as usize;
+            let base = 17;
+            let dims_bytes = ndim * 8;
+            if data.len() < base + dims_bytes { return None; }
+            let mut src_shape = Vec::with_capacity(ndim);
+            for i in 0..ndim {
+                let off = base + i * 8;
+                src_shape.push(u64::from_le_bytes(data[off..off+8].try_into().ok()?) as usize);
+            }
+            let total_len = base + dims_bytes;
+            Some((Instr::TensorReduce { dst, op, src, axis, element_ty, src_shape }, total_len))
+        }
+        0xA2 => {
+            // TensorMatMul: [0xA2] [dst:u16] [lhs:u16] [rhs:u16] [m:u64] [n:u64] [k:u64] [element_ty:u8] [lhs_layout:u8] [rhs_layout:u8]
+            if data.len() < 31 { return None; }
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let lhs = u16::from_le_bytes([data[3], data[4]]);
+            let rhs = u16::from_le_bytes([data[5], data[6]]);
+            let m = u64::from_le_bytes(data[7..15].try_into().ok()?) as usize;
+            let n = u64::from_le_bytes(data[15..23].try_into().ok()?) as usize;
+            let k = u64::from_le_bytes(data[23..31].try_into().ok()?) as usize;
+            let element_ty = ScalarType::from_u8(data[31])?;
+            let lhs_layout = match data.get(32) {
+                Some(0) => MatrixLayout::RowMajor,
+                Some(1) => MatrixLayout::ColMajor,
+                _ => return None,
+            };
+            let rhs_layout = match data.get(33) {
+                Some(0) => MatrixLayout::RowMajor,
+                Some(1) => MatrixLayout::ColMajor,
+                _ => return None,
+            };
+            Some((Instr::TensorMatMul { dst, lhs, rhs, m, n, k, element_ty, lhs_layout, rhs_layout }, 34))
         }
         0x70 if data.len() >= 3 => {
             let slot = u16::from_le_bytes([data[1], data[2]]);

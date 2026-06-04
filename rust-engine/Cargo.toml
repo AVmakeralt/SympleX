@@ -1,6 +1,6 @@
 [package]
 name = "symplex-engine"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 description = "SympleX Polyhedral Tensor Superoptimizer – Rust Engine with x86-64 JIT"
 
@@ -19,10 +19,12 @@ iced-x86 = { version = "1", features = ["code_asm"] }
 cudarc = { version = "0.19", optional = true }
 egg = "0.6"
 good_lp = { version = "1.3", features = ["minilp"], default-features = false }
+openblas-src = { version = "0.10", optional = true, features = ["cblas", "system"] }
 
 [features]
 default = []
 cuda = ["cudarc"]
+blas = ["openblas-src"]
 jit_trace = []  # Enable JIT compilation trace logging (off by default for performance)
 
 [profile.release]

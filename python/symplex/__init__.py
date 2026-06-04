@@ -42,6 +42,35 @@ from ._errors import (
 from ._jit import jit, grad, JitFunction
 from . import linalg
 
+# ── Type annotation helpers for @symplex.jit ──────────────────────────────
+# These allow users to annotate function arguments with specific dtypes:
+#   @symplex.jit
+#   def compute(x: symplex.f32, y: symplex.f32) -> symplex.f32:
+#       return x * 2.5 + y
+
+class _DTypeAnnotation:
+    """Base class for dtype annotations in function signatures."""
+    def __init__(self, name, np_dtype):
+        self.name = name
+        self.np_dtype = np_dtype
+    def __repr__(self):
+        return f"symplex.{self.name}"
+    def __call__(self, shape=None):
+        """Allow f32['M,K'] syntax (future: symbolic shapes)."""
+        return self
+
+f32 = _DTypeAnnotation("f32", np.float32)
+f64 = _DTypeAnnotation("f64", np.float64)
+bf16 = _DTypeAnnotation("bf16", "bfloat16")
+i8 = _DTypeAnnotation("i8", np.int8)
+i16 = _DTypeAnnotation("i16", np.int16)
+i32 = _DTypeAnnotation("i32", np.int32)
+i64 = _DTypeAnnotation("i64", np.int64)
+u8 = _DTypeAnnotation("u8", np.uint8)
+u16 = _DTypeAnnotation("u16", np.uint16)
+u32 = _DTypeAnnotation("u32", np.uint32)
+u64 = _DTypeAnnotation("u64", np.uint64)
+
 # Try to import the Rust engine
 try:
     from ._symplex_core import (
@@ -417,7 +446,7 @@ class lax:
 # ── Module-level info ────────────────────────────────────────────────────────
 
 def __version__():
-    return "1.0.0"
+    return "1.3.0"
 
 
 def is_rust_engine_available():
@@ -475,6 +504,8 @@ __all__ = [
     "SympleXError", "ImpureFunctionError", "TracerError", "CompilationError", "ShapeError",
     # Info
     "is_rust_engine_available", "hardware_info", "micro_kernel_config",
+    # Type annotations
+    "f32", "f64", "bf16", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
 ]
 
 
