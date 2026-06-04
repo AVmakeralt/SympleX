@@ -62,7 +62,7 @@ ext = Extension(
 )
 
 setup(
-    name="symplex",
+    name="simpleX",
     version="1.0.0",
     packages=["symplex"],
     ext_modules=[ext],
