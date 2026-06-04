@@ -56,7 +56,7 @@ class TracerVal:
         allocator: SlotAllocator,
         trace: List[Tuple],
         shape: Tuple[int, ...] = (),
-        dtype: str = "float64",
+        dtype: str = "float32",
         name: str = "",
         slot: Optional[int] = None,
         const_val: Optional[float] = None,
@@ -386,7 +386,7 @@ class TracerVal:
         raise TracerError("In-place /= is impure. Use x = x / y instead.")
 
 
-def _const(allocator: SlotAllocator, trace: List[Tuple], val: float, dtype: str = "float64") -> TracerVal:
+def _const(allocator: SlotAllocator, trace: List[Tuple], val: float, dtype: str = "float32") -> TracerVal:
     """Create a constant tracer value and emit a load instruction."""
     result = TracerVal(allocator, trace, shape=(), dtype=dtype, const_val=val)
     if dtype in ("float64", "fp64"):
@@ -398,7 +398,7 @@ def _const(allocator: SlotAllocator, trace: List[Tuple], val: float, dtype: str 
     elif dtype in ("int32",):
         trace.append(("load_i32", result.slot, int(val)))
     else:
-        trace.append(("load_f64", result.slot, float(val)))
+        trace.append(("load_f32", result.slot, float(val)))
     return result
 
 

@@ -290,29 +290,56 @@ use crate::types::{BinOpKind, UnOpKind, CompiledFn, Instr, AmxOpCode, RuntimeErr
 // for ML workloads — it flips the 88× deficit to roughly 1-2× parity.
 
 #[cfg(feature = "blas")]
-mod blas_ffi {
-    extern "C" {
-        fn cblas_sgemm(
-            layout: u32,   // CblasRowMajor = 101
-            transa: u32,   // CblasNoTrans = 111
-            transb: u32,
-            m: u32, n: u32, k: u32,
-            alpha: f32,
-            a: *const f32, lda: u32,
-            b: *const f32, ldb: u32,
-            beta: f32,
-            c: *mut f32, ldc: u32,
-        );
-        fn cblas_dgemm(
-            layout: u32,
-            transa: u32, transb: u32,
-            m: u32, n: u32, k: u32,
-            alpha: f64,
-            a: *const f64, lda: u32,
-            b: *const f64, ldb: u32,
-            beta: f64,
-            c: *mut f64, ldc: u32,
-        );
+pub mod blas_ffi {
+    use std::sync::OnceLock;
+
+    /// Resolved function pointer types for BLAS calls
+    type SgemmFn = unsafe extern "C" fn(u32, u32, u32, u32, u32, u32, f32,
+        *const f32, u32, *const f32, u32, f32, *mut f32, u32);
+    type DgemmFn = unsafe extern "C" fn(u32, u32, u32, u32, u32, u32, f64,
+        *const f64, u32, *const f64, u32, f64, *mut f64, u32);
+
+    struct BlasLib {
+        sgemm: SgemmFn,
+        dgemm: DgemmFn,
+    }
+
+    static BLAS: OnceLock<Option<BlasLib>> = OnceLock::new();
+
+    fn load_blas() -> Option<BlasLib> {
+        // Try common BLAS library names in order of preference
+        let lib_names: &[&[u8]] = &[
+            b"libopenblas.so\0",
+            b"libopenblas.so.0\0",
+            b"libblas.so.3\0",
+            b"libblas.so\0",
+            b"libmkl_rt.so.2\0",
+            b"libmkl_rt.so\0",
+            b"libcblas.so.3\0",
+            b"libcblas.so\0",
+        ];
+
+        for name in lib_names {
+            let lib = unsafe { libc::dlopen(name.as_ptr() as *const i8, libc::RTLD_NOW | libc::RTLD_LOCAL) };
+            if lib.is_null() { continue; }
+
+            let sgemm_sym = unsafe { libc::dlsym(lib, b"cblas_sgemm\0".as_ptr() as *const i8) };
+            let dgemm_sym = unsafe { libc::dlsym(lib, b"cblas_dgemm\0".as_ptr() as *const i8) };
+
+            if !sgemm_sym.is_null() && !dgemm_sym.is_null() {
+                return Some(BlasLib {
+                    sgemm: unsafe { std::mem::transmute(sgemm_sym) },
+                    dgemm: unsafe { std::mem::transmute(dgemm_sym) },
+                });
+            }
+            // Symbols not found in this lib, try next
+            unsafe { libc::dlclose(lib); }
+        }
+        None
+    }
+
+    fn get_blas() -> Option<&'static BlasLib> {
+        BLAS.get_or_init(load_blas).as_ref()
     }
 
     const CBLAS_ROW_MAJOR: u32 = 101;
@@ -320,20 +347,20 @@ mod blas_ffi {
     const CBLAS_TRANS: u32 = 112;
 
     /// Dispatch a single-precision GEMM via CBLAS.
-    /// C = alpha * A * B + beta * C
-    /// A: (M, K) row-major, B: (K, N) row-major, C: (M, N) row-major
     pub fn sgemm(m: usize, n: usize, k: usize,
                  alpha: f32,
                  a: *const f32, lda: usize,
                  b: *const f32, ldb: usize,
                  beta: f32,
                  c: *mut f32, ldc: usize) {
-        unsafe {
-            cblas_sgemm(
-                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
-                m as u32, n as u32, k as u32,
-                alpha, a, lda as u32, b, ldb as u32, beta, c, ldc as u32,
-            );
+        if let Some(blas) = get_blas() {
+            unsafe {
+                (blas.sgemm)(
+                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                    m as u32, n as u32, k as u32,
+                    alpha, a, lda as u32, b, ldb as u32, beta, c, ldc as u32,
+                );
+            }
         }
     }
 
@@ -344,39 +371,77 @@ mod blas_ffi {
                  b: *const f64, ldb: usize,
                  beta: f64,
                  c: *mut f64, ldc: usize) {
-        unsafe {
-            cblas_dgemm(
-                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
-                m as u32, n as u32, k as u32,
-                alpha, a, lda as u32, b, ldb as u32, beta, c, ldc as u32,
-            );
+        if let Some(blas) = get_blas() {
+            unsafe {
+                (blas.dgemm)(
+                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                    m as u32, n as u32, k as u32,
+                    alpha, a, lda as u32, b, ldb as u32, beta, c, ldc as u32,
+                );
+            }
         }
     }
 
     /// Dispatch GEMM for ColMajor layout — transposes the operation.
-    /// ColMajor A(M,K) = RowMajor A^T(K,M), so we compute C^T = B^T * A^T
-    /// then C = (B^T * A^T)^T = A * B
     pub fn sgemm_colmajor(m: usize, n: usize, k: usize,
                           alpha: f32,
                           a: *const f32, lda: usize,
                           b: *const f32, ldb: usize,
                           beta: f32,
                           c: *mut f32, ldc: usize) {
-        // For ColMajor: swap A and B, transpose both
-        unsafe {
-            cblas_sgemm(
-                CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_TRANS,
-                m as u32, n as u32, k as u32,
-                alpha, b, ldb as u32, a, lda as u32, beta, c, ldc as u32,
-            );
+        if let Some(blas) = get_blas() {
+            unsafe {
+                (blas.sgemm)(
+                    CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_TRANS,
+                    m as u32, n as u32, k as u32,
+                    alpha, b, ldb as u32, a, lda as u32, beta, c, ldc as u32,
+                );
+            }
         }
     }
 
-    pub fn is_available() -> bool { true }
+    pub fn is_available() -> bool { get_blas().is_some() }
+}
+
+/// BLAS-dispatched sgemm wrapper with same ABI as cache_tiled_sgemm.
+/// Called from JIT-compiled code: blas_sgemm(A, B, C, M, N, K)
+/// Dispatches to cblas_sgemm for large GEMM (better threaded perf),
+/// falls back to cache-tiled for small/fused ops.
+#[cfg(feature = "blas")]
+pub extern "C" fn blas_sgemm(a: *const f32, b: *const f32, c: *mut f32,
+                               m: usize, n: usize, k: usize) {
+    let total_ops = m * n * k;
+    if total_ops >= 64 * 64 * 64 {
+        blas_ffi::sgemm(m, n, k, 1.0f32, a, k, b, n, 0.0f32, c, n);
+    } else {
+        unsafe {
+            let a_slice = std::slice::from_raw_parts(a, m * k);
+            let b_slice = std::slice::from_raw_parts(b, k * n);
+            let c_slice = std::slice::from_raw_parts_mut(c, m * n);
+            cache_tiled_sgemm(a_slice, b_slice, c_slice, m, n, k);
+        }
+    }
+}
+
+/// BLAS-dispatched dgemm wrapper with same ABI as cache_tiled_dgemm.
+#[cfg(feature = "blas")]
+pub extern "C" fn blas_dgemm(a: *const f64, b: *const f64, c: *mut f64,
+                               m: usize, n: usize, k: usize) {
+    let total_ops = m * n * k;
+    if total_ops >= 64 * 64 * 64 {
+        blas_ffi::dgemm(m, n, k, 1.0f64, a, k, b, n, 0.0f64, c, n);
+    } else {
+        unsafe {
+            let a_slice = std::slice::from_raw_parts(a, m * k);
+            let b_slice = std::slice::from_raw_parts(b, k * n);
+            let c_slice = std::slice::from_raw_parts_mut(c, m * n);
+            cache_tiled_dgemm(a_slice, b_slice, c_slice, m, n, k);
+        }
+    }
 }
 
 #[cfg(not(feature = "blas"))]
-mod blas_ffi {
+pub mod blas_ffi {
     /// Stub when BLAS is not available — returns false from is_available()
     pub fn is_available() -> bool { false }
 }
@@ -12782,10 +12847,8 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     dst, lhs, rhs, m, n, k, element_ty);
 
                 if blas_ffi::is_available() && matches!(element_ty, ScalarType::F32 | ScalarType::F64) {
-                    // BLAS dispatch path — for now use cache-tiled kernel
-                    // (direct CBLAS call from JIT code requires runtime function
-                    // pointer resolution which is complex; the cache-tiled kernel
-                    // calls CBLAS internally when available)
+                    // BLAS dispatch path — use blas_sgemm/blas_dgemm which dispatches
+                    // to cblas_sgemm for large GEMM and cache-tiled for small/fused.
                     let lhs_disp = (*lhs as i32) * 8;
                     let rhs_disp = (*rhs as i32) * 8;
                     let dst_disp = (*dst as i32) * 8;
@@ -12815,11 +12878,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     em.extend_from_slice(&[0x5A]); // POP RDX (C ptr restored)
 
                     // Now: RDI=A, RSI=B, RDX=C, RCX=M, R8=N, R9=K
-                    // Call cache_tiled_sgemm(A, B, C, M, N, K)
+                    // Call blas_sgemm/blas_dgemm(A, B, C, M, N, K) — BLAS dispatch
                     let kernel_fn = if matches!(element_ty, ScalarType::F32) {
-                        cache_tiled_sgemm as *const () as usize
+                        blas_sgemm as *const () as usize
                     } else {
-                        cache_tiled_dgemm as *const () as usize
+                        blas_dgemm as *const () as usize
                     };
                     em.mov_reg_imm(0, kernel_fn as i64); // RAX = function pointer
                     em.extend_from_slice(&[0xFF, 0xD0]); // CALL RAX

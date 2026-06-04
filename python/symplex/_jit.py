@@ -77,7 +77,7 @@ def _serialize_tensor_instrs(trace, allocator, arg_shapes, arg_dtypes):
             # ("tensor_binop", dst, binop_name, lhs, rhs, dtype, shape, strides_lhs, strides_rhs)
             _, dst, binop_name, lhs, rhs, dtype, shape, strides_lhs, strides_rhs = instr
             binop_u8 = BINOP_TO_U8.get(binop_name, 0)
-            ty_u8 = DTYPE_TO_SCALAR.get(dtype, 10)  # default F64
+            ty_u8 = DTYPE_TO_SCALAR.get(dtype, 9)  # default F32
             ndim = len(shape)
             # Format: [0xA0:u8] [dst:u16] [op:u8] [lhs:u16] [rhs:u16] [element_ty:u8] [ndim:u16]
             buf.extend(struct.pack('<BHBHHBH', 0xA0, dst, binop_u8, lhs, rhs, ty_u8, ndim))
@@ -1705,11 +1705,11 @@ def _tier4_dispatch_elementwise(instrs, slots, slots_get, simd_elem_fn):
             # Determine element count from the first input array
             n = 0
             input_ptr_list = []
-            target_dtype = np.float64
+            target_dtype = np.float32
             for (slot, arr) in fused_inputs:
                 if isinstance(arr, np.ndarray) and arr.ndim > 0:
-                    if arr.dtype == np.float32:
-                        target_dtype = np.float32
+                    if arr.dtype == np.float64:
+                        target_dtype = np.float64
                     flat = np.ascontiguousarray(arr, dtype=target_dtype).ravel()
                     if n == 0:
                         n = flat.size
@@ -1964,11 +1964,11 @@ def _tier4_dispatch_fused_elementwise(instrs, slots, slots_get, simd_elem_fn,
         if all_simd and fused_ops:
             n = 0
             input_ptr_list = []
-            target_dtype = np.float64
+            target_dtype = np.float32
             for (slot, arr) in fused_inputs:
                 if isinstance(arr, np.ndarray) and arr.ndim > 0:
-                    if arr.dtype == np.float32:
-                        target_dtype = np.float32
+                    if arr.dtype == np.float64:
+                        target_dtype = np.float64
                     flat = np.ascontiguousarray(arr, dtype=target_dtype).ravel()
                     if n == 0:
                         n = flat.size
@@ -2693,11 +2693,11 @@ class JitFunction:
             else:
                 arg_shapes.append(())
                 if isinstance(a, float):
-                    arg_dtypes.append("float64")
+                    arg_dtypes.append("float32")
                 elif isinstance(a, int):
                     arg_dtypes.append("int64")
                 else:
-                    arg_dtypes.append("float64")
+                    arg_dtypes.append("float32")
 
         # Check if we need to recompile (shape changed)
         shape_key = tuple(arg_shapes)
@@ -2803,7 +2803,13 @@ class JitFunction:
                 for seg_type, seg_data in segments:
                     if seg_type == "matmul":
                         # Matmul instruction: delegate to BLAS at runtime
-                        _, dst, _, lhs, rhs = seg_data
+                        # Both ("binop", dst, "matmul", lhs, rhs) and
+                        # ("tensor_matmul", dst, lhs, rhs, m, n, k, dtype, lhs_layout, rhs_layout)
+                        op = seg_data[0]
+                        if op == "tensor_matmul":
+                            _, dst, lhs, rhs = seg_data[0], seg_data[1], seg_data[2], seg_data[3]
+                        else:
+                            _, dst, _, lhs, rhs = seg_data
                         segment_plan.append(("matmul", dst, lhs, rhs))
 
                     elif seg_type == "elementwise":
@@ -3466,7 +3472,7 @@ class JitFunction:
                     else:
                         # Respect input dtype — don't force f64
                         if isinstance(a, float):
-                            inputs.append(np.asarray(a, dtype=np.float64))
+                            inputs.append(np.asarray(a, dtype=np.float32))
                         elif isinstance(a, int):
                             inputs.append(np.asarray(a, dtype=np.int64))
                         else:
@@ -3602,15 +3608,15 @@ class JitFunction:
         input_arrays = []
         # Detect the predominant dtype from input arrays — respect f32 data
         # instead of forcing everything to f64 (which halves SIMD throughput).
-        target_dtype = np.float64
+        target_dtype = np.float32
         for inp in inputs:
             if isinstance(inp, np.ndarray):
-                if inp.dtype == np.float32:
-                    target_dtype = np.float32
+                if inp.dtype == np.float64:
+                    target_dtype = np.float64
                     break
             elif isinstance(inp, DeviceArray):
-                if inp.dtype == np.float32:
-                    target_dtype = np.float32
+                if inp.dtype == np.float64:
+                    target_dtype = np.float64
                     break
 
         for slot_idx in range(n_params):
@@ -3800,7 +3806,7 @@ def grad(func: Callable, *, target: str = "server", element_type: str = "fp32") 
                 arg_dtypes.append(str(a.dtype))
             else:
                 arg_shapes.append(())
-                arg_dtypes.append("float64")
+                arg_dtypes.append("float32")
 
         trace, allocator = trace_function(func, arg_shapes, arg_dtypes)
 

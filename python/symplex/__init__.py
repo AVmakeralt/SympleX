@@ -315,32 +315,32 @@ def transpose(x, axes=None):
     return np.transpose(x, axes)
 
 
-def zeros(shape, dtype=np.float64):
+def zeros(shape, dtype=np.float32):
     """Create array of zeros."""
     return DeviceArray(np.zeros(shape, dtype=dtype))
 
 
-def ones(shape, dtype=np.float64):
+def ones(shape, dtype=np.float32):
     """Create array of ones."""
     return DeviceArray(np.ones(shape, dtype=dtype))
 
 
-def array(data, dtype=np.float64):
+def array(data, dtype=np.float32):
     """Create a DeviceArray from data."""
     return DeviceArray(np.array(data, dtype=dtype))
 
 
-def arange(start, stop=None, step=1, dtype=np.float64):
+def arange(start, stop=None, step=1, dtype=np.float32):
     """Create an array with evenly spaced values."""
     return DeviceArray(np.arange(start, stop, step, dtype=dtype))
 
 
-def linspace(start, stop, num=50, dtype=np.float64):
+def linspace(start, stop, num=50, dtype=np.float32):
     """Create an array with evenly spaced values over interval."""
     return DeviceArray(np.linspace(start, stop, num, dtype=dtype))
 
 
-def eye(n, m=None, k=0, dtype=np.float64):
+def eye(n, m=None, k=0, dtype=np.float32):
     """Create an identity matrix."""
     return DeviceArray(np.eye(n, m, k, dtype=dtype))
 
@@ -421,7 +421,7 @@ class lax:
             def __init__(self, state):
                 self.state = state
 
-            def __call__(self, shape, dtype=np.float64):
+            def __call__(self, shape, dtype=np.float32):
                 """Generate random uniform values in [0, 1)."""
                 n = 1
                 for s in shape:
@@ -432,7 +432,7 @@ class lax:
                     result[i] = dtype(self.state / 0x7FFFFFFF)
                 return DeviceArray(result.reshape(shape))
 
-            def normal(self, shape, dtype=np.float64):
+            def normal(self, shape, dtype=np.float32):
                 """Generate random normal values (Box-Muller)."""
                 u1 = self(shape, dtype).to_numpy()
                 u2 = self(shape, dtype).to_numpy()
@@ -446,7 +446,7 @@ class lax:
 # ── Module-level info ────────────────────────────────────────────────────────
 
 def __version__():
-    return "1.4.3"
+    return "1.5.0"
 
 
 def is_rust_engine_available():

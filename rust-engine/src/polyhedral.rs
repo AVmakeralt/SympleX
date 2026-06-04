@@ -2865,7 +2865,7 @@ pub fn apply_cache_padding(block: &mut PolyhedralBlock) -> usize {
         let element_size = match tile.element_type {
             Some(ref ty) if ty == "f64" => 8,
             Some(ref ty) if ty == "f32" => 4,
-            _ => 8, // default to f64
+            _ => 4, // default to f32
         };
 
         if let Some(padded_cols) = recommend_cache_padding(tile.rows, tile.cols, element_size) {
@@ -3524,7 +3524,7 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
             rows: 32,
             cols: 32,
             stride: 32,
-            element_type: Some("f64".to_string()),
+            element_type: Some("f32".to_string()),
         });
     }
 

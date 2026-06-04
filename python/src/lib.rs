@@ -1022,16 +1022,26 @@ fn parallel_matmul(a_ptr: usize, b_ptr: usize, c_ptr: usize, m: i64, n: i64, k: 
     0
 }
 
-/// JIT-compiled parallel matmul — uses AVX-512 multi-stream kernel when available.
+/// JIT-compiled parallel matmul — uses BLAS when available, AVX-512 multi-stream kernel as fallback.
 #[pyfunction]
 #[pyo3(signature = (a_ptr, b_ptr, c_ptr, m, n, k))]
 fn jit_parallel_matmul(a_ptr: usize, b_ptr: usize, c_ptr: usize, m: i64, n: i64, k: i64) -> i64 {
     if m == 0 || n == 0 || k == 0 { return 0; }
+    let m = m as usize;
+    let n = n as usize;
+    let k = k as usize;
     unsafe {
-        let a = std::slice::from_raw_parts(a_ptr as *const f32, (m * k) as usize);
-        let b = std::slice::from_raw_parts(b_ptr as *const f32, (k * n) as usize);
-        let c = std::slice::from_raw_parts_mut(c_ptr as *mut f32, (m * n) as usize);
-        x86_emitter::jit_parallel_matmul(a, b, c, m as usize, n as usize, k as usize);
+        let a = std::slice::from_raw_parts(a_ptr as *const f32, m * k);
+        let b = std::slice::from_raw_parts(b_ptr as *const f32, k * n);
+        let c = std::slice::from_raw_parts_mut(c_ptr as *mut f32, m * n);
+        if p3::blas_ffi::is_available() {
+            #[cfg(feature = "blas")]
+            {
+                p3::blas_sgemm(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), m, n, k);
+                return 0;
+            }
+        }
+        x86_emitter::jit_parallel_matmul(a, b, c, m, n, k);
     }
     0
 }
