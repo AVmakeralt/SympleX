@@ -630,6 +630,38 @@ pub fn cache_tiled_dgemm(
     }
 }
 
+/// Thin-pointer wrapper for cache_tiled_sgemm, matching the ABI of blas_sgemm.
+/// The JIT calls this via `CALL RAX` with thin pointers in RDI, RSI, RDX
+/// and M, N, K in RCX, R8, R9.
+///
+/// Safety: The caller must ensure that A has at least m*k valid f32 elements,
+/// B has at least k*n, and C has at least m*n.
+#[no_mangle]
+pub unsafe extern "C" fn cache_tiled_sgemm_thin(
+    a: *const f32, b: *const f32, c: *mut f32,
+    m: usize, n: usize, k: usize,
+) {
+    let a_slice = std::slice::from_raw_parts(a, m * k);
+    let b_slice = std::slice::from_raw_parts(b, k * n);
+    let c_slice = std::slice::from_raw_parts_mut(c, m * n);
+    cache_tiled_sgemm(a_slice, b_slice, c_slice, m, n, k);
+}
+
+/// Thin-pointer wrapper for cache_tiled_dgemm, matching the ABI of blas_dgemm.
+///
+/// Safety: The caller must ensure that A has at least m*k valid f64 elements,
+/// B has at least k*n, and C has at least m*n.
+#[no_mangle]
+pub unsafe extern "C" fn cache_tiled_dgemm_thin(
+    a: *const f64, b: *const f64, c: *mut f64,
+    m: usize, n: usize, k: usize,
+) {
+    let a_slice = std::slice::from_raw_parts(a, m * k);
+    let b_slice = std::slice::from_raw_parts(b, k * n);
+    let c_slice = std::slice::from_raw_parts_mut(c, m * n);
+    cache_tiled_dgemm(a_slice, b_slice, c_slice, m, n, k);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SSA IR type definitions (ported from Jules compiler::ir)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4146,6 +4178,10 @@ fn compute_live_intervals(instrs: &[Instr], slot_count: usize) -> Vec<LiveInterv
                 use_!(*s, pc);
                 def!(*d, pc);
             }
+            Instr::Reduce(d, _, s) => {
+                use_!(*s, pc);
+                def!(*d, pc);
+            }
             Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) | Instr::Return(s) => {
                 use_!(*s, pc);
             }
@@ -4276,6 +4312,11 @@ fn compute_float_slots(instrs: &[Instr], slot_count: usize) -> Vec<bool> {
                 }
             }
             Instr::UnOp(d, _, s) => {
+                ensure!(*d);
+                ensure!(*s);
+                tys[*d as usize] = tys[*s as usize];
+            }
+            Instr::Reduce(d, _, s) => {
                 ensure!(*d);
                 ensure!(*s);
                 tys[*d as usize] = tys[*s as usize];
@@ -5527,6 +5568,10 @@ fn coalesce_registers(instrs: &[Instr], ra: &mut RegAlloc) -> Vec<bool> {
                 let s = *s as usize;
                 if s < max_slot { last_use[s] = last_use[s].max(pc); }
             }
+            Instr::Reduce(_, _, s) => {
+                let s = *s as usize;
+                if s < max_slot { last_use[s] = last_use[s].max(pc); }
+            }
             Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) => {
                 let s = *s as usize;
                 if s < max_slot { last_use[s] = last_use[s].max(pc); }
@@ -5559,6 +5604,12 @@ fn coalesce_registers(instrs: &[Instr], ra: &mut RegAlloc) -> Vec<bool> {
                 }
             }
             Instr::UnOp(d, _, _) => {
+                let d = *d as usize;
+                if d < max_slot && first_def[d] == UNDEF {
+                    first_def[d] = pc;
+                }
+            }
+            Instr::Reduce(d, _, _) => {
                 let d = *d as usize;
                 if d < max_slot && first_def[d] == UNDEF {
                     first_def[d] = pc;
@@ -6456,7 +6507,7 @@ impl SoftwarePipeline {
         for i in loop_start..loop_end {
             match &instrs[i] {
                 Instr::Load(_, _) | Instr::LoadF32(_, _) | Instr::LoadF64(_, _) => load_count += 1,
-                Instr::BinOp(_, _, _, _) | Instr::UnOp(_, _, _) => compute_count += 1,
+                Instr::BinOp(_, _, _, _) | Instr::UnOp(_, _, _) | Instr::Reduce(_, _, _) => compute_count += 1,
                 _ => {}
             }
         }
@@ -8856,6 +8907,7 @@ fn instr_operand_slots(instr: &Instr) -> Vec<u16> {
         Instr::Move(_, s) | Instr::Load(_, s) => vec![*s],
         Instr::Store(_, s) => vec![*s],
         Instr::UnOp(_, _, s) => vec![*s],
+        Instr::Reduce(_, _, s) => vec![*s],
         Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) => vec![*s],
         Instr::Return(s) => vec![*s],
         // LoadI* have no operand slots — they produce constants
@@ -9935,6 +9987,9 @@ fn global_dce(instrs: &mut Vec<Instr>) {
                 Instr::UnOp(_, _, s) => {
                     used.insert(*s);
                 }
+                Instr::Reduce(_, _, s) => {
+                    used.insert(*s);
+                }
                 Instr::JumpFalse(s, _) => {
                     used.insert(*s);
                 }
@@ -9966,6 +10021,7 @@ fn global_dce(instrs: &mut Vec<Instr>) {
                 Instr::Store(d, _) => (Some(*d), true),
                 Instr::BinOp(d, _, _, _) => (Some(*d), true),
                 Instr::UnOp(d, _, _) => (Some(*d), true),
+                Instr::Reduce(d, _, _) => (Some(*d), true),
                 // Everything else is either side-effecting or doesn't write a slot
                 _ => (None, false),
             };
@@ -10152,6 +10208,7 @@ fn instruction_cost(instr: &Instr) -> u32 {
         Instr::LoadF32(_, _) | Instr::LoadF64(_, _) => 2,
         Instr::Move(_, _) | Instr::Load(_, _) | Instr::Store(_, _) => 1,
         Instr::UnOp(_, _, _) => 1,
+        Instr::Reduce(_, _, _) => 1,
         Instr::JumpFalse(_, _) | Instr::JumpTrue(_, _) => 2,
         Instr::Call(_, _, _, _) | Instr::CallBuiltin(_, _, _, _) | Instr::CallMethod(_, _, _, _, _) => 20,
         _ => 1,
@@ -10214,6 +10271,7 @@ fn can_inline(callee: &CompiledFn, caller_name: &str) -> bool {
             | Instr::Store(..)
             | Instr::BinOp(..)
             | Instr::UnOp(..)
+            | Instr::Reduce(..)
             | Instr::Jump(..)
             | Instr::JumpFalse(..)
             | Instr::JumpTrue(..)
@@ -10263,6 +10321,7 @@ fn max_slot_in_instrs(instrs: &[Instr]) -> u16 {
             Instr::Store(slot, s) => { max_slot = max_slot.max(*slot).max(*s); }
             Instr::BinOp(d, _, l, r) => { max_slot = max_slot.max(*d).max(*l).max(*r); }
             Instr::UnOp(d, _, s) => { max_slot = max_slot.max(*d).max(*s); }
+            Instr::Reduce(d, _, s) => { max_slot = max_slot.max(*d).max(*s); }
             Instr::PowOp(d, b, e) | Instr::MatMulInstr(d, b, e) => { max_slot = max_slot.max(*d).max(*b).max(*e); }
             Instr::TensorBinOp { dst, lhs, rhs, .. } => { max_slot = max_slot.max(*dst).max(*lhs).max(*rhs); }
             Instr::TensorReduce { dst, src, .. } => { max_slot = max_slot.max(*dst).max(*src); }
@@ -10305,6 +10364,7 @@ fn remap_slots(instr: &Instr, offset: u16) -> Instr {
         Instr::Store(d, s) => Instr::Store(d + offset, s + offset),
         Instr::BinOp(d, op, l, r) => Instr::BinOp(d + offset, op, l + offset, r + offset),
         Instr::UnOp(d, op, s) => Instr::UnOp(d + offset, op, s + offset),
+        Instr::Reduce(d, op, s) => Instr::Reduce(d + offset, op, s + offset),
         Instr::Jump(off) => Instr::Jump(off),
         Instr::JumpFalse(s, off) => Instr::JumpFalse(s + offset, off),
         Instr::JumpTrue(s, off) => Instr::JumpTrue(s + offset, off),
@@ -10337,6 +10397,7 @@ pub fn compile_ops(name: &str, ops: &[Instr]) -> Option<CompiledFn> {
             Instr::Store(slot, s) => { max_slot = max_slot.max(*slot).max(*s); }
             Instr::BinOp(d, _, l, r) => { max_slot = max_slot.max(*d).max(*l).max(*r); }
             Instr::UnOp(d, _, s) => { max_slot = max_slot.max(*d).max(*s); }
+            Instr::Reduce(d, _, s) => { max_slot = max_slot.max(*d).max(*s); }
             Instr::PowOp(d, b, e) | Instr::MatMulInstr(d, b, e) => { max_slot = max_slot.max(*d).max(*b).max(*e); }
             Instr::TensorBinOp { dst, lhs, rhs, .. } => { max_slot = max_slot.max(*dst).max(*lhs).max(*rhs); }
             Instr::TensorReduce { dst, src, .. } => { max_slot = max_slot.max(*dst).max(*src); }
@@ -10402,6 +10463,12 @@ pub fn phase3_flat_ir_from_instrs(name: &str, instrs: &[Instr]) -> FlatIrFunctio
                 slot_to_vid.insert(*d, vid);
                 Some(vid)
             }
+            Instr::Reduce(d, _, _) => {
+                let vid = ValueId(next_value);
+                next_value += 1;
+                slot_to_vid.insert(*d, vid);
+                Some(vid)
+            }
             Instr::Move(d, _) | Instr::Load(d, _) => {
                 let vid = ValueId(next_value);
                 next_value += 1;
@@ -10458,6 +10525,7 @@ pub fn phase3_flat_ir_from_instrs(name: &str, instrs: &[Instr]) -> FlatIrFunctio
             Instr::Move(d, s) | Instr::Load(d, s) => acc.max(*d).max(*s),
             Instr::BinOp(d, _, l, r) => acc.max(*d).max(*l).max(*r),
             Instr::UnOp(d, _, s) => acc.max(*d).max(*s),
+            Instr::Reduce(d, _, s) => acc.max(*d).max(*s),
             Instr::Return(s) | Instr::JumpFalse(s, _) | Instr::JumpTrue(s, _) => acc.max(*s),
             _ => acc,
         }
@@ -10541,6 +10609,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
             | Instr::Store(..)
             | Instr::BinOp(..)
             | Instr::UnOp(..)
+            | Instr::Reduce(..)
             | Instr::Jump(..)
             | Instr::JumpFalse(..)
             | Instr::JumpTrue(..)
@@ -12623,6 +12692,22 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 }
             }
 
+            Instr::Reduce(dst, _op, src) => {
+                // Scalar reduction: a single value is already reduced.
+                // Just copy src → dst (effectively a Move).
+                // For tensor reduction, use TensorReduce which has shape info.
+                load_rax(&mut em, *src, &ra);
+                if !is_straight_line_dead_def(instrs, pc, *dst) {
+                    store_rax(&mut em, *dst, &ra);
+                }
+                if let Some(c) = const_at.get(*src) {
+                    const_at.insert(*dst, c);
+                } else {
+                    const_at.remove(*dst);
+                }
+                type_at.set(*dst, type_at.get(*src));
+            }
+
             Instr::Return(r) => {
                 load_rax(&mut em, *r, &ra);
                 // Superpower U: When custom calling convention is enabled,
@@ -12857,23 +12942,23 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                     em.extend_from_slice(&[0x49, 0x89, 0xFF]); // MOV R15, RDI
 
                     // Load A ptr: MOV RDI, [R15 + lhs_disp]
-                    em.extend_from_slice(&[0x49, 0x8B, 0x7F]);
+                    em.extend_from_slice(&[0x49, 0x8B, 0xBF]);
                     em.extend_from_slice(&lhs_disp.to_le_bytes());
 
                     // Load B ptr: MOV RSI, [R15 + rhs_disp]
-                    em.extend_from_slice(&[0x49, 0x8B, 0x77]);
+                    em.extend_from_slice(&[0x49, 0x8B, 0xB7]);
                     em.extend_from_slice(&rhs_disp.to_le_bytes());
 
                     // Load C ptr: MOV RDX, [R15 + dst_disp]
-                    em.extend_from_slice(&[0x49, 0x8B, 0x57]);
+                    em.extend_from_slice(&[0x49, 0x8B, 0x97]);
                     em.extend_from_slice(&dst_disp.to_le_bytes());
 
                     // Push C ptr, load M/N/K, then pop
                     em.extend_from_slice(&[0x52]); // PUSH RDX (C ptr)
 
-                    em.mov_reg_imm(2, *n as i64); // RDX = N
                     em.mov_reg_imm(1, *m as i64); // RCX = M
-                    em.mov_reg_imm(8, *k as i64); // R8 = K
+                    em.mov_reg_imm(8, *n as i64); // R8 = N
+                    em.mov_reg_imm(9, *k as i64); // R9 = K
 
                     em.extend_from_slice(&[0x5A]); // POP RDX (C ptr restored)
 
@@ -12897,27 +12982,28 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
                     em.extend_from_slice(&[0x49, 0x89, 0xFF]); // MOV R15, RDI
 
-                    em.extend_from_slice(&[0x49, 0x8B, 0x7F]);
+                    em.extend_from_slice(&[0x49, 0x8B, 0xBF]);
                     em.extend_from_slice(&lhs_disp.to_le_bytes());
 
-                    em.extend_from_slice(&[0x49, 0x8B, 0x77]);
+                    em.extend_from_slice(&[0x49, 0x8B, 0xB7]);
                     em.extend_from_slice(&rhs_disp.to_le_bytes());
 
-                    em.extend_from_slice(&[0x49, 0x8B, 0x57]);
+                    em.extend_from_slice(&[0x49, 0x8B, 0x97]);
                     em.extend_from_slice(&dst_disp.to_le_bytes());
 
                     em.extend_from_slice(&[0x52]); // PUSH RDX
 
-                    em.mov_reg_imm(2, *n as i64);
-                    em.mov_reg_imm(1, *m as i64);
-                    em.mov_reg_imm(8, *k as i64);
+                    em.mov_reg_imm(1, *m as i64); // RCX = M
+                    em.mov_reg_imm(8, *n as i64); // R8 = N
+                    em.mov_reg_imm(9, *k as i64); // R9 = K
 
                     em.extend_from_slice(&[0x5A]); // POP RDX
 
+                    // Now: RDI=A, RSI=B, RDX=C, RCX=M, R8=N, R9=K
                     let kernel_fn = if matches!(element_ty, ScalarType::F32) {
-                        cache_tiled_sgemm as *const () as usize
+                        cache_tiled_sgemm_thin as *const () as usize
                     } else {
-                        cache_tiled_dgemm as *const () as usize
+                        cache_tiled_dgemm_thin as *const () as usize
                     };
                     em.mov_reg_imm(0, kernel_fn as i64);
                     em.extend_from_slice(&[0xFF, 0xD0]); // CALL RAX
@@ -12960,13 +13046,13 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 em.extend_from_slice(&[0x49, 0x89, 0xFF]); // MOV R15, RDI
 
                 // Load A ptr
-                em.extend_from_slice(&[0x49, 0x8B, 0x7F]);
+                em.extend_from_slice(&[0x49, 0x8B, 0xBF]);
                 em.extend_from_slice(&lhs_disp.to_le_bytes());
                 // Load B ptr
-                em.extend_from_slice(&[0x49, 0x8B, 0x77]);
+                em.extend_from_slice(&[0x49, 0x8B, 0xB7]);
                 em.extend_from_slice(&rhs_disp.to_le_bytes());
                 // Load C ptr
-                em.extend_from_slice(&[0x49, 0x8B, 0x57]);
+                em.extend_from_slice(&[0x49, 0x8B, 0x97]);
                 em.extend_from_slice(&dst_disp.to_le_bytes());
 
                 // RCX = loop counter = total_elements
@@ -13054,7 +13140,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 em.extend_from_slice(&[0x49, 0x89, 0xFF]); // MOV R15, RDI
 
                 // Load src ptr
-                em.extend_from_slice(&[0x49, 0x8B, 0x7F]);
+                em.extend_from_slice(&[0x49, 0x8B, 0xBF]);
                 em.extend_from_slice(&src_disp.to_le_bytes());
 
                 // Initialize accumulator
@@ -13097,16 +13183,16 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
                 // INC R8
                 em.extend_from_slice(&[0x49, 0xFF, 0xC0]);
-                // CMP R8, RCX
+                // CMP RCX, R8 (sets flags for RCX - R8)
                 em.extend_from_slice(&[0x4C, 0x39, 0xC1]);
-                // JL loop_start
+                // JG loop_start (continue while RCX > R8, i.e. R8 < reduce_len)
                 let current_pos = em.pos();
                 let back_offset = loop_start as i32 - (current_pos as i32 + 2);
                 if back_offset >= -128 {
-                    em.b(0x7C); // JL rel8
+                    em.b(0x7F); // JG rel8
                     em.b(back_offset as u8);
                 } else {
-                    em.extend_from_slice(&[0x0F, 0x8C]); // JL rel32
+                    em.extend_from_slice(&[0x0F, 0x8F]); // JG rel32
                     em.extend_from_slice(&(back_offset - 4).to_le_bytes());
                 }
 
@@ -13127,7 +13213,7 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
 
                 // Store result to dst slot
                 // Load dst ptr
-                em.extend_from_slice(&[0x49, 0x8B, 0x57]);
+                em.extend_from_slice(&[0x49, 0x8B, 0x97]);
                 em.extend_from_slice(&dst_disp.to_le_bytes());
                 if matches!(element_ty, ScalarType::F32) {
                     em.extend_from_slice(&[0xF3, 0x0F, 0x11, 0x02]); // MOVSS [RDX], XMM0
@@ -13688,6 +13774,7 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
             match instr {
                 Instr::BinOp(_, _, l, r) => { used.insert(*l); used.insert(*r); }
                 Instr::UnOp(_, _, s) => { used.insert(*s); }
+                Instr::Reduce(_, _, s) => { used.insert(*s); }
                 Instr::Move(_, s) => { used.insert(*s); }
                 Instr::Load(_, s) => { used.insert(*s); }
                 Instr::Store(_, s) => { used.insert(*s); }
@@ -17121,6 +17208,7 @@ impl StencilCompiler {
                 Instr::Store(_, _) => 0x04,
                 Instr::UnOp(_, UnOpKind::Neg, _) => 0x05,
                 Instr::UnOp(_, UnOpKind::Not, _) => 0x06,
+                Instr::Reduce(_, _, _) => 0x07,
                 Instr::BinOp(_, BinOpKind::Add, _, _) => 0x10,
                 Instr::BinOp(_, BinOpKind::Sub, _, _) => 0x11,
                 Instr::BinOp(_, BinOpKind::Mul, _, _) => 0x12,
@@ -17294,6 +17382,9 @@ impl StencilCompiler {
             Instr::UnOp(dst, _, src) => {
                 if slot_idx == 0 { (*src as usize) * 8 } else { (*dst as usize) * 8 }
             }
+            Instr::Reduce(dst, _, src) => {
+                if slot_idx == 0 { (*src as usize) * 8 } else { (*dst as usize) * 8 }
+            }
             Instr::Return(slot) => (*slot as usize) * 8,
             Instr::JumpFalse(slot, _) | Instr::JumpTrue(slot, _) => (*slot as usize) * 8,
             _ => 0,
@@ -17359,6 +17450,7 @@ impl StencilCompiler {
                 Instr::Store(_, _) => 0x04,
                 Instr::UnOp(_, UnOpKind::Neg, _) => 0x05,
                 Instr::UnOp(_, UnOpKind::Not, _) => 0x06,
+                Instr::Reduce(_, _, _) => 0x07,
                 Instr::BinOp(_, BinOpKind::Add, _, _) => 0x10,
                 Instr::BinOp(_, BinOpKind::Sub, _, _) => 0x11,
                 Instr::BinOp(_, BinOpKind::Mul, _, _) => 0x12,

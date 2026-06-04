@@ -1591,26 +1591,30 @@ unsafe fn micro_kernel_6x16(
         }
     }
 
-    // Store accumulators to C with stride ldc
+    // Store accumulators to C with stride ldc — ADD to existing C values
+    // (not overwrite!) so that multiple k-blocks accumulate correctly.
     for row in 0..mr {
         let c_row = c.add(row * ldc);
         if nr >= 16 {
-            _mm256_storeu_ps(c_row, acc[row * 2]);
-            _mm256_storeu_ps(c_row.add(8), acc[row * 2 + 1]);
+            let c0 = _mm256_loadu_ps(c_row);
+            let c1 = _mm256_loadu_ps(c_row.add(8));
+            _mm256_storeu_ps(c_row, _mm256_add_ps(c0, acc[row * 2]));
+            _mm256_storeu_ps(c_row.add(8), _mm256_add_ps(c1, acc[row * 2 + 1]));
         } else if nr >= 8 {
-            _mm256_storeu_ps(c_row, acc[row * 2]);
+            let c0 = _mm256_loadu_ps(c_row);
+            _mm256_storeu_ps(c_row, _mm256_add_ps(c0, acc[row * 2]));
             if nr > 8 {
-                // Partial second YMM: extract and store only the valid elements
+                // Partial second YMM: add only the valid elements
                 let acc1_arr: [f32; 8] = std::mem::transmute(acc[row * 2 + 1]);
                 for j in 8..nr {
-                    *c_row.add(j) = acc1_arr[j - 8];
+                    *c_row.add(j) += acc1_arr[j - 8];
                 }
             }
         } else {
-            // nr < 8: store element by element from first YMM
+            // nr < 8: add element by element from first YMM
             let acc0_arr: [f32; 8] = std::mem::transmute(acc[row * 2]);
             for j in 0..nr {
-                *c_row.add(j) = acc0_arr[j];
+                *c_row.add(j) += acc0_arr[j];
             }
         }
     }

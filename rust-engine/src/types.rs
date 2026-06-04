@@ -311,6 +311,9 @@ pub enum Instr {
     // ── Unary operations ───────────────────────────────────────────────
     UnOp(u16, UnOpKind, u16),
 
+    // ── Scalar reduction (no shape/axis — reduces all elements) ──────
+    Reduce(u16, ReduceOp, u16),
+
     // ── Data movement ──────────────────────────────────────────────────
     Move(u16, u16),
     Store(u16, u16),
@@ -460,6 +463,12 @@ pub fn serialize_instr(instr: &Instr) -> Vec<u8> {
         }
         Instr::UnOp(dst, op, src) => {
             buf.push(0x11);
+            buf.extend_from_slice(&dst.to_le_bytes());
+            buf.push(*op as u8);
+            buf.extend_from_slice(&src.to_le_bytes());
+        }
+        Instr::Reduce(dst, op, src) => {
+            buf.push(0x12);
             buf.extend_from_slice(&dst.to_le_bytes());
             buf.push(*op as u8);
             buf.extend_from_slice(&src.to_le_bytes());
@@ -669,6 +678,12 @@ pub fn deserialize_instr(data: &[u8]) -> Option<(Instr, usize)> {
             let op = UnOpKind::from_u8(data[3])?;
             let src = u16::from_le_bytes([data[4], data[5]]);
             Some((Instr::UnOp(dst, op, src), 6))
+        }
+        0x12 if data.len() >= 6 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let op = ReduceOp::from_u8(data[3])?;
+            let src = u16::from_le_bytes([data[4], data[5]]);
+            Some((Instr::Reduce(dst, op, src), 6))
         }
         0x20 if data.len() >= 5 => {
             let dst = u16::from_le_bytes([data[1], data[2]]);

@@ -147,7 +147,7 @@ def _serialize_tensor_instrs(trace, allocator, arg_shapes, arg_dtypes):
         elif op == "reduce":
             _, dst, reduce_name, src = instr
             red_u8 = REDUCE_TO_U8.get(reduce_name, 0)
-            buf.extend(struct.pack('<BHBH', 0xA1, dst, red_u8, src))
+            buf.extend(struct.pack('<BHBH', 0x12, dst, red_u8, src))
     
     return bytes(buf)
 
