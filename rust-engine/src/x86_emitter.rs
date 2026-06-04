@@ -1466,9 +1466,293 @@ pub fn simd_reduce_f64(op: u8, data_ptr: usize, n: usize) -> f64 {
     }
 }
 
+// ── BLIS-Style Cache-Blocked Matmul ──────────────────────────────────────
+//
+// Implements a 5-loop BLIS-style algorithm with:
+//   - AVX2 6×16 micro-kernel (12 YMM accumulators, 12 FMAs per k-step)
+//   - B-matrix packing (contiguous access in micro-kernel, eliminates stride)
+//   - A-matrix packing (column-major micro-panels for sequential broadcast)
+//   - L1/L2/L3 cache blocking (MC=64, NC=64, KC=256)
+//   - Rayon parallelism on the outermost (i2) loop
+//
+// Packed layouts (critical for micro-kernel performance):
+//   A micro-panel [MR rows × kc cols]: column-major within panel
+//     Layout: a[0,0] a[1,0] ... a[MR-1,0] a[0,1] a[1,1] ... a[MR-1,kc-1]
+//     Stride between k-steps = MR  (micro-kernel does a_ptr += MR)
+//
+//   B micro-panel [kc rows × NR cols]: row-major within panel, padded to NR
+//     Layout: b[0,0] b[0,1] ... b[0,NR-1] b[1,0] ... b[kc-1,NR-1]
+//     Stride between k-steps = NR  (micro-kernel does b_ptr += NR)
+
+/// Micro-kernel row dimension (6 rows accumulated in YMM registers)
+const BLIS_MR: usize = 6;
+/// Micro-kernel column dimension (2 YMMs wide = 16 f32)
+const BLIS_NR: usize = 16;
+/// L2 cache block: rows of A
+const BLIS_MC: usize = 128;
+/// L2 cache block: cols of B
+const BLIS_NC: usize = 128;
+/// L2 cache block: shared dimension
+const BLIS_KC: usize = 128;
+
+/// AVX2 micro-kernel for MR×NR rank-1 update.
+///
+/// Accumulates into C[i:i+mr, j:j+nr] += A_panel * B_panel
+/// using 12 YMM accumulators (6 rows × 2 YMM columns = 12 YMMs).
+///
+/// A_packed layout (column-major within panel):
+///   For each k step k, BLIS_MR consecutive values starting at a_packed + k*BLIS_MR:
+///   a[0,k], a[1,k], ..., a[BLIS_MR-1,k]
+///
+/// B_packed layout (row-major within panel, b_stride between k-rows):
+///   For each k step k, BLIS_NR consecutive values starting at b_packed + k*b_stride:
+///   b[k,0], b[k,1], ..., b[k,BLIS_NR-1]
+///   b_stride must be >= BLIS_NR (padded so loads are always valid).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn micro_kernel_6x16(
+    a_packed: *const f32,
+    b_packed: *const f32,
+    b_stride: usize, // stride between k-rows in packed B
+    c: *mut f32,
+    ldc: usize,
+    kc: usize,
+    mr: usize, // actual mr (may be < BLIS_MR at edges)
+    nr: usize, // actual nr (may be < BLIS_NR at edges)
+) {
+    use std::arch::x86_64::*;
+
+    // 12 YMM accumulators: acc[row][col_block]
+    // row 0: acc[0], acc[1]    row 1: acc[2], acc[3]    row 2: acc[4], acc[5]
+    // row 3: acc[6], acc[7]    row 4: acc[8], acc[9]    row 5: acc[10], acc[11]
+    let mut acc = [_mm256_setzero_ps(); 12];
+
+    for p in 0..kc {
+        // Load 2 YMM from B row p (16 f32 contiguous, padded so loads are always valid)
+        let b_row = b_packed.add(p * b_stride);
+        let b0 = _mm256_loadu_ps(b_row);
+        let b1 = _mm256_loadu_ps(b_row.add(8));
+
+        // Broadcast each A row value and do 12 FMAs
+        // A is stored column-major: a_packed + p*BLIS_MR has all MR row values for this k
+        let a_row = a_packed.add(p * BLIS_MR);
+        for row in 0..BLIS_MR {
+            let a_val = _mm256_broadcast_ss(&*a_row.add(row));
+            acc[row * 2] = _mm256_fmadd_ps(a_val, b0, acc[row * 2]);
+            acc[row * 2 + 1] = _mm256_fmadd_ps(a_val, b1, acc[row * 2 + 1]);
+        }
+    }
+
+    // Store accumulators to C with stride ldc
+    for row in 0..mr {
+        let c_row = c.add(row * ldc);
+        if nr >= 16 {
+            _mm256_storeu_ps(c_row, acc[row * 2]);
+            _mm256_storeu_ps(c_row.add(8), acc[row * 2 + 1]);
+        } else if nr >= 8 {
+            _mm256_storeu_ps(c_row, acc[row * 2]);
+            if nr > 8 {
+                // Partial second YMM: extract and store only the valid elements
+                let acc1_arr: [f32; 8] = std::mem::transmute(acc[row * 2 + 1]);
+                for j in 8..nr {
+                    *c_row.add(j) = acc1_arr[j - 8];
+                }
+            }
+        } else {
+            // nr < 8: store element by element from first YMM
+            let acc0_arr: [f32; 8] = std::mem::transmute(acc[row * 2]);
+            for j in 0..nr {
+                *c_row.add(j) = acc0_arr[j];
+            }
+        }
+    }
+}
+
+/// Core BLIS-style blocked matmul body (shared between serial and parallel).
+/// Processes a single MC-row block starting at row i2.
+/// Uses raw pointers for C to allow sharing across rayon threads safely.
+fn blis_process_block(
+    a: &[f32],
+    b: &[f32],
+    c_ptr: *mut f32,
+    _m: usize,
+    n: usize,
+    k_dim: usize,  // renamed from `k` to avoid conflict with iced-x86's k2 register
+    i2: usize,
+    mc: usize,
+    packed_b: &mut [f32],
+    packed_a: &mut [f32],
+) {
+    let has_avx2 = is_x86_feature_detected!("avx2");
+
+    // packed_b layout: [kc][BLIS_NC] with stride BLIS_NC (>= BLIS_NR, multiple of BLIS_NR)
+    // BLIS_NC = 64 which is a multiple of BLIS_NR = 16, so loads at j1 offsets are safe
+    let b_stride = BLIS_NC;
+
+    for j2 in (0..n).step_by(BLIS_NC) {
+        let nc = std::cmp::min(BLIS_NC, n - j2);
+
+        for kk2 in (0..k_dim).step_by(BLIS_KC) {
+            let kc = std::cmp::min(BLIS_KC, k_dim - kk2);
+
+            // Pack B[kk2:kk2+kc, j2:j2+nc] with stride b_stride = BLIS_NC
+            // Layout: [kc][BLIS_NC] row-major, zero-padded beyond nc
+            for p in 0..kc {
+                let k_idx = kk2 + p;
+                let row_start = p * b_stride;
+                // Copy actual data
+                for jj in 0..nc {
+                    packed_b[row_start + jj] = b[k_idx * n + j2 + jj];
+                }
+                // Zero-pad remainder (only if nc < BLIS_NC)
+                if nc < BLIS_NC {
+                    for jj in nc..BLIS_NC {
+                        packed_b[row_start + jj] = 0.0f32;
+                    }
+                }
+            }
+
+            // Pack A[i2:i2+mc, kk2:kk2+kc] in column-major order within micro-panels
+            // Layout within micro-panel (at offset i1*kc in packed_a):
+            //   for each k step p: BLIS_MR consecutive values
+            //   packed_a[i1*kc + p*BLIS_MR + row] = A[i2+i1+row, kk2+p]
+            for i1 in (0..mc).step_by(BLIS_MR) {
+                let mr = std::cmp::min(BLIS_MR, mc - i1);
+                let panel_base = i1 * kc;
+                for p in 0..kc {
+                    let col_start = panel_base + p * BLIS_MR;
+                    // Copy actual rows
+                    for row in 0..mr {
+                        let i_idx = i2 + i1 + row;
+                        packed_a[col_start + row] = a[i_idx * k_dim + kk2 + p];
+                    }
+                    // Zero-pad remainder (only if mr < BLIS_MR)
+                    if mr < BLIS_MR {
+                        for row in mr..BLIS_MR {
+                            packed_a[col_start + row] = 0.0f32;
+                        }
+                    }
+                }
+            }
+
+            // Micro-kernel loops
+            for i1 in (0..mc).step_by(BLIS_MR) {
+                let mr = std::cmp::min(BLIS_MR, mc - i1);
+
+                for j1 in (0..nc).step_by(BLIS_NR) {
+                    let nr = std::cmp::min(BLIS_NR, nc - j1);
+
+                    let a_panel_ptr = packed_a.as_ptr().wrapping_add(i1 * kc);
+                    // B micro-panel starts at column j1 within the packed NC-wide panel
+                    let b_panel_ptr = packed_b.as_ptr().wrapping_add(j1);
+                    let c_row_ptr = unsafe { c_ptr.add((i2 + i1) * n + j2 + j1) };
+
+                    if has_avx2 {
+                        unsafe {
+                            micro_kernel_6x16(
+                                a_panel_ptr,
+                                b_panel_ptr,
+                                b_stride, // stride between k-rows in packed B
+                                c_row_ptr,
+                                n, // ldc
+                                kc,
+                                mr,
+                                nr,
+                            );
+                        }
+                    } else {
+                        // Scalar fallback
+                        for i in 0..mr {
+                            for j in 0..nr {
+                                let mut sum = 0.0f32;
+                                for p in 0..kc {
+                                    let a_val = packed_a[i1 * kc + p * BLIS_MR + i];
+                                    let b_val = packed_b[p * b_stride + j1 + j];
+                                    sum += a_val * b_val;
+                                }
+                                unsafe {
+                                    *c_ptr.add((i2 + i1 + i) * n + j2 + j1 + j) += sum;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// BLIS-style cache-blocked matmul (serial version).
+pub fn cache_blocked_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    if m == 0 || n == 0 || k == 0 { return; }
+
+    // Pre-allocate packing buffers (reused across loops)
+    // A pack needs extra space for zero-padding: round up MC to next MR multiple
+    let a_pack_rows = ((BLIS_MC + BLIS_MR - 1) / BLIS_MR) * BLIS_MR;
+    let b_pack_size = BLIS_KC * BLIS_NC;  // B panel [kc][BLIS_NC]
+    let a_pack_size = a_pack_rows * BLIS_KC;   // A panel (rounded mc × kc)
+    let mut packed_b = vec![0.0f32; b_pack_size];
+    let mut packed_a = vec![0.0f32; a_pack_size];
+
+    // Zero C
+    for val in c.iter_mut().take(m * n) {
+        *val = 0.0f32;
+    }
+
+    let c_ptr = c.as_mut_ptr();
+
+    // Process all MC-row blocks serially
+    for i2 in (0..m).step_by(BLIS_MC) {
+        let mc = std::cmp::min(BLIS_MC, m - i2);
+        blis_process_block(a, b, c_ptr, m, n, k, i2, mc, &mut packed_b, &mut packed_a);
+    }
+}
+
+/// Parallel version of cache_blocked_matmul using rayon.
+/// Parallelizes over the outermost loop (MC-row blocks).
+pub fn parallel_cache_blocked_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+    use rayon::prelude::*;
+    if m == 0 || n == 0 || k == 0 { return; }
+
+    // Zero C first
+    for val in c.iter_mut().take(m * n) {
+        *val = 0.0f32;
+    }
+
+    let num_blocks = (m + BLIS_MC - 1) / BLIS_MC;
+
+    // Convert pointer to usize for safe Send+Sync capture across rayon threads.
+    // Safety: each thread writes to disjoint rows of C (different i2 blocks).
+    let c_addr = c.as_mut_ptr() as usize;
+
+    // Process each MC-row block in parallel (each thread gets its own packing buffers)
+    (0..num_blocks).into_par_iter().for_each(|block_idx| {
+        let i2 = block_idx * BLIS_MC;
+        let mc = std::cmp::min(BLIS_MC, m - i2);
+        let c_ptr = c_addr as *mut f32;
+
+        // Per-thread packing buffers
+        let a_pack_rows = ((BLIS_MC + BLIS_MR - 1) / BLIS_MR) * BLIS_MR;
+        let b_pack_size = BLIS_KC * BLIS_NC;
+        let a_pack_size = a_pack_rows * BLIS_KC;
+        let mut packed_b = vec![0.0f32; b_pack_size];
+        let mut packed_a = vec![0.0f32; a_pack_size];
+
+        blis_process_block(a, b, c_ptr, m, n, k, i2, mc, &mut packed_b, &mut packed_a);
+    });
+}
+
 pub fn parallel_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     use rayon::prelude::*;
     if m == 0 || n == 0 || k == 0 { return; }
+
+    // Use cache-blocked matmul when AVX2 is available for significant speedup
+    if is_x86_feature_detected!("avx2") {
+        parallel_cache_blocked_matmul(a, b, c, m, n, k);
+        return;
+    }
+
+    // Scalar fallback
     c.par_chunks_mut(n).enumerate().for_each(|(i, c_row)| {
         c_row.fill(0.0f32);
         let a_row = &a[i * k..(i + 1) * k];
@@ -1482,6 +1766,8 @@ pub fn parallel_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, 
 
 pub fn jit_parallel_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     if m == 0 || n == 0 || k == 0 { return; }
+
+    // Use JIT AVX-512 kernel for large matrices where it excels
     let isa = detect_isa_level();
     if isa == ISALevel::AVX512 && n >= 64 {
         let kernel = CompiledKernel::compile_matmul_avx512(m, n, k);
@@ -1490,6 +1776,13 @@ pub fn jit_parallel_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usi
             return;
         }
     }
+
+    // Use cache-blocked matmul when AVX2 is available
+    if is_x86_feature_detected!("avx2") {
+        parallel_cache_blocked_matmul(a, b, c, m, n, k);
+        return;
+    }
+
     parallel_matmul(a, b, c, m, n, k);
 }
 
