@@ -13,7 +13,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
-use symplex_engine::types::{Instr, BinOpKind, UnOpKind, serialize_instr, deserialize_instr, Value};
+use symplex_engine::types::{Instr, BinOpKind, UnOpKind, ScalarType, ReduceOp, MatrixLayout, serialize_instr, deserialize_instr, Value};
 use symplex_engine::phase3_jit::{
     self as p3, NativeCode,
 };
@@ -650,6 +650,145 @@ fn serialize_instructions<'py>(
             "return" => {
                 let slot: u16 = tuple.get_item(1)?.extract()?;
                 result.extend_from_slice(&serialize_instr(&Instr::Return(slot)));
+            }
+            "tensor_binop" => {
+                // ("tensor_binop", dst, binop_name, lhs, rhs, dtype, shape, strides_lhs, strides_rhs)
+                let dst: u16 = tuple.get_item(1)?.extract()?;
+                let op_str: String = tuple.get_item(2)?.extract()?;
+                let lhs: u16 = tuple.get_item(3)?.extract()?;
+                let rhs: u16 = tuple.get_item(4)?.extract()?;
+                let dtype_str: String = tuple.get_item(5)?.extract()?;
+                let shape: Vec<usize> = tuple.get_item(6)?.extract()?;
+                let strides_lhs: Vec<usize> = tuple.get_item(7)?.extract()?;
+                let strides_rhs: Vec<usize> = tuple.get_item(8)?.extract()?;
+
+                let op = match op_str.as_str() {
+                    "add" => BinOpKind::Add, "sub" => BinOpKind::Sub,
+                    "mul" => BinOpKind::Mul, "div" => BinOpKind::Div,
+                    "rem" => BinOpKind::Rem, "bitand" => BinOpKind::BitAnd,
+                    "bitor" => BinOpKind::BitOr, "bitxor" => BinOpKind::BitXor,
+                    "shl" => BinOpKind::Shl, "shr" => BinOpKind::Shr,
+                    "eq" => BinOpKind::Eq, "ne" => BinOpKind::Ne,
+                    "lt" => BinOpKind::Lt, "le" => BinOpKind::Le,
+                    "gt" => BinOpKind::Gt, "ge" => BinOpKind::Ge,
+                    "and" => BinOpKind::And, "or" => BinOpKind::Or,
+                    "min" => BinOpKind::Min, "max" => BinOpKind::Max,
+                    _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                        format!("Unknown tensor_binop operation: {}", op_str)
+                    )),
+                };
+
+                let element_ty = match dtype_str.as_str() {
+                    "float32" | "f32" => ScalarType::F32,
+                    "float64" | "f64" => ScalarType::F64,
+                    "int8" | "i8" => ScalarType::I8,
+                    "int16" | "i16" => ScalarType::I16,
+                    "int32" | "i32" => ScalarType::I32,
+                    "int64" | "i64" => ScalarType::I64,
+                    "uint8" | "u8" => ScalarType::U8,
+                    "uint16" | "u16" => ScalarType::U16,
+                    "uint32" | "u32" => ScalarType::U32,
+                    "uint64" | "u64" => ScalarType::U64,
+                    "bfloat16" | "bf16" => ScalarType::BF16,
+                    "bool" => ScalarType::Bool,
+                    _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                        format!("Unknown tensor_binop dtype: {}", dtype_str)
+                    )),
+                };
+
+                result.extend_from_slice(&serialize_instr(&Instr::TensorBinOp {
+                    dst, op, lhs, rhs, element_ty, shape, strides_lhs, strides_rhs,
+                }));
+            }
+            "tensor_matmul" => {
+                // ("tensor_matmul", dst, lhs, rhs, m, n, k, dtype, lhs_layout, rhs_layout)
+                let dst: u16 = tuple.get_item(1)?.extract()?;
+                let lhs: u16 = tuple.get_item(2)?.extract()?;
+                let rhs: u16 = tuple.get_item(3)?.extract()?;
+                let m: usize = tuple.get_item(4)?.extract()?;
+                let n: usize = tuple.get_item(5)?.extract()?;
+                let k: usize = tuple.get_item(6)?.extract()?;
+                let dtype_str: String = tuple.get_item(7)?.extract()?;
+                let lhs_layout_str: String = tuple.get_item(8)?.extract()?;
+                let rhs_layout_str: String = tuple.get_item(9)?.extract()?;
+
+                let element_ty = match dtype_str.as_str() {
+                    "float32" | "f32" => ScalarType::F32,
+                    "float64" | "f64" => ScalarType::F64,
+                    "int8" | "i8" => ScalarType::I8,
+                    "int16" | "i16" => ScalarType::I16,
+                    "int32" | "i32" => ScalarType::I32,
+                    "int64" | "i64" => ScalarType::I64,
+                    "uint8" | "u8" => ScalarType::U8,
+                    "uint16" | "u16" => ScalarType::U16,
+                    "uint32" | "u32" => ScalarType::U32,
+                    "uint64" | "u64" => ScalarType::U64,
+                    "bfloat16" | "bf16" => ScalarType::BF16,
+                    "bool" => ScalarType::Bool,
+                    _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                        format!("Unknown tensor_matmul dtype: {}", dtype_str)
+                    )),
+                };
+
+                let lhs_layout = match lhs_layout_str.as_str() {
+                    "row_major" | "RowMajor" => MatrixLayout::RowMajor,
+                    "col_major" | "ColMajor" => MatrixLayout::ColMajor,
+                    _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                        format!("Unknown tensor_matmul lhs_layout: {}", lhs_layout_str)
+                    )),
+                };
+                let rhs_layout = match rhs_layout_str.as_str() {
+                    "row_major" | "RowMajor" => MatrixLayout::RowMajor,
+                    "col_major" | "ColMajor" => MatrixLayout::ColMajor,
+                    _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                        format!("Unknown tensor_matmul rhs_layout: {}", rhs_layout_str)
+                    )),
+                };
+
+                result.extend_from_slice(&serialize_instr(&Instr::TensorMatMul {
+                    dst, lhs, rhs, m, n, k, element_ty, lhs_layout, rhs_layout,
+                }));
+            }
+            "tensor_reduce" => {
+                // ("tensor_reduce", dst, reduce_op, src, axis, dtype, src_shape)
+                let dst: u16 = tuple.get_item(1)?.extract()?;
+                let reduce_op_str: String = tuple.get_item(2)?.extract()?;
+                let src: u16 = tuple.get_item(3)?.extract()?;
+                let axis: usize = tuple.get_item(4)?.extract()?;
+                let dtype_str: String = tuple.get_item(5)?.extract()?;
+                let src_shape: Vec<usize> = tuple.get_item(6)?.extract()?;
+
+                let op = match reduce_op_str.as_str() {
+                    "sum" => ReduceOp::Sum,
+                    "max" => ReduceOp::Max,
+                    "min" => ReduceOp::Min,
+                    "mean" => ReduceOp::Mean,
+                    _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                        format!("Unknown tensor_reduce operation: {}", reduce_op_str)
+                    )),
+                };
+
+                let element_ty = match dtype_str.as_str() {
+                    "float32" | "f32" => ScalarType::F32,
+                    "float64" | "f64" => ScalarType::F64,
+                    "int8" | "i8" => ScalarType::I8,
+                    "int16" | "i16" => ScalarType::I16,
+                    "int32" | "i32" => ScalarType::I32,
+                    "int64" | "i64" => ScalarType::I64,
+                    "uint8" | "u8" => ScalarType::U8,
+                    "uint16" | "u16" => ScalarType::U16,
+                    "uint32" | "u32" => ScalarType::U32,
+                    "uint64" | "u64" => ScalarType::U64,
+                    "bfloat16" | "bf16" => ScalarType::BF16,
+                    "bool" => ScalarType::Bool,
+                    _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                        format!("Unknown tensor_reduce dtype: {}", dtype_str)
+                    )),
+                };
+
+                result.extend_from_slice(&serialize_instr(&Instr::TensorReduce {
+                    dst, op, src, axis, element_ty, src_shape,
+                }));
             }
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(

@@ -1,6 +1,6 @@
 [package]
 name = "symplex-python"
-version = "1.4.2"
+version = "1.4.3"
 edition = "2021"
 description = "SympleX Python bindings — PyO3 native module"
 license = "AGPL-3.0-or-later"

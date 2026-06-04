@@ -446,7 +446,7 @@ class lax:
 # ── Module-level info ────────────────────────────────────────────────────────
 
 def __version__():
-    return "1.4.2"
+    return "1.4.3"
 
 
 def is_rust_engine_available():
