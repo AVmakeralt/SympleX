@@ -696,24 +696,36 @@ def _analyze_elem_for_simd(elem_instrs):
       - Single binop (add/sub/mul/div/min/max) with two array inputs
       - Chain of binops that can be decomposed into independent
         array-level operations (e.g., a+b+c → add(add(a,b),c))
+      - Unary ops (neg, abs, sqrt, exp, log, sin, cos, tanh, sigmoid, relu)
+        applied to array inputs or results of previous ops
       - Elementwise chain followed by a reduce (sum/max/min)
 
     The SIMD kernel operates on flat f64 or f32 arrays via AVX2
-    VADDPD/VSUBPD/VADDPS/VSUBPS etc.
+    VADDPD/VSUBPD/VADDPS/VSUBPS etc.  Unary ops use per-lane scalar
+    dispatch (no SVML dependency).
 
     Returns a dict with keys:
-      - "ops": list of (op_str, lhs_slot, rhs_slot, dst_slot) tuples
+      - "ops": list of (op_str, lhs_slot, rhs_slot_or_None, dst_slot) tuples
+        For unary ops, rhs_slot is None.
+      - "unops": list of (op_code, src_slot, dst_slot) tuples for unary ops
       - "input_slots": set of slots that are inputs (loaded from args)
       - "output_slot": the final output slot
       - "reduce": None or (op_name, src_slot, dst_slot) if a reduce is present
     Or None if the segment cannot be SIMD-compiled.
     """
     _SIMD_SUPPORTED_BINOPS = {"add", "sub", "mul", "div", "min", "max"}
+    _SIMD_SUPPORTED_UNOPS = {"neg", "abs", "sqrt", "exp", "log", "sin", "cos", "tanh", "sigmoid", "relu"}
     _SIMD_SUPPORTED_REDUCE_OPS = {"sum", "max", "min"}
+
+    # Op code mapping for unary ops (must match Rust x86_emitter.rs UNOP_* constants)
+    _UNOP_CODES = {
+        "neg": 6, "abs": 7, "sqrt": 8, "exp": 9, "log": 10,
+        "sin": 11, "cos": 12, "tanh": 13, "sigmoid": 14, "relu": 15,
+    }
 
     ops = []
     all_slots = set()
-    written_by_binop = set()  # Only track slots written by binops
+    written_by_binop = set()  # Only track slots written by binops/unops
     input_slots = set()
     reduce_info = None  # Will be (op_name, src_slot, dst_slot) if a reduce is present
 
@@ -736,8 +748,13 @@ def _analyze_elem_for_simd(elem_instrs):
             written_by_binop.add(dst_slot)
             reduce_info = (reduce_op, src_slot, dst_slot)
         elif op == "unop":
-            # SIMD kernel doesn't support unary ops yet
-            return None
+            _, dst, unop_name, src = instr
+            if unop_name not in _SIMD_SUPPORTED_UNOPS:
+                return None
+            all_slots.update([dst, src])
+            written_by_binop.add(dst)
+            # Encode as a special op tuple with None rhs
+            ops.append((unop_name, src, None, dst))
         elif op in ("load_f64", "load_f32"):
             _, slot, _ = instr
             all_slots.add(slot)
@@ -1143,23 +1160,24 @@ def _tier4_should_orchestrate(trace):
 
     Tier 4 is preferred when the trace contains operations that Phase 3's
     SIMD elementwise kernels don't support:
-      - Transcendental unops (tanh, sigmoid, exp, log, sin, cos)
       - Comparison/logical ops (lt, le, gt, ge, eq, ne, and, or, xor)
       - Unsupported binops (rem, mod, shl, shr)
-      - Mixed-mode traces with multiple operation categories
+
+    Transcendental unops (exp, log, sin, cos, tanh, sigmoid, sqrt, relu, neg, abs)
+    are now handled by the fused SIMD elementwise kernel (op codes 6–15),
+    so they NO LONGER force Tier 4.  This allows the main phase3_jit
+    optimization path to run for traces like log(1 + exp(x)).
 
     Returns True if Tier 4 should be tried BEFORE Phase3 SIMD compilation,
     because Phase3 would fail anyway and Tier 4 provides better dispatch.
     """
     _T4_PREFERRED_BINOPS = {"rem", "mod", "shl", "shr", "and", "or", "xor"}
-    _T4_PREFERRED_UNOPS = {"sin", "cos", "exp", "log", "tanh", "sigmoid"}
+    # NOTE: Transcendentals (exp, log, sin, cos, tanh, sigmoid) are NO LONGER
+    # in this set — the fused SIMD kernel handles them via per-lane scalar dispatch.
 
     has_t4_binop = False
-    has_t4_unop = False
-    has_elementwise = False
     has_matmul = False
     has_reduction = False
-    op_categories = 0
 
     for instr in trace:
         op = instr[0]
@@ -1171,33 +1189,17 @@ def _tier4_should_orchestrate(trace):
                 has_t4_binop = True
             elif binop == "matmul":
                 has_matmul = True
-            else:
-                has_elementwise = True
         elif op == "unop":
-            _, _, unop_name, _ = instr[:4]
-            if unop_name in _T4_PREFERRED_UNOPS:
-                has_t4_unop = True
-            else:
-                has_elementwise = True
+            # All unops (including transcendentals) are now handled by the
+            # fused SIMD elementwise kernel — no Tier 4 bypass needed.
+            pass
         elif op == "reduce":
             has_reduction = True
 
-    # Count how many distinct operation categories are present
-    if has_t4_binop or has_t4_unop:
-        op_categories += 1
-    if has_elementwise:
-        op_categories += 1
-    if has_matmul:
-        op_categories += 1
-    if has_reduction:
-        op_categories += 1
-
-    # Tier 4 is preferred if:
-    # 1. Trace has ops that Phase3 SIMD can't handle (transcendentals, logical)
-    # 2. Trace has multiple operation categories (mixed-mode)
-    if has_t4_binop or has_t4_unop:
-        return True
-    if op_categories >= 2:
+    # Tier 4 is preferred only for ops the SIMD kernel truly can't handle:
+    # comparison/logical binops, integer arithmetic, and bit shifts.
+    # Transcendentals and reductions are handled by phase3_jit / SIMD.
+    if has_t4_binop:
         return True
 
     return False
@@ -2931,9 +2933,17 @@ class JitFunction:
                 # Second pass: build the fused op schedule
                 fused_ops = []  # list of (op_code, lhs_src, lhs_idx, rhs_src, rhs_idx)
                 _OP_MAP = {"add": 0, "sub": 1, "mul": 2, "div": 3, "min": 4, "max": 5}
+                _UNOP_MAP = {
+                    "neg": 6, "abs": 7, "sqrt": 8, "exp": 9, "log": 10,
+                    "sin": 11, "cos": 12, "tanh": 13, "sigmoid": 14, "relu": 15,
+                }
 
                 for op_idx, (op_str, lhs_slot, rhs_slot, dst_slot) in enumerate(ops):
-                    op_code = _OP_MAP.get(op_str, 0)
+                    is_unary = rhs_slot is None
+                    if is_unary:
+                        op_code = _UNOP_MAP.get(op_str, 6)
+                    else:
+                        op_code = _OP_MAP.get(op_str, 0)
 
                     # Classify lhs
                     if lhs_slot in input_slot_to_idx:
@@ -2958,8 +2968,10 @@ class JitFunction:
                             const_slot_to_idx[lhs_slot] = cidx
                             lhs_src, lhs_idx = 1, cidx
 
-                    # Classify rhs
-                    if rhs_slot in input_slot_to_idx:
+                    # Classify rhs (for unary ops, rhs is ignored by the Rust kernel)
+                    if is_unary:
+                        rhs_src, rhs_idx = 0, 0  # dummy — Rust kernel ignores rhs for unary ops
+                    elif rhs_slot in input_slot_to_idx:
                         rhs_src, rhs_idx = 0, input_slot_to_idx[rhs_slot]
                     elif rhs_slot in const_slot_to_idx:
                         rhs_src, rhs_idx = 1, const_slot_to_idx[rhs_slot]

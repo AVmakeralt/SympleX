@@ -1937,7 +1937,9 @@ pub fn jit_parallel_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usi
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct FusedOpDesc {
-    /// Operation: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max
+    /// Operation: 0=add, 1=sub, 2=mul, 3=div, 4=min, 5=max,
+    ///   6=neg, 7=abs, 8=sqrt, 9=exp, 10=log, 11=sin, 12=cos, 13=tanh, 14=sigmoid, 15=relu
+    /// Ops 6–15 are unary: lhs is the input, rhs is ignored.
     pub op: u8,
     /// Left operand source: 0=input_array, 1=constant, 2=result_of_previous_op
     pub lhs_src: u8,
@@ -1957,6 +1959,60 @@ const REDUCE_SUM: u8 = 0;
 const REDUCE_MAX: u8 = 1;
 const REDUCE_MIN: u8 = 2;
 const REDUCE_NONE: u8 = 255;
+
+/// Unary operation codes (appended after the binary ops 0–5)
+const UNOP_NEG: u8 = 6;
+const UNOP_ABS: u8 = 7;
+const UNOP_SQRT: u8 = 8;
+const UNOP_EXP: u8 = 9;
+const UNOP_LOG: u8 = 10;
+const UNOP_SIN: u8 = 11;
+const UNOP_COS: u8 = 12;
+const UNOP_TANH: u8 = 13;
+const UNOP_SIGMOID: u8 = 14;
+const UNOP_RELU: u8 = 15;
+
+/// Returns true if the op code is a unary operation.
+#[inline]
+fn is_unary_op(op: u8) -> bool {
+    op >= 6
+}
+
+/// Apply a scalar unary operation to an f32 value.
+#[inline]
+fn apply_unop_f32(op: u8, val: f32) -> f32 {
+    match op {
+        UNOP_NEG => -val,
+        UNOP_ABS => val.abs(),
+        UNOP_SQRT => val.sqrt(),
+        UNOP_EXP => val.exp(),
+        UNOP_LOG => val.ln(),
+        UNOP_SIN => val.sin(),
+        UNOP_COS => val.cos(),
+        UNOP_TANH => val.tanh(),
+        UNOP_SIGMOID => 1.0 / (1.0 + (-val).exp()),
+        UNOP_RELU => val.max(0.0),
+        _ => val,
+    }
+}
+
+/// Apply a scalar unary operation to an f64 value.
+#[inline]
+fn apply_unop_f64(op: u8, val: f64) -> f64 {
+    match op {
+        UNOP_NEG => -val,
+        UNOP_ABS => val.abs(),
+        UNOP_SQRT => val.sqrt(),
+        UNOP_EXP => val.exp(),
+        UNOP_LOG => val.ln(),
+        UNOP_SIN => val.sin(),
+        UNOP_COS => val.cos(),
+        UNOP_TANH => val.tanh(),
+        UNOP_SIGMOID => 1.0 / (1.0 + (-val).exp()),
+        UNOP_RELU => val.max(0.0),
+        _ => val,
+    }
+}
 
 // ── f32 AVX2 core ──
 //
@@ -2059,15 +2115,23 @@ unsafe fn fused_elem_f32_avx2_core(
                     _ => zero,
                 };
 
-                intermediates[op_idx] = match desc.op {
-                    0 => _mm256_add_ps(lhs, rhs),
-                    1 => _mm256_sub_ps(lhs, rhs),
-                    2 => _mm256_mul_ps(lhs, rhs),
-                    3 => _mm256_div_ps(lhs, rhs),
-                    4 => _mm256_min_ps(lhs, rhs),
-                    5 => _mm256_max_ps(lhs, rhs),
-                    _ => lhs,
-                };
+                intermediates[op_idx] = if is_unary_op(desc.op) {
+                        // Unary ops: per-lane scalar dispatch (avoids SVML dependency)
+                        let mut arr = [0f32; 8];
+                        _mm256_storeu_ps(arr.as_mut_ptr(), lhs);
+                        for lane in &mut arr { *lane = apply_unop_f32(desc.op, *lane); }
+                        _mm256_loadu_ps(arr.as_ptr())
+                    } else {
+                        match desc.op {
+                            0 => _mm256_add_ps(lhs, rhs),
+                            1 => _mm256_sub_ps(lhs, rhs),
+                            2 => _mm256_mul_ps(lhs, rhs),
+                            3 => _mm256_div_ps(lhs, rhs),
+                            4 => _mm256_min_ps(lhs, rhs),
+                            5 => _mm256_max_ps(lhs, rhs),
+                            _ => lhs,
+                        }
+                    };
             }
 
             let final_val = intermediates[num_ops - 1];
@@ -2136,14 +2200,22 @@ unsafe fn fused_elem_f32_avx2_core(
                 _ => zero,
             };
 
-            intermediates[op_idx] = match desc.op {
-                0 => _mm256_add_ps(lhs, rhs),
-                1 => _mm256_sub_ps(lhs, rhs),
-                2 => _mm256_mul_ps(lhs, rhs),
-                3 => _mm256_div_ps(lhs, rhs),
-                4 => _mm256_min_ps(lhs, rhs),
-                5 => _mm256_max_ps(lhs, rhs),
-                _ => lhs,
+            intermediates[op_idx] = if is_unary_op(desc.op) {
+                // Unary ops: per-lane scalar dispatch (avoids SVML dependency)
+                let mut arr = [0f32; 8];
+                _mm256_storeu_ps(arr.as_mut_ptr(), lhs);
+                for lane in &mut arr { *lane = apply_unop_f32(desc.op, *lane); }
+                _mm256_loadu_ps(arr.as_ptr())
+            } else {
+                match desc.op {
+                    0 => _mm256_add_ps(lhs, rhs),
+                    1 => _mm256_sub_ps(lhs, rhs),
+                    2 => _mm256_mul_ps(lhs, rhs),
+                    3 => _mm256_div_ps(lhs, rhs),
+                    4 => _mm256_min_ps(lhs, rhs),
+                    5 => _mm256_max_ps(lhs, rhs),
+                    _ => lhs,
+                }
             };
         }
 
@@ -2190,14 +2262,18 @@ unsafe fn fused_elem_f32_avx2_core(
                 _ => 0.0,
             };
 
-            scalar_intermediates[op_idx] = match desc.op {
-                0 => lhs + rhs,
-                1 => lhs - rhs,
-                2 => lhs * rhs,
-                3 => lhs / rhs,
-                4 => lhs.min(rhs),
-                5 => lhs.max(rhs),
-                _ => lhs,
+            scalar_intermediates[op_idx] = if is_unary_op(desc.op) {
+                apply_unop_f32(desc.op, lhs)
+            } else {
+                match desc.op {
+                    0 => lhs + rhs,
+                    1 => lhs - rhs,
+                    2 => lhs * rhs,
+                    3 => lhs / rhs,
+                    4 => lhs.min(rhs),
+                    5 => lhs.max(rhs),
+                    _ => lhs,
+                }
             };
         }
 
@@ -2312,14 +2388,18 @@ unsafe fn fused_elem_f32_scalar(
                 2 => if (desc.rhs_idx as usize) < num_ops { intermediates[desc.rhs_idx as usize] } else { 0.0 },
                 _ => 0.0,
             };
-            intermediates[op_idx] = match desc.op {
-                0 => lhs + rhs,
-                1 => lhs - rhs,
-                2 => lhs * rhs,
-                3 => lhs / rhs,
-                4 => lhs.min(rhs),
-                5 => lhs.max(rhs),
-                _ => lhs,
+            intermediates[op_idx] = if is_unary_op(desc.op) {
+                apply_unop_f32(desc.op, lhs)
+            } else {
+                match desc.op {
+                    0 => lhs + rhs,
+                    1 => lhs - rhs,
+                    2 => lhs * rhs,
+                    3 => lhs / rhs,
+                    4 => lhs.min(rhs),
+                    5 => lhs.max(rhs),
+                    _ => lhs,
+                }
             };
         }
 
@@ -2467,14 +2547,22 @@ unsafe fn fused_elem_f64_avx2_core(
                     _ => zero,
                 };
 
-                intermediates[op_idx] = match desc.op {
-                    0 => _mm256_add_pd(lhs, rhs),
-                    1 => _mm256_sub_pd(lhs, rhs),
-                    2 => _mm256_mul_pd(lhs, rhs),
-                    3 => _mm256_div_pd(lhs, rhs),
-                    4 => _mm256_min_pd(lhs, rhs),
-                    5 => _mm256_max_pd(lhs, rhs),
-                    _ => lhs,
+                intermediates[op_idx] = if is_unary_op(desc.op) {
+                    // Unary ops: per-lane scalar dispatch (avoids SVML dependency)
+                    let mut arr = [0f64; 4];
+                    _mm256_storeu_pd(arr.as_mut_ptr(), lhs);
+                    for lane in &mut arr { *lane = apply_unop_f64(desc.op, *lane); }
+                    _mm256_loadu_pd(arr.as_ptr())
+                } else {
+                    match desc.op {
+                        0 => _mm256_add_pd(lhs, rhs),
+                        1 => _mm256_sub_pd(lhs, rhs),
+                        2 => _mm256_mul_pd(lhs, rhs),
+                        3 => _mm256_div_pd(lhs, rhs),
+                        4 => _mm256_min_pd(lhs, rhs),
+                        5 => _mm256_max_pd(lhs, rhs),
+                        _ => lhs,
+                    }
                 };
             }
 
@@ -2526,14 +2614,22 @@ unsafe fn fused_elem_f64_avx2_core(
                 _ => zero,
             };
 
-            intermediates[op_idx] = match desc.op {
-                0 => _mm256_add_pd(lhs, rhs),
-                1 => _mm256_sub_pd(lhs, rhs),
-                2 => _mm256_mul_pd(lhs, rhs),
-                3 => _mm256_div_pd(lhs, rhs),
-                4 => _mm256_min_pd(lhs, rhs),
-                5 => _mm256_max_pd(lhs, rhs),
-                _ => lhs,
+            intermediates[op_idx] = if is_unary_op(desc.op) {
+                // Unary ops: per-lane scalar dispatch (avoids SVML dependency)
+                let mut arr = [0f64; 4];
+                _mm256_storeu_pd(arr.as_mut_ptr(), lhs);
+                for lane in &mut arr { *lane = apply_unop_f64(desc.op, *lane); }
+                _mm256_loadu_pd(arr.as_ptr())
+            } else {
+                match desc.op {
+                    0 => _mm256_add_pd(lhs, rhs),
+                    1 => _mm256_sub_pd(lhs, rhs),
+                    2 => _mm256_mul_pd(lhs, rhs),
+                    3 => _mm256_div_pd(lhs, rhs),
+                    4 => _mm256_min_pd(lhs, rhs),
+                    5 => _mm256_max_pd(lhs, rhs),
+                    _ => lhs,
+                }
             };
         }
 
@@ -2570,9 +2666,13 @@ unsafe fn fused_elem_f64_avx2_core(
                 2 => scalar_intermediates[desc.rhs_idx as usize],
                 _ => 0.0,
             };
-            scalar_intermediates[op_idx] = match desc.op {
-                0 => lhs + rhs, 1 => lhs - rhs, 2 => lhs * rhs, 3 => lhs / rhs,
-                4 => lhs.min(rhs), 5 => lhs.max(rhs), _ => lhs,
+            scalar_intermediates[op_idx] = if is_unary_op(desc.op) {
+                apply_unop_f64(desc.op, lhs)
+            } else {
+                match desc.op {
+                    0 => lhs + rhs, 1 => lhs - rhs, 2 => lhs * rhs, 3 => lhs / rhs,
+                    4 => lhs.min(rhs), 5 => lhs.max(rhs), _ => lhs,
+                }
             };
         }
         let val = scalar_intermediates[num_ops - 1];
@@ -2665,14 +2765,18 @@ unsafe fn fused_elem_f64_scalar(
                 2 => if (desc.rhs_idx as usize) < num_ops { intermediates[desc.rhs_idx as usize] } else { 0.0 },
                 _ => 0.0,
             };
-            intermediates[op_idx] = match desc.op {
-                0 => lhs + rhs,
-                1 => lhs - rhs,
-                2 => lhs * rhs,
-                3 => lhs / rhs,
-                4 => lhs.min(rhs),
-                5 => lhs.max(rhs),
-                _ => lhs,
+            intermediates[op_idx] = if is_unary_op(desc.op) {
+                apply_unop_f64(desc.op, lhs)
+            } else {
+                match desc.op {
+                    0 => lhs + rhs,
+                    1 => lhs - rhs,
+                    2 => lhs * rhs,
+                    3 => lhs / rhs,
+                    4 => lhs.min(rhs),
+                    5 => lhs.max(rhs),
+                    _ => lhs,
+                }
             };
         }
         let val = intermediates[num_ops - 1];
