@@ -312,7 +312,7 @@ fn jit_info() -> String {
 /// Arguments: a_ptr, b_ptr: *const f32, c_ptr: *mut f32, m, n, k: i64
 #[pyfunction]
 fn parallel_matmul(a_ptr: usize, b_ptr: usize, c_ptr: usize, m: i64, n: i64, k: i64) -> i64 {
-    if m == 0 || n == 0 || k == 0 { return 0; }
+    if m <= 0 || n <= 0 || k <= 0 { return 0; }
     unsafe {
         let a = std::slice::from_raw_parts(a_ptr as *const f32, (m * k) as usize);
         let b = std::slice::from_raw_parts(b_ptr as *const f32, (k * n) as usize);
@@ -328,7 +328,7 @@ fn parallel_matmul(a_ptr: usize, b_ptr: usize, c_ptr: usize, m: i64, n: i64, k: 
 /// Arguments: a_ptr, b_ptr: *const f32, c_ptr: *mut f32, m, n, k: i64
 #[pyfunction]
 fn jit_parallel_matmul(a_ptr: usize, b_ptr: usize, c_ptr: usize, m: i64, n: i64, k: i64) -> i64 {
-    if m == 0 || n == 0 || k == 0 { return 0; }
+    if m <= 0 || n <= 0 || k <= 0 { return 0; }
     unsafe {
         let a = std::slice::from_raw_parts(a_ptr as *const f32, (m * k) as usize);
         let b = std::slice::from_raw_parts(b_ptr as *const f32, (k * n) as usize);
@@ -1010,6 +1010,11 @@ fn phase3_compile(serialized_instrs: Vec<u8>, param_count: Option<u16>) -> PyRes
     while offset < serialized_instrs.len() {
         match deserialize_instr(&serialized_instrs[offset..]) {
             Some((instr, consumed)) => {
+                if consumed == 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Deserializer returned consumed=0 at offset {} — infinite loop guard", offset)
+                    ));
+                }
                 instrs.push(instr);
                 offset += consumed;
             }
@@ -1065,6 +1070,11 @@ fn phase3_compile_ssa(serialized_instrs: Vec<u8>, param_count: Option<u16>) -> P
     while offset < serialized_instrs.len() {
         match deserialize_instr(&serialized_instrs[offset..]) {
             Some((instr, consumed)) => {
+                if consumed == 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Deserializer returned consumed=0 at offset {} — infinite loop guard", offset)
+                    ));
+                }
                 instrs.push(instr);
                 offset += consumed;
             }
@@ -1173,6 +1183,11 @@ fn phase3_compile_and_run(serialized_instrs: Vec<u8>, args: Vec<i64>, param_coun
     while offset < serialized_instrs.len() {
         match deserialize_instr(&serialized_instrs[offset..]) {
             Some((instr, consumed)) => {
+                if consumed == 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Deserializer returned consumed=0 at offset {} — infinite loop guard", offset)
+                    ));
+                }
                 instrs.push(instr);
                 offset += consumed;
             }
@@ -1235,6 +1250,11 @@ fn tracing_jit_compile_and_run(serialized_instrs: Vec<u8>, args: Vec<i64>) -> Py
     while offset < serialized_instrs.len() {
         match deserialize_instr(&serialized_instrs[offset..]) {
             Some((instr, consumed)) => {
+                if consumed == 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Deserializer returned consumed=0 at offset {} — infinite loop guard", offset)
+                    ));
+                }
                 instrs.push(instr);
                 offset += consumed;
             }

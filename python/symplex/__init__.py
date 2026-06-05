@@ -150,6 +150,9 @@ def exp(x):
     """Element-wise exponential."""
     if isinstance(x, DeviceArray):
         return x.exp()
+    TracerVal = _get_tracer_val()
+    if isinstance(x, TracerVal):
+        return x.exp()
     import numpy as np
     return np.exp(x)
 
@@ -157,6 +160,9 @@ def exp(x):
 def log(x):
     """Element-wise natural logarithm."""
     if isinstance(x, DeviceArray):
+        return x.log()
+    TracerVal = _get_tracer_val()
+    if isinstance(x, TracerVal):
         return x.log()
     import numpy as np
     return np.log(x)
@@ -166,6 +172,9 @@ def sqrt(x):
     """Element-wise square root."""
     if isinstance(x, DeviceArray):
         return x.sqrt()
+    TracerVal = _get_tracer_val()
+    if isinstance(x, TracerVal):
+        return x.sqrt()
     import numpy as np
     return np.sqrt(x)
 
@@ -174,6 +183,9 @@ def sin(x):
     """Element-wise sine."""
     if isinstance(x, DeviceArray):
         return x.sin()
+    TracerVal = _get_tracer_val()
+    if isinstance(x, TracerVal):
+        return x.sin()
     import numpy as np
     return np.sin(x)
 
@@ -181,6 +193,9 @@ def sin(x):
 def cos(x):
     """Element-wise cosine."""
     if isinstance(x, DeviceArray):
+        return x.cos()
+    TracerVal = _get_tracer_val()
+    if isinstance(x, TracerVal):
         return x.cos()
     import numpy as np
     return np.cos(x)
@@ -445,8 +460,7 @@ class lax:
 
 # ── Module-level info ────────────────────────────────────────────────────────
 
-def __version__():
-    return "1.5.0"
+__version__ = "1.5.0"
 
 
 def is_rust_engine_available():

@@ -102,7 +102,7 @@ def _serialize_tensor_instrs(trace, allocator, arg_shapes, arg_dtypes):
             # ("tensor_reduce", dst, reduce_op, src, axis, dtype, src_shape)
             _, dst, reduce_op, src, axis, dtype, src_shape = instr
             red_u8 = REDUCE_TO_U8.get(reduce_op, 0)
-            ty_u8 = DTYPE_TO_SCALAR.get(dtype, 10)
+            ty_u8 = DTYPE_TO_SCALAR.get(dtype, 9)  # default F32 (consistent with matmul/binop)
             ndim = len(src_shape)
             # Format: [0xA1:u8] [dst:u16] [op:u8] [src:u16] [axis:u64] [element_ty:u8] [ndim:u16]
             buf.extend(struct.pack('<BHBHQBH', 0xA1, dst, red_u8, src,
@@ -117,7 +117,9 @@ def _serialize_tensor_instrs(trace, allocator, arg_shapes, arg_dtypes):
             
         elif op == "unop":
             _, dst, unop_name, src = instr
-            unop_u8 = {"neg": 0, "not": 1, "bitnot": 2, "abs": 3}.get(unop_name, 0)
+            unop_u8 = {"neg": 0, "not": 1, "bitnot": 2, "abs": 3,
+                        "exp": 4, "log": 5, "sqrt": 6, "sin": 7, "cos": 8,
+                        "tanh": 9, "sigmoid": 10, "relu": 11}.get(unop_name, 0)
             buf.extend(struct.pack('<BHBH', 0x11, dst, unop_u8, src))
             
         elif op == "load_f64":
@@ -179,6 +181,12 @@ _UNOP_DISPATCH = {
     "not": lambda s: not s,
     "sigmoid": lambda s: 1.0 / (1.0 + np.exp(-s)),
     "tanh": np.tanh,
+    "exp": np.exp,
+    "log": np.log,
+    "sqrt": np.sqrt,
+    "sin": np.sin,
+    "cos": np.cos,
+    "relu": lambda s: np.maximum(0, s),
 }
 
 _REDUCE_DISPATCH = {
@@ -1242,9 +1250,9 @@ def _tier4_serialize_trace(trace, allocator):
             _, dst, lhs, rhs, _m, _n, _k, _dtype, _ll, _rl = instr
             ops.append((0x20, [dst, lhs, rhs]))
         elif op == "tensor_reduce":
-            _, dst, reduce_name, src, _axis, _dtype, _shape = instr
+            _, dst, reduce_name, src, axis, dtype, src_shape = instr
             opcode = _T4_OPCODE_MAP.get(f"reduce_{reduce_name}", 0x40)
-            ops.append((opcode, [dst, src]))
+            ops.append((opcode, [dst, src, axis, len(src_shape)] + list(src_shape) + [0 if dtype == "float32" else 1]))
         else:
             # Unknown — skip
             pass
@@ -2394,7 +2402,7 @@ def _create_fused_elementwise_executor(trace, allocator):
             plan.append(("reduce", dst_slot, reduce_op, src_slot))
         elif op == "tensor_reduce":
             _, dst_slot, reduce_op, src_slot, axis, dtype, src_shape = instr
-            plan.append(("reduce", dst_slot, reduce_op, src_slot))
+            plan.append(("reduce", dst_slot, reduce_op, src_slot, axis, dtype, src_shape))
         elif op in ("load_f32", "load_f64"):
             _, slot, val = instr
             plan.append(("load", slot, float(val)))
@@ -3326,24 +3334,10 @@ class JitFunction:
 
                 # Remap trace for Rust serialization:
                 # - matmul → mul (Rust doesn't have matmul opcode in BinOp)
-                # - sigmoid/tanh → skip Rust optimizer (unsupported unops)
-                #   (Rust's serialize_instructions only supports neg/not/bitnot/abs unops)
-                has_unsupported_unop = False
                 rust_trace = []
                 for instr in self._trace:
                     if instr[0] == "binop" and instr[2] == "matmul":
                         rust_trace.append((instr[0], instr[1], "mul", instr[3], instr[4]))
-                    elif instr[0] == "unop" and instr[2] == "sigmoid":
-                        # sigmoid is not supported by Rust serialize_instructions;
-                        # skip the Rust optimizer for traces containing sigmoid
-                        # and rely on the fast-path executor instead
-                        has_unsupported_unop = True
-                        break
-                    elif instr[0] == "unop" and instr[2] == "tanh":
-                        # tanh is not supported by Rust serialize_instructions;
-                        # skip the Rust optimizer for traces containing tanh
-                        has_unsupported_unop = True
-                        break
                     elif instr[0] == "reduce":
                         # Reductions are handled by the SIMD fast-path or NumPy
                         # fallback; the Rust phase3_jit backend doesn't support
@@ -3363,8 +3357,8 @@ class JitFunction:
                     else:
                         rust_trace.append(instr)
 
-                # Serialize the trace (skip if trace has unsupported unops)
-                if not has_unsupported_unop and rust_trace:
+                # Serialize the trace
+                if rust_trace:
                     trace_bytes = serialize_instructions(rust_trace)
 
                     # Run the polyhedral optimizer

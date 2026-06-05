@@ -293,9 +293,14 @@ pub extern "C" fn poly_optimize_trace(
         if compute_type == ElementType::INT8 || compute_type == ElementType::BF16 {
             let pack_instrs = emit_quantization_pack_instrs(0, 100, compute_type);
             // Insert quantization instructions at the beginning
+            let num_prepended = pack_instrs.len();
             let mut combined = pack_instrs;
             combined.append(&mut block.instrs);
             block.instrs = combined;
+            // Shift all hint PCs by the number of prepended instructions
+            for (pc, _) in &mut block.hints {
+                *pc += num_prepended;
+            }
         }
     }
 
@@ -341,7 +346,7 @@ pub extern "C" fn poly_optimize_trace(
 
     // ── Sort and dedup hints ──────────────────────────────────────────────
     block.hints.sort_unstable_by_key(|(pc, _)| *pc);
-    block.hints.dedup_by_key(|(pc, _)| *pc);
+    block.hints.dedup_by(|a, b| a.0 == b.0 && a == b);
 
     // ── Compute roofline estimate ─────────────────────────────────────────
     let estimated_gflops = if let Some(ref scop) = polyhedral::extract_scop(&instructions) {
@@ -363,8 +368,10 @@ pub extern "C" fn poly_optimize_trace(
     }
 
     let mut hints_bytes = Vec::new();
-    for (_pc, hint) in &block.hints {
-        // Serialize hint as: [kind:u8] [slot_lo:u8] [slot_hi:u8] [extra: u8; 4]
+    for (pc, hint) in &block.hints {
+        // Serialize hint as: [pc_lo:u8] [pc_hi:u8] [kind:u8] [slot_lo:u8] [slot_hi:u8] [extra: u8; 4]
+        hints_bytes.push((*pc & 0xFF) as u8);
+        hints_bytes.push((pc >> 8) as u8);
         let kind_byte = match hint {
             polyhedral::SimdHintKind::VectorPack { .. } => 1u8,
             polyhedral::SimdHintKind::MatrixOuterProduct { .. } => 2u8,
@@ -492,7 +499,7 @@ pub extern "C" fn poly_optimize_specialized(
 
     // ── Sort and dedup hints ──────────────────────────────────────────────
     block.hints.sort_unstable_by_key(|(pc, _)| *pc);
-    block.hints.dedup_by_key(|(pc, _)| *pc);
+    block.hints.dedup_by(|a, b| a.0 == b.0 && a == b);
 
     // ── Compute roofline estimate ─────────────────────────────────────────
     let estimated_gflops = if let Some(ref scop) = polyhedral::extract_scop(&instructions) {
@@ -513,7 +520,10 @@ pub extern "C" fn poly_optimize_specialized(
     }
 
     let mut hints_bytes = Vec::new();
-    for (_pc, hint) in &block.hints {
+    for (pc, hint) in &block.hints {
+        // Serialize hint as: [pc_lo:u8] [pc_hi:u8] [kind:u8] [slot_lo:u8] [slot_hi:u8] [extra: u8; 4]
+        hints_bytes.push((*pc & 0xFF) as u8);
+        hints_bytes.push((pc >> 8) as u8);
         let kind_byte = match hint {
             polyhedral::SimdHintKind::VectorPack { .. } => 1u8,
             polyhedral::SimdHintKind::MatrixOuterProduct { .. } => 2u8,
@@ -767,6 +777,13 @@ fn deserialize_instr_stream(data: *const u8, len: usize) -> Result<Vec<Instr>, S
     while offset < slice.len() {
         match deserialize_instr(&slice[offset..]) {
             Some((instr, consumed)) => {
+                if consumed == 0 {
+                    return Err(format!(
+                        "Deserializer returned consumed=0 at offset {} (byte: 0x{:02x}) — infinite loop guard",
+                        offset,
+                        slice.get(offset).copied().unwrap_or(0xFF)
+                    ));
+                }
                 instrs.push(instr);
                 offset += consumed;
             }

@@ -247,7 +247,7 @@ fn run_optimize_pipeline(
     // 4) Double buffering
     let ml_config = configure_extreme_ml_kernel(target, element_bytes);
     if enable_double_buffering && ml_config.double_buffer_count >= 2 {
-        let _db_config = DoubleBufferConfig {
+        let db_config = DoubleBufferConfig {
             num_buffers: ml_config.double_buffer_count,
             prefetch_distance: ml_config.prefetch_distance,
             buffer_bytes: element_bytes * ml_config.tile_m * ml_config.tile_n * 4,
@@ -259,7 +259,7 @@ fn run_optimize_pipeline(
             if pc % ml_config.tile_m.max(1) == 0 {
                 block.hints.push((pc, polyhedral::SimdHintKind::AsyncPrefetch {
                     slot: 0,
-                    distance: ml_config.prefetch_distance,
+                    distance: db_config.prefetch_distance,
                 }));
             }
         }
@@ -623,6 +623,10 @@ fn serialize_instructions<'py>(
                 let op = match op_str.as_str() {
                     "neg" => UnOpKind::Neg, "not" => UnOpKind::Not,
                     "bitnot" => UnOpKind::BitNot, "abs" => UnOpKind::Abs,
+                    "exp" => UnOpKind::Exp, "log" => UnOpKind::Log,
+                    "sqrt" => UnOpKind::Sqrt, "sin" => UnOpKind::Sin,
+                    "cos" => UnOpKind::Cos, "tanh" => UnOpKind::Tanh,
+                    "sigmoid" => UnOpKind::Sigmoid, "relu" => UnOpKind::Relu,
                     _ => return Err(pyo3::exceptions::PyValueError::new_err(
                         format!("Unknown unop: {}", op_str)
                     )),
@@ -968,16 +972,19 @@ fn jit_execute<'py>(
     kernel_id: usize,
     arrays: Vec<Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // Look up the kernel in P3_KERNELS and execute while holding the lock
-    // (NativeCode contains executable memory pointers and cannot be cloned)
-    let kernels = P3_KERNELS.lock().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    let native = kernels.get(kernel_id)
-        .and_then(|k| k.as_ref())
-        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(
-            format!("Invalid kernel_id: {}", kernel_id)
-        ))?;
+    // Look up the kernel, clone the data we need, then release the lock
+    // BEFORE calling into Python to avoid deadlock risk.
+    let (func_ptr, slot_count) = {
+        let kernels = P3_KERNELS.lock().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let native = kernels.get(kernel_id)
+            .and_then(|k| k.as_ref())
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(
+                format!("Invalid kernel_id: {}", kernel_id)
+            ))?;
+        (native.mem_entry(), native.slot_count)
+    };
 
-    // Extract f64 values from the input arrays
+    // Extract f64 values from the input arrays (Python calls — lock NOT held)
     let mut values: Vec<Value> = Vec::new();
     for arr_obj in &arrays {
         let arr = arr_obj.clone();
@@ -986,19 +993,27 @@ fn jit_execute<'py>(
         values.push(Value::F64(item));
     }
 
-    // Execute the kernel via phase3_jit
-    let result = p3::execute(native, &values)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-            format!("JIT execution error: {:?}", e)
-        ))?;
+    // Execute the kernel via phase3_jit (no lock held, no Python calls)
+    let result = unsafe {
+        let f: extern "C" fn(*mut i64) -> i64 = std::mem::transmute(func_ptr);
+        let mut slots: Vec<i64> = vec![0i64; slot_count as usize];
+        for (i, val) in values.iter().enumerate() {
+            if i < slot_count as usize {
+                slots[i] = match val {
+                    Value::F64(v) => v.to_bits() as i64,
+                    Value::I64(v) => *v,
+                    Value::I32(v) => *v as i64,
+                    _ => 0,
+                };
+            }
+        }
+        let ret = f(slots.as_mut_ptr());
+        // Reinterpret as f64
+        f64::from_bits(ret as u64)
+    };
 
     // Write result back to the first array's first element
-    let result_f64 = match result {
-        Value::F64(v) => v,
-        Value::I64(v) => v as f64,
-        Value::I32(v) => v as f64,
-        _ => 0.0,
-    };
+    let result_f64 = result;
     arrays[0].call_method1("__setitem__", (0, result_f64))?;
 
     // Return the first array (which is the output buffer)
@@ -1107,6 +1122,15 @@ use std::sync::Mutex;
 
 /// Global store for phase3 JIT-compiled kernels.
 static P3_KERNELS: Mutex<Vec<Option<NativeCode>>> = Mutex::new(Vec::new());
+
+/// Clear all cached phase3 JIT kernels, freeing their executable memory.
+/// Call this to prevent unbounded memory growth when compiling many kernels.
+#[pyfunction]
+fn clear_kernels() -> PyResult<()> {
+    let mut kernels = P3_KERNELS.lock().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    kernels.clear();
+    Ok(())
+}
 
 /// Compile an instruction trace via phase3_jit and return a kernel ID.
 /// The trace is given as serialized bytes (same format as serialize_instructions).
@@ -1339,14 +1363,14 @@ fn phase3_execute_arrays(
     param_count: u16,
 ) -> PyResult<f64> {
     // Acquire the lock, get the kernel's function pointer and code size, then release
-    let (func_ptr, code_size) = {
+    let (func_ptr, code_size, slot_count) = {
         let kernels = P3_KERNELS.lock().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let native = kernels.get(kernel_id)
             .and_then(|k| k.as_ref())
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(
                 format!("Invalid kernel_id: {}", kernel_id)
             ))?;
-        (native.mem_entry(), native.code_size())
+        (native.mem_entry(), native.code_size(), native.slot_count as usize)
     };
 
     let n_params = param_count as usize;
@@ -1365,14 +1389,19 @@ fn phase3_execute_arrays(
 
     let start = std::time::Instant::now();
 
+    // Allocate slot buffer ONCE outside the loop to avoid millions of heap allocs
+    let slot_buf_size = slot_count.max(n_params).max(256);
+    let mut slots: Vec<i64> = vec![0i64; slot_buf_size];
+
     unsafe {
         // Build a NativeCode-like wrapper just for execution
         // We have the function pointer, so we can call it directly
         let f: extern "C" fn(*mut i64) -> i64 = std::mem::transmute(func_ptr);
 
         for i in 0..n_elements {
-            // Gather input values into a slot array
-            let mut slots: Vec<i64> = vec![0i64; 256]; // generous slot buffer
+            // Reset slots to zero (only the ones we'll use)
+            for s in &mut slots[..n_params] { *s = 0; }
+            // Gather input values into slot array
             for p in 0..n_params {
                 let val = *input_slices[p].add(i);
                 slots[p] = val.to_bits() as i64;
@@ -2114,6 +2143,7 @@ fn _symplex_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(jit_info, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_compile, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_compile_ssa, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_kernels, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_execute_int, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_execute_f64, m)?)?;
     m.add_function(wrap_pyfunction!(phase3_bench_int, m)?)?;

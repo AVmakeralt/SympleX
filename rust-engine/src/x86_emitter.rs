@@ -439,6 +439,9 @@ impl CompiledKernel {
 
         // Prologue
         a.push(rbp).unwrap(); a.mov(rbp, rsp).unwrap();
+        // Stack alignment fix: after PUSH RBP, RSP ≡ 8 mod 16.
+        // AND RSP, -16 aligns to 16-byte boundary for AVX-512 requirements.
+        a.and(rsp, -16).unwrap();
         a.push(rbx).unwrap(); a.push(r12).unwrap(); a.push(r13).unwrap();
         a.push(r14).unwrap(); a.push(r15).unwrap();
         a.sub(rsp, 64).unwrap();
@@ -1153,15 +1156,61 @@ impl CompiledKernel {
         // rdi = data ptr, rsi = n
         a.mov(rbx, rsi).unwrap(); // rbx = n
 
-        // Zero-initialize 8 YMM accumulators (ymm0-ymm7)
-        a.vxorps(ymm0, ymm0, ymm0).unwrap();
-        a.vxorps(ymm1, ymm1, ymm1).unwrap();
-        a.vxorps(ymm2, ymm2, ymm2).unwrap();
-        a.vxorps(ymm3, ymm3, ymm3).unwrap();
-        a.vxorps(ymm4, ymm4, ymm4).unwrap();
-        a.vxorps(ymm5, ymm5, ymm5).unwrap();
-        a.vxorps(ymm6, ymm6, ymm6).unwrap();
-        a.vxorps(ymm7, ymm7, ymm7).unwrap();
+        // Initialize 8 YMM accumulators
+        // For max/min, use ±∞ so that any finite value wins over the initial.
+        // For sum, zero is the correct identity.
+        match op {
+            0 => {
+                // sum: zero-init
+                a.vxorps(ymm0, ymm0, ymm0).unwrap();
+                a.vxorps(ymm1, ymm1, ymm1).unwrap();
+                a.vxorps(ymm2, ymm2, ymm2).unwrap();
+                a.vxorps(ymm3, ymm3, ymm3).unwrap();
+                a.vxorps(ymm4, ymm4, ymm4).unwrap();
+                a.vxorps(ymm5, ymm5, ymm5).unwrap();
+                a.vxorps(ymm6, ymm6, ymm6).unwrap();
+                a.vxorps(ymm7, ymm7, ymm7).unwrap();
+            }
+            1 => {
+                // max: init to -∞
+                let neg_inf_bits: u32 = f32::NEG_INFINITY.to_bits();
+                // Load -∞ into xmm0, then broadcast to all YMMs
+                a.mov(eax, neg_inf_bits as u32).unwrap();
+                a.vmovd(xmm0, eax).unwrap();
+                a.vbroadcastss(ymm0, xmm0).unwrap();
+                a.vmovapd(ymm1, ymm0).unwrap();
+                a.vmovapd(ymm2, ymm0).unwrap();
+                a.vmovapd(ymm3, ymm0).unwrap();
+                a.vmovapd(ymm4, ymm0).unwrap();
+                a.vmovapd(ymm5, ymm0).unwrap();
+                a.vmovapd(ymm6, ymm0).unwrap();
+                a.vmovapd(ymm7, ymm0).unwrap();
+            }
+            2 => {
+                // min: init to +∞
+                let pos_inf_bits: u32 = f32::INFINITY.to_bits();
+                a.mov(eax, pos_inf_bits as u32).unwrap();
+                a.vmovd(xmm0, eax).unwrap();
+                a.vbroadcastss(ymm0, xmm0).unwrap();
+                a.vmovapd(ymm1, ymm0).unwrap();
+                a.vmovapd(ymm2, ymm0).unwrap();
+                a.vmovapd(ymm3, ymm0).unwrap();
+                a.vmovapd(ymm4, ymm0).unwrap();
+                a.vmovapd(ymm5, ymm0).unwrap();
+                a.vmovapd(ymm6, ymm0).unwrap();
+                a.vmovapd(ymm7, ymm0).unwrap();
+            }
+            _ => {
+                a.vxorps(ymm0, ymm0, ymm0).unwrap();
+                a.vxorps(ymm1, ymm1, ymm1).unwrap();
+                a.vxorps(ymm2, ymm2, ymm2).unwrap();
+                a.vxorps(ymm3, ymm3, ymm3).unwrap();
+                a.vxorps(ymm4, ymm4, ymm4).unwrap();
+                a.vxorps(ymm5, ymm5, ymm5).unwrap();
+                a.vxorps(ymm6, ymm6, ymm6).unwrap();
+                a.vxorps(ymm7, ymm7, ymm7).unwrap();
+            }
+        }
 
         // Vectorized loop: process 64 f32 (8 × YMM) per iteration
         // rdx = byte offset
@@ -1170,7 +1219,7 @@ impl CompiledKernel {
         let mut vec_loop = a.create_label();
         let mut vec_exit = a.create_label();
         a.set_label(&mut vec_loop).unwrap();
-        a.cmp(rdx, rax).unwrap(); a.jge(vec_exit).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jg(vec_exit).unwrap(); // jg (not jge) to include last full vector
 
         // Load 8 × 8 = 64 f32 per iteration (256 bytes), accumulate into 8 YMM regs
         match op {
@@ -1215,7 +1264,7 @@ impl CompiledKernel {
         let mut rem_loop = a.create_label();
         let mut rem_exit = a.create_label();
         a.set_label(&mut rem_loop).unwrap();
-        a.cmp(rdx, rax).unwrap(); a.jge(rem_exit).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jg(rem_exit).unwrap(); // jg (not jge) to include last full vector
         match op {
             0 => { a.vaddps(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
             1 => { a.vmaxps(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
@@ -1320,10 +1369,41 @@ impl CompiledKernel {
         a.mov(rbx, rsi).unwrap(); // rbx = n
 
         // Zero-initialize 4 YMM accumulators
-        a.vxorpd(ymm0, ymm0, ymm0).unwrap();
-        a.vxorpd(ymm1, ymm1, ymm1).unwrap();
-        a.vxorpd(ymm2, ymm2, ymm2).unwrap();
-        a.vxorpd(ymm3, ymm3, ymm3).unwrap();
+        match op {
+            0 => {
+                // sum: zero-init
+                a.vxorpd(ymm0, ymm0, ymm0).unwrap();
+                a.vxorpd(ymm1, ymm1, ymm1).unwrap();
+                a.vxorpd(ymm2, ymm2, ymm2).unwrap();
+                a.vxorpd(ymm3, ymm3, ymm3).unwrap();
+            }
+            1 => {
+                // max: init to -∞
+                let neg_inf_bits: u64 = f64::NEG_INFINITY.to_bits();
+                a.mov(rax, neg_inf_bits).unwrap();
+                a.vmovq(xmm0, rax).unwrap();
+                a.vbroadcastsd(ymm0, xmm0).unwrap();
+                a.vmovapd(ymm1, ymm0).unwrap();
+                a.vmovapd(ymm2, ymm0).unwrap();
+                a.vmovapd(ymm3, ymm0).unwrap();
+            }
+            2 => {
+                // min: init to +∞
+                let pos_inf_bits: u64 = f64::INFINITY.to_bits();
+                a.mov(rax, pos_inf_bits).unwrap();
+                a.vmovq(xmm0, rax).unwrap();
+                a.vbroadcastsd(ymm0, xmm0).unwrap();
+                a.vmovapd(ymm1, ymm0).unwrap();
+                a.vmovapd(ymm2, ymm0).unwrap();
+                a.vmovapd(ymm3, ymm0).unwrap();
+            }
+            _ => {
+                a.vxorpd(ymm0, ymm0, ymm0).unwrap();
+                a.vxorpd(ymm1, ymm1, ymm1).unwrap();
+                a.vxorpd(ymm2, ymm2, ymm2).unwrap();
+                a.vxorpd(ymm3, ymm3, ymm3).unwrap();
+            }
+        }
 
         // Vectorized loop: process 16 f64 (4 × YMM) per iteration
         // rdx = byte offset
@@ -1332,7 +1412,7 @@ impl CompiledKernel {
         let mut vec_loop = a.create_label();
         let mut vec_exit = a.create_label();
         a.set_label(&mut vec_loop).unwrap();
-        a.cmp(rdx, rax).unwrap(); a.jge(vec_exit).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jg(vec_exit).unwrap(); // jg (not jge) to include last full vector
 
         match op {
             0 => {
@@ -1364,7 +1444,7 @@ impl CompiledKernel {
         let mut rem_loop = a.create_label();
         let mut rem_exit = a.create_label();
         a.set_label(&mut rem_loop).unwrap();
-        a.cmp(rdx, rax).unwrap(); a.jge(rem_exit).unwrap();
+        a.cmp(rdx, rax).unwrap(); a.jg(rem_exit).unwrap(); // jg (not jge) to include last full vector
         match op {
             0 => { a.vaddpd(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
             1 => { a.vmaxpd(ymm0, ymm0, ymmword_ptr(rdi + rdx)).unwrap(); }
@@ -1907,10 +1987,16 @@ unsafe fn fused_elem_f32_avx2_core(
     let zero = _mm256_setzero_ps();
 
     // 4 YMM accumulators for 4x-unrolled reduce
-    let mut acc0 = zero;
-    let mut acc1 = zero;
-    let mut acc2 = zero;
-    let mut acc3 = zero;
+    // For max/min, initialize to ±∞ so any finite value wins.
+    let init_val: __m256 = match reduce_op {
+        REDUCE_MAX => _mm256_set1_ps(f32::NEG_INFINITY),
+        REDUCE_MIN => _mm256_set1_ps(f32::INFINITY),
+        _ => zero,
+    };
+    let mut acc0 = init_val;
+    let mut acc1 = init_val;
+    let mut acc2 = init_val;
+    let mut acc3 = init_val;
 
     // Allocate intermediates ONCE — reused across all elements.
     // For short chains this fits in registers; for long chains the
@@ -2327,10 +2413,16 @@ unsafe fn fused_elem_f64_avx2_core(
     let has_reduce = reduce_op != REDUCE_NONE;
     let zero = _mm256_setzero_pd();
 
-    let mut acc0 = zero;
-    let mut acc1 = zero;
-    let mut acc2 = zero;
-    let mut acc3 = zero;
+    // For max/min, initialize to ±∞ so any finite value wins.
+    let init_val: __m256d = match reduce_op {
+        REDUCE_MAX => _mm256_set1_pd(f64::NEG_INFINITY),
+        REDUCE_MIN => _mm256_set1_pd(f64::INFINITY),
+        _ => zero,
+    };
+    let mut acc0 = init_val;
+    let mut acc1 = init_val;
+    let mut acc2 = init_val;
+    let mut acc3 = init_val;
 
     // Allocate intermediates ONCE — reused across all elements.
     let mut intermediates: Vec<__m256d> = vec![zero; num_ops];

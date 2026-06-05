@@ -407,3 +407,36 @@ Stage Summary:
 - Bug #3: TensorReduce loop uses JG (0x7F) instead of JL (0x7C), fixing 1-iteration exit bug
 - Bug #2: New thin-pointer wrappers + correct register assignments (RCX=M, R8=N, R9=K) for matmul ABI
 - Build: compiles cleanly, installed and tested locally
+---
+Task ID: 9
+Agent: Main
+Task: Fix remaining 39 bugs from the 44-bug audit (P0 #4-#12, P1 #13-31, P2 #32-42, P3 #43-44)
+
+Work Log:
+- Fixed P0 #4: Rewrote LoadBool/LoadF32/LoadF64 stencils from slot-copy pattern to immediate-load pattern
+  - Added StencilPatch::Imm64 variant for LoadF64's 8-byte immediate
+  - Fixed extract_imm() to return bit patterns for LoadBool/LoadF32/LoadF64
+  - Fixed extract_slot_disp() legacy function for new stencil layouts
+- Fixed P0 #7: Changed `m == 0` checks to `m <= 0` in parallel_matmul/jit_parallel_matmul (prevents negative dim → segfault)
+- Fixed P0 #8 + P2 #37: Replaced fixed 256-slot buffer with dynamic allocation using kernel's slot_count; moved Vec allocation outside hot loop
+- Fixed P0 #9: Added consumed==0 guard in all 5 deserialize loops (ffi.rs + 4 sites in lib.rs)
+- Fixed P0 #10: Fixed Jump/JumpFalse/JumpTrue deserialization — changed from u64 reads to i32 reads matching serialization format
+  - Jump: 9 bytes → 5 bytes, JumpFalse: 11 → 7, JumpTrue: 11 → 7
+- Fixed P0 #11: Fixed off-by-one min-length checks in deserialization
+  - Loop (0x33): 38 → 43, TensorBinOp (0xA0): 10 → 11, TensorReduce (0xA1): 16 → 17, TensorMatMul (0xA2): 31 → 34
+- Fixed P0 #12: Added TracerVal dispatch for exp/log/sqrt/sin/cos in __init__.py and _tracer.py
+  - Added exp/log/sqrt/sin/cos/tanh/sigmoid/relu methods to TracerVal class
+  - Added these ops to _UNOP_DISPATCH, Python serializer, and Rust serialize_instructions
+  - Added UnOpKind variants (Exp=4, Log=5, Sqrt=6, Sin=7, Cos=8, Tanh=9, Sigmoid=10, Relu=11)
+  - Added libm function wrappers (libc_exp/log/sqrt/sin/cos/tanh) for JIT codegen
+  - Added CALL-based math unop codegen in the JIT UnOp emission path
+- P1 bugs #13-31 fixed by subagent (19 bugs): floordiv, pow, tensor_reduce axis, Tier4 serialization, relu/mean tensor dispatch, matmul 1D shapes, bit-cast conversion, SSA ValueIds, hint PC shifts, hint dedup, hint serialization, f32/f64 max/min reduce init (±∞), CALL rel32 byte count, sgemm_colmajor double-transpose, 9 missing opcode deserializers, to_f64/to_f32 conversions
+- P2 bugs #32-42 fixed by subagent (11 bugs): xmm_pool XMM0/1 exclusion, TensorReduce multi-axis, integer TensorBinOp, AVX-512 stack alignment, vectorized loop bounds, P3_KERNELS cleanup, DoubleBufferConfig usage, Mutex deadlock fix, default dtype consistency, dtype downcast prevention
+- P3 bugs #43-44 fixed by subagent: __version__ string fix, f32_lanes() doc comment
+- Build: compiles cleanly, all tests pass (add, exp, sqrt, mul, sub verified)
+
+Stage Summary:
+- All 39 remaining bugs fixed across 8 files: phase3_jit.rs, x86_emitter.rs, lib.rs, types.rs, ffi.rs, _jit.py, _tracer.py, __init__.py
+- Key new infrastructure: StencilPatch::Imm64, UnOpKind math variants, libc_* libm wrappers, Instr::Reduce deserialization, consumed==0 infinite loop guards
+- Verified: exp([0,1,2])=[1.0, 2.718, 7.389], sqrt([0,1,2])=[0.0, 1.0, 1.414], add/mul/sub all correct
+- Package: simplex-tensor 1.5.0 rebuilt and installed successfully

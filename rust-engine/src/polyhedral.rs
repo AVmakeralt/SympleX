@@ -2150,7 +2150,7 @@ pub fn emit_register_microkernel(scop: &Scop) -> Vec<Instr> {
 // §11. SIMD / AMX HINT EMISSION
 // =============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SimdHintKind {
     /// Standard 1-D SIMD vectorization (AVX2 / AVX-512 / NEON).
     VectorPack { op: BinOpKind, width: usize, src1_base: u16, src2_base: u16, dst_base: u16 },
@@ -2332,7 +2332,7 @@ pub fn generate_simd_hints(scop: &Scop, tiled_instrs: &[Instr]) -> PolyhedralBlo
 
     // Sort by PC so binary_search_by_key is valid, then deduplicate.
     hints.sort_unstable_by_key(|(pc, _)| *pc);
-    hints.dedup_by_key(|(pc, _)| *pc);
+    hints.dedup_by(|a, b| a.0 == b.0 && a == b);
 
     PolyhedralBlock { instrs: tiled_instrs.to_vec(), hints, tiles: Vec::new() }
 }
@@ -3546,7 +3546,7 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
     if !fusion_hints.is_empty() {
         block.hints.extend(fusion_hints);
         block.hints.sort_unstable_by_key(|(pc, _)| *pc);
-        block.hints.dedup_by_key(|(pc, _)| *pc);
+        block.hints.dedup_by(|a, b| a.0 == b.0 && a == b);
     }
 
     // Add IndexSetSplit hints for the core/fringe boundary
@@ -4790,7 +4790,7 @@ pub fn optimize_trace_polyhedral_specialized(
 
     // Sort and dedup hints
     block.hints.sort_unstable_by_key(|(pc, _)| *pc);
-    block.hints.dedup_by_key(|(pc, _)| *pc);
+    block.hints.dedup_by(|a, b| a.0 == b.0 && a == b);
 
     block
 }

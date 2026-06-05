@@ -82,7 +82,7 @@ class TracerVal:
         for the Rust JIT to use for SIMD vectorization and fusion decisions.
         Otherwise emits a plain binop for scalar operations.
         """
-        result = TracerVal(self.allocator, self.trace, shape=result_shape or self.shape, dtype=self.dtype)
+        result = TracerVal(self.allocator, self.trace, shape=result_shape or self.shape, dtype=self._promoted_dtype(other))
         
         # Emit TensorBinOp for tensor operations (non-empty shapes)
         if result_shape or (self.shape and other.shape):
@@ -132,6 +132,14 @@ class TracerVal:
                 raise ShapeError(f"Cannot broadcast shapes {a} and {b}")
         return tuple(result)
 
+    def _promoted_dtype(self, other: 'TracerVal') -> str:
+        """Promote dtypes to prevent silent downcasting (e.g. f64→f32).
+        If either operand is f64, the result is f64. Otherwise f32."""
+        _DTYPE_RANK = {"float16": 0, "bfloat16": 0, "float32": 1, "float64": 2}
+        if _DTYPE_RANK.get(other.dtype, 0) > _DTYPE_RANK.get(self.dtype, 0):
+            return other.dtype
+        return self.dtype
+
     # ── Arithmetic operators ─────────────────────────────────────────────
 
     def __add__(self, other) -> 'TracerVal':
@@ -173,7 +181,7 @@ class TracerVal:
     def __floordiv__(self, other) -> 'TracerVal':
         if isinstance(other, (int, float)):
             other = _const(self.allocator, self.trace, other, self.dtype)
-        return self._emit_binop("div", other, self._broadcast_shape(other))
+        return self._emit_binop("floordiv", other, self._broadcast_shape(other))
 
     def __mod__(self, other) -> 'TracerVal':
         if isinstance(other, (int, float)):
@@ -200,18 +208,46 @@ class TracerVal:
                         result = result._emit_binop("mul", self, result.shape)  # x**k
                     return result
             other = _const(self.allocator, self.trace, other, self.dtype)
-        return self._emit_binop("mul", other, self._broadcast_shape(other))
+        return self._emit_binop("pow", other, self._broadcast_shape(other))
 
     def __matmul__(self, other) -> 'TracerVal':
         if not isinstance(other, TracerVal):
             raise TracerError("matmul requires TracerVal operand")
-        # matmul: (..., M, K) @ (..., K, N) -> (..., M, N)
-        m = self.shape[-2] if len(self.shape) >= 2 else 1
-        k = self.shape[-1] if len(self.shape) >= 1 else 1
-        n = other.shape[-1] if len(other.shape) >= 1 else 1
-        result_shape = self.shape[:-2] + (m, n)
+        # Handle 1D inputs per NumPy rules:
+        #   1D @ 2D: (K,) @ (K, N) -> (N,)
+        #   2D @ 1D: (M, K) @ (K,) -> (M,)
+        #   1D @ 1D: (K,) @ (K,) -> ()  (dot product)
+        #   2D @ 2D: (M, K) @ (K, N) -> (M, N)
+        self_1d = len(self.shape) == 1
+        other_1d = len(other.shape) == 1
+
+        if self_1d and other_1d:
+            # dot product: (K,) @ (K,) -> ()
+            k = self.shape[-1]
+            m = 1
+            n = 1
+            result_shape = ()
+        elif self_1d:
+            # (K,) @ (K, N) -> (N,)
+            k = self.shape[-1]
+            n = other.shape[-1]
+            m = 1
+            result_shape = other.shape[:-2] + (n,)
+        elif other_1d:
+            # (M, K) @ (K,) -> (M,)
+            m = self.shape[-2] if len(self.shape) >= 2 else 1
+            k = self.shape[-1]
+            n = 1
+            result_shape = self.shape[:-2] + (m,)
+        else:
+            # (..., M, K) @ (..., K, N) -> (..., M, N)
+            m = self.shape[-2]
+            k = self.shape[-1]
+            n = other.shape[-1]
+            result_shape = self.shape[:-2] + (m, n)
+
         result = TracerVal(self.allocator, self.trace, shape=result_shape, dtype=self.dtype)
-        
+
         # Emit TensorMatMul with full shape/layout info
         # Default: both matrices are RowMajor
         self.trace.append(("tensor_matmul", result.slot, self.slot, other.slot,
@@ -228,13 +264,14 @@ class TracerVal:
 
     def relu(self) -> 'TracerVal':
         """ReLU: max(0, x) — traced as a comparison + multiply."""
-        # relu(x) = x * (x > 0) — but we emit it as a single unop "abs"
-        # Actually relu(x) = max(0, x), which we can trace as a max with zero.
-        # For simplicity, emit as: x > 0 produces a mask, then x * mask
         zero = _const(self.allocator, self.trace, 0.0, self.dtype)
-        # Emit as max(x, 0) which maps to BinOpKind::Max
-        result = TracerVal(self.allocator, self.trace, shape=self.shape, dtype=self.dtype)
-        self.trace.append(("binop", result.slot, "max", self.slot, zero.slot))
+        if self.shape:
+            result = TracerVal(self.allocator, self.trace, shape=self.shape, dtype=self.dtype)
+            self.trace.append(("tensor_binop", result.slot, "max", self.slot, zero.slot,
+                              self.dtype, self.shape, (), ()))
+        else:
+            result = TracerVal(self.allocator, self.trace, shape=self.shape, dtype=self.dtype)
+            self.trace.append(("binop", result.slot, "max", self.slot, zero.slot))
         return result
 
     def gelu(self) -> 'TracerVal':
@@ -263,6 +300,26 @@ class TracerVal:
         The fused NumPy executor will use np.tanh().
         """
         return self._emit_unop("tanh")
+
+    def exp(self) -> 'TracerVal':
+        """exp — traced as a dedicated exp unop."""
+        return self._emit_unop("exp")
+
+    def log(self) -> 'TracerVal':
+        """log — traced as a dedicated log unop."""
+        return self._emit_unop("log")
+
+    def sqrt(self) -> 'TracerVal':
+        """sqrt — traced as a dedicated sqrt unop."""
+        return self._emit_unop("sqrt")
+
+    def sin(self) -> 'TracerVal':
+        """sin — traced as a dedicated sin unop."""
+        return self._emit_unop("sin")
+
+    def cos(self) -> 'TracerVal':
+        """cos — traced as a dedicated cos unop."""
+        return self._emit_unop("cos")
 
     def softmax(self, axis=-1) -> 'TracerVal':
         """Softmax — traced as identity (handled by FlashAttention pass)."""
@@ -296,7 +353,11 @@ class TracerVal:
         s = self.sum(axis=axis, keepdims=keepdims)
         n = _const(self.allocator, self.trace, float(max(1, self.shape[axis] if axis is not None else self.size)), self.dtype)
         result = TracerVal(self.allocator, self.trace, shape=s.shape, dtype=self.dtype)
-        self.trace.append(("binop", result.slot, "div", s.slot, n.slot))
+        if s.shape:
+            self.trace.append(("tensor_binop", result.slot, "div", s.slot, n.slot,
+                              self.dtype, s.shape, (), ()))
+        else:
+            self.trace.append(("binop", result.slot, "div", s.slot, n.slot))
         return result
 
     def max(self, axis=None, keepdims=False) -> 'TracerVal':

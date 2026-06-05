@@ -67,6 +67,14 @@ pub enum UnOpKind {
     Not = 1,
     BitNot = 2,
     Abs = 3,
+    Exp = 4,
+    Log = 5,
+    Sqrt = 6,
+    Sin = 7,
+    Cos = 8,
+    Tanh = 9,
+    Sigmoid = 10,
+    Relu = 11,
 }
 
 // =============================================================================
@@ -126,6 +134,9 @@ impl ScalarType {
     pub fn is_signed(&self) -> bool {
         matches!(self, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)
     }
+    /// Number of SIMD lanes for the given ISA level and this scalar type.
+    /// Despite the historical name, this works for ALL scalar types (not just f32).
+    /// The lane count is `vector_width / (element_size * 8)`.
     pub fn f32_lanes(&self, has_avx512: bool, has_avx2: bool) -> usize {
         let vector_width = if has_avx512 { 512 } else if has_avx2 { 256 } else { 128 };
         vector_width / (self.size_bytes() * 8)
@@ -232,6 +243,14 @@ impl Value {
             Value::F64(v) => Some(*v),
             Value::F32(v) => Some(*v as f64),
             Value::I64(v) => Some(*v as f64),
+            Value::I32(v) => Some(*v as f64),
+            Value::I16(v) => Some(*v as f64),
+            Value::I8(v) => Some(*v as f64),
+            Value::U64(v) => Some(*v as f64),
+            Value::U32(v) => Some(*v as f64),
+            Value::U16(v) => Some(*v as f64),
+            Value::U8(v) => Some(*v as f64),
+            Value::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
             _ => None,
         }
     }
@@ -241,6 +260,14 @@ impl Value {
             Value::F32(v) => Some(*v),
             Value::F64(v) => Some(*v as f32),
             Value::I64(v) => Some(*v as f32),
+            Value::I32(v) => Some(*v as f32),
+            Value::I16(v) => Some(*v as f32),
+            Value::I8(v) => Some(*v as f32),
+            Value::U64(v) => Some(*v as f32),
+            Value::U32(v) => Some(*v as f32),
+            Value::U16(v) => Some(*v as f32),
+            Value::U8(v) => Some(*v as f32),
+            Value::Bool(v) => Some(if *v { 1.0f32 } else { 0.0f32 }),
             _ => None,
         }
     }
@@ -695,21 +722,21 @@ pub fn deserialize_instr(data: &[u8]) -> Option<(Instr, usize)> {
             let val = u16::from_le_bytes([data[3], data[4]]);
             Some((Instr::Store(slot, val), 5))
         }
-        0x30 if data.len() >= 9 => {
-            let pc = u64::from_le_bytes(data[1..9].try_into().ok()?) as usize;
-            Some((Instr::Jump(pc as i32), 9))
+        0x30 if data.len() >= 5 => {
+            let off = i32::from_le_bytes(data[1..5].try_into().ok()?);
+            Some((Instr::Jump(off), 5))
         }
-        0x31 if data.len() >= 11 => {
+        0x31 if data.len() >= 7 => {
             let slot = u16::from_le_bytes([data[1], data[2]]);
-            let pc = u64::from_le_bytes(data[3..11].try_into().ok()?) as usize;
-            Some((Instr::JumpFalse(slot, pc as i32), 11))
+            let off = i32::from_le_bytes(data[3..7].try_into().ok()?);
+            Some((Instr::JumpFalse(slot, off), 7))
         }
-        0x32 if data.len() >= 11 => {
+        0x32 if data.len() >= 7 => {
             let slot = u16::from_le_bytes([data[1], data[2]]);
-            let pc = u64::from_le_bytes(data[3..11].try_into().ok()?) as usize;
-            Some((Instr::JumpTrue(slot, pc as i32), 11))
+            let off = i32::from_le_bytes(data[3..7].try_into().ok()?);
+            Some((Instr::JumpTrue(slot, off), 7))
         }
-        0x33 if data.len() >= 38 => {
+        0x33 if data.len() >= 43 => {
             let header_pc = u64::from_le_bytes(data[1..9].try_into().ok()?) as usize;
             let back_edge_pc = u64::from_le_bytes(data[9..17].try_into().ok()?) as usize;
             let slot = u16::from_le_bytes([data[17], data[18]]);
@@ -740,9 +767,63 @@ pub fn deserialize_instr(data: &[u8]) -> Option<(Instr, usize)> {
             let slot = u16::from_le_bytes([data[1], data[2]]);
             Some((Instr::ForceRegisterUnlock { slot }, 3))
         }
+        0x22 if data.len() >= 5 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let src = u16::from_le_bytes([data[3], data[4]]);
+            Some((Instr::Load(dst, src), 5))
+        }
+        0x72 if data.len() >= 11 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let idx = u64::from_le_bytes(data[3..11].try_into().ok()?) as usize;
+            Some((Instr::LoadFn(slot, idx), 11))
+        }
+        0x73 if data.len() >= 11 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let idx = u64::from_le_bytes(data[3..11].try_into().ok()?) as usize;
+            Some((Instr::LoadStr(slot, idx), 11))
+        }
+        0x74 if data.len() >= 11 => {
+            let slot = u16::from_le_bytes([data[1], data[2]]);
+            let idx = u64::from_le_bytes(data[3..11].try_into().ok()?) as usize;
+            Some((Instr::LoadConst(slot, idx), 11))
+        }
+        0x80 if data.len() >= 9 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let fn_reg = u16::from_le_bytes([data[3], data[4]]);
+            let args_start = u16::from_le_bytes([data[5], data[6]]);
+            let arg_count = u16::from_le_bytes([data[7], data[8]]);
+            Some((Instr::Call(dst, fn_reg, args_start, arg_count), 9))
+        }
+        0x81 if data.len() >= 14 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let name_idx = u64::from_le_bytes(data[3..11].try_into().ok()?) as usize;
+            let args_start = u16::from_le_bytes([data[11], data[12]]);
+            let arg_count = u16::from_le_bytes([data[13], data[14]]);
+            Some((Instr::CallBuiltin(dst, name_idx, args_start, arg_count), 14))
+        }
+        0x82 if data.len() >= 16 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let recv = u16::from_le_bytes([data[3], data[4]]);
+            let method_idx = u64::from_le_bytes(data[5..13].try_into().ok()?) as usize;
+            let args_start = u16::from_le_bytes([data[13], data[14]]);
+            let arg_count = u16::from_le_bytes([data[15], data[16]]);
+            Some((Instr::CallMethod(dst, recv, method_idx, args_start, arg_count), 16))
+        }
+        0x90 if data.len() >= 7 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let base = u16::from_le_bytes([data[3], data[4]]);
+            let exp = u16::from_le_bytes([data[5], data[6]]);
+            Some((Instr::PowOp(dst, base, exp), 7))
+        }
+        0x91 if data.len() >= 7 => {
+            let dst = u16::from_le_bytes([data[1], data[2]]);
+            let lhs = u16::from_le_bytes([data[3], data[4]]);
+            let rhs = u16::from_le_bytes([data[5], data[6]]);
+            Some((Instr::MatMulInstr(dst, lhs, rhs), 7))
+        }
         0xA0 => {
             // TensorBinOp: [0xA0] [dst:u16] [op:u8] [lhs:u16] [rhs:u16] [element_ty:u8] [ndim:u16] [shape: ndim×u64] [strides_lhs: ndim×u64] [strides_rhs: ndim×u64]
-            if data.len() < 10 { return None; }
+            if data.len() < 11 { return None; }
             let dst = u16::from_le_bytes([data[1], data[2]]);
             let op = BinOpKind::from_u8(data[3])?;
             let lhs = u16::from_le_bytes([data[4], data[5]]);
@@ -772,7 +853,7 @@ pub fn deserialize_instr(data: &[u8]) -> Option<(Instr, usize)> {
         }
         0xA1 => {
             // TensorReduce: [0xA1] [dst:u16] [op:u8] [src:u16] [axis:u64] [element_ty:u8] [ndim:u16] [src_shape: ndim×u64]
-            if data.len() < 16 { return None; }
+            if data.len() < 17 { return None; }
             let dst = u16::from_le_bytes([data[1], data[2]]);
             let op = ReduceOp::from_u8(data[3])?;
             let src = u16::from_le_bytes([data[4], data[5]]);
@@ -792,7 +873,7 @@ pub fn deserialize_instr(data: &[u8]) -> Option<(Instr, usize)> {
         }
         0xA2 => {
             // TensorMatMul: [0xA2] [dst:u16] [lhs:u16] [rhs:u16] [m:u64] [n:u64] [k:u64] [element_ty:u8] [lhs_layout:u8] [rhs_layout:u8]
-            if data.len() < 31 { return None; }
+            if data.len() < 34 { return None; }
             let dst = u16::from_le_bytes([data[1], data[2]]);
             let lhs = u16::from_le_bytes([data[3], data[4]]);
             let rhs = u16::from_le_bytes([data[5], data[6]]);
@@ -859,6 +940,14 @@ impl UnOpKind {
             1 => Some(UnOpKind::Not),
             2 => Some(UnOpKind::BitNot),
             3 => Some(UnOpKind::Abs),
+            4 => Some(UnOpKind::Exp),
+            5 => Some(UnOpKind::Log),
+            6 => Some(UnOpKind::Sqrt),
+            7 => Some(UnOpKind::Sin),
+            8 => Some(UnOpKind::Cos),
+            9 => Some(UnOpKind::Tanh),
+            10 => Some(UnOpKind::Sigmoid),
+            11 => Some(UnOpKind::Relu),
             _ => None,
         }
     }
