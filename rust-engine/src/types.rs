@@ -618,9 +618,19 @@ pub fn serialize_instr(instr: &Instr) -> Vec<u8> {
             buf.push(*element_ty as u8);
             let ndim = shape.len() as u16;
             buf.extend_from_slice(&ndim.to_le_bytes());
+            // Always write exactly ndim elements for each array.
+            // Scalar broadcasts may have fewer stride entries than ndim;
+            // pad with zeros so the deserializer (which expects ndim per array)
+            // can read a consistent wire format.
             for &d in shape { buf.extend_from_slice(&(d as u64).to_le_bytes()); }
-            for &s in strides_lhs { buf.extend_from_slice(&(s as u64).to_le_bytes()); }
-            for &s in strides_rhs { buf.extend_from_slice(&(s as u64).to_le_bytes()); }
+            for i in 0..ndim as usize {
+                let s = strides_lhs.get(i).copied().unwrap_or(0);
+                buf.extend_from_slice(&(s as u64).to_le_bytes());
+            }
+            for i in 0..ndim as usize {
+                let s = strides_rhs.get(i).copied().unwrap_or(0);
+                buf.extend_from_slice(&(s as u64).to_le_bytes());
+            }
         }
         Instr::TensorReduce { dst, op, src, axis, element_ty, src_shape } => {
             buf.push(0xA1);

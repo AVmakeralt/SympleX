@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "simplex-tensor"
-version = "1.5.1"
+version = "1.5.2"
 description = "SympleX – Polyhedral Tensor Superoptimizer with JAX-style purity enforcement and x86-64 JIT compilation"
 readme = "README.md"
 requires-python = ">=3.10"
