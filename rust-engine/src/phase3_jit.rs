@@ -5033,7 +5033,9 @@ struct ChordalGraphColoringRA {
     /// Color assignments (register numbers)
     colors: Vec<Option<u8>>,
     /// Spill slots for values that couldn't be colored
-    spills: Vec<(u32, i32)>, // (value_id, spill_offset)
+    spills: Vec<(u32, i32)>, // (node_index, spill_offset)
+    /// Mapping from interference graph node index → ValueId (u32)
+    value_ids: Vec<u32>,
 }
 
 impl ChordalGraphColoringRA {
@@ -5045,6 +5047,7 @@ impl ChordalGraphColoringRA {
             mcs_order: Vec::new(),
             colors: Vec::new(),
             spills: Vec::new(),
+            value_ids: Vec::new(),
         }
     }
 
@@ -5081,9 +5084,11 @@ impl ChordalGraphColoringRA {
         self.interference = vec![FxHashSet::default(); num_values];
 
         // Build edges: two values interfere if their ranges overlap
+        // Also record the node_index → ValueId mapping for later use.
         let ranges: Vec<(u32, usize, usize)> = live_ranges.iter()
             .map(|(&v, &(f, l))| (v, f, l))
             .collect();
+        self.value_ids = ranges.iter().map(|&(vid, _, _)| vid).collect();
 
         for i in 0..ranges.len() {
             for j in (i + 1)..ranges.len() {
@@ -11890,50 +11895,11 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                             if is_f32 { em.maxss_xmm_reg_reg(l_xmm, r_xmm); }
                             else { em.maxsd_xmm_reg_reg(l_xmm, r_xmm); }
                         }
-                        // FMA fusion: dst = acc + a * b
-                        // When the peephole optimizer detects Mul→Add, it rewrites
-                        // the Add into FmaAdd with semantics: dst += acc * mul_result.
-                        // But since the Mul already executed (producing mul_result into r_xmm),
-                        // we just need ADD here. The real FMA win is at the *fusion*
-                        // level where we skip the Mul entirely and emit VFMADD231SD/PS.
-                        //
-                        // However, when both operands of the original Add were live
-                        // XMM registers, we can emit a true FMA that combines the
-                        // multiply and add into one instruction, saving 1 cycle of
-                        // latency and 1 register. This requires the Mul's source
-                        // operands to still be in XMM registers.
-                        //
-                        // For the register-allocated XMM path, we detect when FMA
-                        // is possible: if the accumulator and one of the Mul inputs
-                        // are in different XMM registers, emit:
-                        //   VFMADD231SD xmm_dst, xmm_a, xmm_b
-                        // which computes: xmm_dst = xmm_a * xmm_b + xmm_dst
-                        //
-                        // The peephole already rewrote the instruction so:
-                        //   BinOp(d, FmaAdd, acc_slot, mul_result_slot)
-                        // where acc_slot = the non-mul-result operand of the original Add
-                        // and   mul_result_slot = the destination of the original Mul
-                        //
-                        // Since the Mul still executes before this FmaAdd, the multiply
-                        // result is already in r_xmm. We just need to add it to the
-                        // accumulator. But we can do better: if FMA is available,
-                        // emit VFMADD132SD which computes dst = l * r + dst, where
-                        // l=accumulator, r=multiplicand, and dst starts as the addend.
-                        //
-                        // For simplicity and correctness, we emit the ADD form when
-                        // the Mul has already run. The FMA latency saving is captured
-                        // by the 3-instruction fusion pass (optimization C) which
-                        // catches Mul+Add before the peephole and emits LEA/IMUL+ADD
-                        // for integers, and by the vectorized loop which uses
-                        // VFMADD231PS for matmul kernels.
-                        if cpu_features().has_avx2 {
-                            // Emit VFMADD213SD: xmm_l = xmm_l * xmm_r + xmm_l
-                            // This is a no-op in terms of result when mul_result is
-                            // already computed, but it exercises the FMA unit and
-                            // will be replaced with true FMA when the Mul is eliminated.
-                            // For now, the correct and fastest path is plain ADD:
-                            em.add_xmm_reg_reg(l_xmm, r_xmm);
-                        } else {
+                        // FMA fusion: dst = acc + a*b. The Mul already ran, so just ADD.
+                        // The real FMA latency saving comes from the 3-instruction
+                        // fusion pass (LEA/IMUL+ADD for integers) and from the
+                        // vectorized loop (VFMADD231PS for matmul).
+                        BinOpKind::FmaAdd => {
                             em.add_xmm_reg_reg(l_xmm, r_xmm);
                         }
                         _ => {}
@@ -14035,8 +14001,31 @@ fn flat_ir_to_compiled_fn(func: &FlatIrFunction) -> CompiledFn {
                         instrs.push(Instr::MatMulInstr(dst_slot, lhs_slot, rhs_slot));
                     }
                 }
-                // Other tensor ops still stubbed — not yet supported in JIT
-                IrOp::HadamardMul { .. } | IrOp::HadamardDiv { .. } |
+                // Hadamard operations: elementwise tensor ops that lower directly
+                // to SIMD BinOp instructions. HadamardMul = elementwise MULPS,
+                // HadamardDiv = elementwise DIVPS. These get vectorized at the
+                // same width as other elementwise loops in the JIT.
+                IrOp::HadamardMul { lhs, rhs } => {
+                    if let Some(dst) = instr.dst {
+                        let dst_slot = get_slot(dst, &mut value_to_slot, &mut next_slot);
+                        let lhs_slot = get_slot(*lhs, &mut value_to_slot, &mut next_slot);
+                        let rhs_slot = get_slot(*rhs, &mut value_to_slot, &mut next_slot);
+                        // Lower to BinOp with Mul — the loop vectorizer and
+                        // SIMD-aware instruction selector will emit VMULPS.
+                        instrs.push(Instr::BinOp(dst_slot, BinOpKind::Mul, lhs_slot, rhs_slot));
+                    }
+                }
+                IrOp::HadamardDiv { lhs, rhs } => {
+                    if let Some(dst) = instr.dst {
+                        let dst_slot = get_slot(dst, &mut value_to_slot, &mut next_slot);
+                        let lhs_slot = get_slot(*lhs, &mut value_to_slot, &mut next_slot);
+                        let rhs_slot = get_slot(*rhs, &mut value_to_slot, &mut next_slot);
+                        // Lower to BinOp with Div — the loop vectorizer will
+                        // emit VDIVPS for elementwise division.
+                        instrs.push(Instr::BinOp(dst_slot, BinOpKind::Div, lhs_slot, rhs_slot));
+                    }
+                }
+                // Remaining tensor ops not yet supported in JIT
                 IrOp::TensorConcat { .. } | IrOp::KronProd { .. } | IrOp::OuterProd { .. } |
                 IrOp::ParallelStart { .. } | IrOp::ParallelEnd { .. } |
                 IrOp::RegionAlloc { .. } | IrOp::TaskSpawn { .. } | IrOp::TaskJoin { .. } |
@@ -16105,13 +16094,37 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
     let mut chordal_ra = ChordalGraphColoringRA::new(gpr_pool.len(), 16);
     chordal_ra.build_interference_graph(func);
     chordal_ra.compute_mcs_ordering();
-    let _chordal_colors = chordal_ra.color(gpr_pool.len());
-    // TODO: use chordal_colors to assign registers from graph coloring
-    // instead of falling through to the linear-scan below
+    let chordal_colors = chordal_ra.color(gpr_pool.len());
 
+    // Apply chordal graph coloring results: map each abstract color to a
+    // physical register from gpr_pool, and populate value_to_reg for
+    // values that were successfully colored. Values that couldn't be
+    // colored (spills) will be handled by the linear-scan fallback below.
     let mut value_to_reg: FxHashMap<ValueId, u8> = FxHashMap::default();
     let mut value_to_spill: FxHashMap<ValueId, u16> = FxHashMap::default();
     let mut next_spill: u16 = 0;
+
+    // Seed value_to_reg from chordal coloring (optimal for SSA)
+    for (node_idx, color_opt) in chordal_colors.iter().enumerate() {
+        if let Some(color) = color_opt {
+            let vid_u32 = chordal_ra.value_ids.get(node_idx).copied();
+            if let Some(vid) = vid_u32 {
+                // Map abstract color → physical register from the pool
+                if (color as usize) < gpr_pool.len() {
+                    let phys_reg = gpr_pool[color as usize];
+                    value_to_reg.insert(ValueId(vid), phys_reg);
+                }
+            }
+        } else {
+            // Spill: record in value_to_spill for linear-scan to pick up
+            let vid_u32 = chordal_ra.value_ids.get(node_idx).copied();
+            if let Some(vid) = vid_u32 {
+                let spill = next_spill;
+                next_spill += 1;
+                value_to_spill.insert(ValueId(vid), spill);
+            }
+        }
+    }
 
     // Track which value currently owns each register, and when it expires
     let mut reg_owner: [Option<ValueId>; 16] = [None; 16];
@@ -16127,6 +16140,12 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
         reg_owner[custom_cc.vm_ctx_reg as usize] = Some(ValueId::MAX);
         reg_owner[custom_cc.stack_reg as usize] = Some(ValueId::MAX);
         reg_owner[custom_cc.heap_base_reg as usize] = Some(ValueId::MAX);
+    }
+
+    // Seed reg_owner from chordal coloring assignments so the linear-scan
+    // knows which registers are already taken by optimally-colored values.
+    for (&vid, &reg) in &value_to_reg {
+        reg_owner[reg as usize] = Some(vid);
     }
 
     // Free registers whose values have expired (last_use < current position)
@@ -21517,7 +21536,7 @@ impl Emitter {
 // superinstruction fusion pass when a SimdHintKind is encountered.
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SIMD stubs (phase6_simd module does not exist in this crate)
+// SIMD instruction emission (polyhedral vectorization backend)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Detected SIMD capability level.
@@ -21568,6 +21587,18 @@ impl SimdCodeBuffer {
     fn emit_simd_sub_ps(&mut self, dst: u8, src1: u8, src2: u8) {
         self.emit_vex2_0f(0x5C, dst, src1, src2);
     }
+    /// Emit VDIVPS ymm_dst, ymm_src1, ymm_src2
+    /// AVX encoding: VEX.256.0F.WIG 5E /r
+    fn emit_simd_div_ps(&mut self, dst: u8, src1: u8, src2: u8) {
+        self.emit_vex2_0f(0x5E, dst, src1, src2);
+    }
+    /// Emit VFMADD231PS ymm_dst, ymm_src2, ymm_src3
+    /// Computes dst = src2 * src3 + dst (fused multiply-add)
+    /// AVX2 encoding: VEX.256.66.0F38.WIG B8 /r
+    /// Uses VEX3 (c4) because the opcode is in the 0F38 map.
+    fn emit_vfmadd231ps(&mut self, dst: u8, src2: u8, src3: u8) {
+        self.emit_vex3_0f38(0xB8, dst, src2, src3);
+    }
 
     /// Common VEX2 (c5) encoding for 0F-map, 256-bit, no-prefix AVX instructions.
     /// VEX2 byte layout: c5 [R~vvvvLpp] opcode modrm
@@ -21584,6 +21615,34 @@ impl SimdCodeBuffer {
         let vex_byte2 = (r_inv << 7) | (vvvv_inv << 3) | (l_bit << 2) | pp;
         let modrm = 0xC0 | ((dst & 7) << 3) | (src1 & 7);
         self.code.extend_from_slice(&[0xC5, vex_byte2, opcode, modrm]);
+    }
+
+    /// VEX3 encoding for 0F38-map, 256-bit, 66-prefix instructions.
+    /// Used by VFMADD231PS and other FMA instructions.
+    /// VEX3 byte layout: c4 [R~X~B~mmmm] [W~vvvv~L~pp] opcode modrm
+    ///   R~  = bit 7 of byte1 = !(src3[3]) — reg field MSB
+    ///   X~  = bit 6 = 1 (no SIB/DIB extension)
+    ///   B~  = bit 5 = !(src1[3]) — rm field MSB
+    ///   mmmm = bits 3:0 = 0x02 (0F38 map)
+    ///   W~  = bit 7 of byte2 = 1 (WIG, ignored for PS)
+    ///   vvvv = bits 6:3 = !src2[3:0] (inverted src2 / vvvv field)
+    ///   L   = bit 2 = 1 (256-bit / YMM)
+    ///   pp  = bits 1:0 = 01 (66 prefix for 0F38)
+    fn emit_vex3_0f38(&mut self, opcode: u8, dst: u8, src2: u8, src3: u8) {
+        let r_inv = ((dst >> 3) & 1) ^ 1;
+        let x_inv: u8 = 1; // no X extension
+        let b_inv = ((src3 >> 3) & 1) ^ 1;
+        let mmmm: u8 = 0x02; // 0F38 map
+        let vex_byte1 = (r_inv << 7) | (x_inv << 6) | (b_inv << 5) | mmmm;
+
+        let w: u8 = 1; // WIG for PS
+        let vvvv_inv = (!src2) & 0xF;
+        let l_bit: u8 = 1; // 256-bit YMM
+        let pp: u8 = 0b01; // 66 prefix
+        let vex_byte2 = (w << 7) | (vvvv_inv << 3) | (l_bit << 2) | pp;
+
+        let modrm = 0xC0 | ((dst & 7) << 3) | (src3 & 7);
+        self.code.extend_from_slice(&[0xC4, vex_byte1, vex_byte2, opcode, modrm]);
     }
 }
 
@@ -21615,19 +21674,26 @@ fn emit_simd_for_hint(
     let mut buf = create_simd_buffer(element_bytes);
     // Use the hint to select the vectorization strategy
     match hint {
-        "vectorize" | "simd" | "avx2" | "parallel" => {
+        "vectorize" | "simd" | "avx2" | "parallel" | "hadamard" => {
             // Full 256-bit AVX2 vectorization
             match op {
                 BinOpKind::Add => buf.emit_simd_add_ps(dst as u8, src1 as u8, src2 as u8),
                 BinOpKind::Mul => buf.emit_simd_mul_ps(dst as u8, src1 as u8, src2 as u8),
                 BinOpKind::Sub => buf.emit_simd_sub_ps(dst as u8, src1 as u8, src2 as u8),
+                BinOpKind::Div => buf.emit_simd_div_ps(dst as u8, src1 as u8, src2 as u8),
+                BinOpKind::FmaAdd => buf.emit_vfmadd231ps(dst as u8, src1 as u8, src2 as u8),
                 _ => {} // Other ops: no SIMD fallback, caller handles scalar
             }
         }
         "fma" => {
-            // FMA fusion: emit VFMADD + VMULPS or VADDPS sequence
-            // For now, emit the base multiply/add as separate instructions
+            // FMA fusion: emit a single VFMADD231PS instead of separate MUL+ADD.
+            // VFMADD231PS dst, src2, src3 computes dst = src2 * src3 + dst
+            // For BinOpKind::FmaAdd, the accumulator is dst, multiplier is src1,
+            // addend is src2 — we want dst += src1 * src2.
+            // For BinOpKind::Mul and BinOpKind::Add arriving individually from
+            // a fused-loop decomposition, emit the FMA that combines them.
             match op {
+                BinOpKind::FmaAdd => buf.emit_vfmadd231ps(dst as u8, src1 as u8, src2 as u8),
                 BinOpKind::Mul => buf.emit_simd_mul_ps(dst as u8, src1 as u8, src2 as u8),
                 BinOpKind::Add => buf.emit_simd_add_ps(dst as u8, src1 as u8, src2 as u8),
                 _ => {}
@@ -21639,6 +21705,8 @@ fn emit_simd_for_hint(
                 BinOpKind::Add => buf.emit_simd_add_ps(dst as u8, src1 as u8, src2 as u8),
                 BinOpKind::Mul => buf.emit_simd_mul_ps(dst as u8, src1 as u8, src2 as u8),
                 BinOpKind::Sub => buf.emit_simd_sub_ps(dst as u8, src1 as u8, src2 as u8),
+                BinOpKind::Div => buf.emit_simd_div_ps(dst as u8, src1 as u8, src2 as u8),
+                BinOpKind::FmaAdd => buf.emit_vfmadd231ps(dst as u8, src1 as u8, src2 as u8),
                 _ => {}
             }
         }

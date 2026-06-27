@@ -309,7 +309,7 @@ fn emit_avx2_exp_polynomial(em: &mut Emitter) {
 
     // ymm3 = ymm3 + ymm7*ymm0  (high = (c4+c5*r) + r^2*(c6*r))
     em.emit3(0xC5, 0xC4, 0x59); // VMULPS ymm0, ymm7, ymm0  (r^2 * c6*r = r^3*c6)
-    em.b(0xC1;
+    em.b(0xC1);
     em.emit3(0xC5, 0xE4, 0x58); // VADDPS ymm3, ymm3, ymm0
     em.b(0xD8);
 
