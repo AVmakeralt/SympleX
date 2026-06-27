@@ -1,9 +1,0 @@
-{
-  "platform": {
-    "isa": "AVX-512",
-    "avx512": true,
-    "cores": 4,
-    "vec_width": 16
-  },
-  "note": "SympleX parallel_matmul is significantly slower than NumPy BLAS for all GEMM sizes"
-}
