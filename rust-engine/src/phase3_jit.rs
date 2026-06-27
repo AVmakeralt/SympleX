@@ -12578,7 +12578,6 @@ pub fn translate(compiled: &CompiledFn) -> Option<NativeCode> {
                 // This overlaps memory latency with the branch prediction
                 // and loop overhead, saving 20-40% on memory-bound loops.
                 if target < pc {
-                    em.emit_prefetch_t0(0);       // current iteration data
                     em.emit_prefetcht0_rdi(128);   // L1: 2 cache lines ahead
                     em.emit_prefetcht1_rdi(512);   // L2: 8 cache lines ahead
                 }
