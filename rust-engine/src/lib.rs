@@ -30,6 +30,8 @@ pub mod ffi;
 pub mod phase3_jit;
 pub mod tracing_jit;
 pub mod cuda_backend;
+pub mod simd_math;
+pub mod huge_pages;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
