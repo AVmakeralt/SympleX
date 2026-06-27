@@ -1,8 +1,6 @@
 
 //polyhedral.rs
-// =============================================================================
-// SympleX Polyhedral Tensor Optimizer — World-Class ML & Calculus JIT Engine
-// =============================================================================
+// SympleX Polyhedral Tensor Optimizer 
 //
 // Architecture:
 //   §1  Constants & Multi-Dimensional Affine Mathematics
@@ -23,7 +21,6 @@
 //  §16  Strength Reduction (Inductive Variable → Pointer Increment)
 //  §17  Interleave Unroll with Configurable Factor & Register Renaming
 //  §18  Public Transformation Service (Top-Level Pipeline)
-// =============================================================================
 
 use crate::types::{BinOpKind, Instr};
 
@@ -37,13 +34,11 @@ macro_rules! poly_trace {
     ($($arg:tt)*) => {};
 }
 
-// =============================================================================
 // §1. CONSTANTS & MULTI-DIMENSIONAL AFFINE MATHEMATICS
-// =============================================================================
 
 /// Hardcoded maximum loop nesting depth to eliminate heap-allocated maps/vectors
 /// in the multi-dimensional math hot paths.
-pub const MAX_POLY_DEPTH: usize = 8;
+pub const MAX_POLY_DEPTH: usize = 268;
 
 /// Size limit for JIT tracking slots.
 pub const MAX_TRACKED_SLOTS: usize = 4096;
@@ -85,9 +80,7 @@ pub const MAX_UTVPI_CONSTRAINTS: usize = 256;
 /// Default software-pipeline unroll factor (matches half of AVX-512 ZMM count).
 pub const PIPELINE_UNROLL_FACTOR: usize = 8;
 
-// =============================================================================
 // §1b. AFFINE EXPRESSION (stack-resident, Copy)
-// =============================================================================
 
 /// Represents a multi-dimensional affine expression: C0 + C1*v1 + C2*v2 ...
 /// Compact structure that implements Copy to reside completely on the stack.
@@ -231,9 +224,7 @@ fn safe_gcd(mut u: i64, mut v: i64) -> i64 {
     u << shift
 }
 
-// =============================================================================
 // §2. UTVPI EXACT INTEGER SOLVER
-// =============================================================================
 //
 // Fourier-Motzkin Elimination works over *reals* and produces fractional
 // bounds that are conservatively rounded — it misses parallelisation
@@ -427,9 +418,7 @@ impl UtvpiSolver {
     }
 }
 
-// =============================================================================
 // §3. DEPENDENCY ANALYSIS (BANERJEE-WOLFE + UTVPI + N-DIM INTERSECTION)
-// =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction { LT, EQ, GT, ANY }
@@ -655,8 +644,7 @@ pub fn analyze_dependency_multivariate(
     }
     if lo > hi { return None; }
 
-    // ── UTVPI exact integer refinement ─────────────────────────────────────
-    //
+    // UTVPI exact integer refinement
     // If FM could not prove independence (interval is non-empty), we feed the
     // same constraint system to the UTVPI solver for an exact check.  This
     // catches cases where the real-valued interval contains no integer point.
@@ -832,9 +820,7 @@ pub fn classify_dependency_type(
     }
 }
 
-// =============================================================================
 // §4. REDUCTION CLASSIFICATION
-// =============================================================================
 //
 // Scans the statement list inside a SCoP and classifies each slot that
 // accumulates via an associative operator.  The result is a bitset: if bit
@@ -951,9 +937,7 @@ pub fn classify_reductions(arena: &ScopArena) -> ReductionMap {
     map
 }
 
-// =============================================================================
 // §5. SCoP EXTRACTION — ARENA LAYOUT WITH TensorAccessRelation
-// =============================================================================
 
 #[derive(Debug, Clone)]
 pub struct InductionVar {
@@ -1644,9 +1628,7 @@ pub fn apply_virtual_transpose(arena: &mut ScopArena, base_slot: u16, dim_a: usi
     count
 }
 
-// =============================================================================
 // §7. LOOP SKEWING (Wavefront Parallelism for Stencils/FDTD)
-// =============================================================================
 
 #[derive(Debug, Clone)]
 pub struct TransformMatrix {
@@ -1689,9 +1671,7 @@ pub fn build_skew_matrix(dim: usize, time_axis: usize, space_axis: usize, skew_f
     tm
 }
 
-// =============================================================================
 // §8. PHYSICAL TILING LOOP GENERATION WITH INDEX SET SPLITTING
-// =============================================================================
 
 /// A guard condition hoisted from the original loop by the tracing JIT.
 #[derive(Debug, Clone)]
@@ -1767,7 +1747,7 @@ pub fn generate_tiled_loops(scop: &Scop, tile_sizes: &[usize], guard_table: &mut
         out.push(Instr::LoadI64(tile_const_slot, tile_size));
         out.push(Instr::LoadI64(n_const_slot, upper));
 
-        // ── Index Set Splitting ─────────────────────────────────────────────
+        // ── Index Set Splitting 
         let perfect_core = if tile_size > 0 {
             ((upper - lower) / tile_size) * tile_size + lower
         } else {
@@ -1775,7 +1755,7 @@ pub fn generate_tiled_loops(scop: &Scop, tile_sizes: &[usize], guard_table: &mut
         };
         out.push(Instr::LoadI64(core_limit_slot, perfect_core));
 
-        // ── CORE LOOP: guard-free, maximum SIMD throughput ──────────────────
+        // ── CORE LOOP: guard-free, maximum SIMD throughput 
         let l1_pc = out.len();
         out.push(Instr::BinOp(cond_slot, BinOpKind::Ge, ti_slot, core_limit_slot));
         out.push(Instr::JumpTrue(cond_slot, 0));
@@ -1850,9 +1830,7 @@ pub fn generate_tiled_loops(scop: &Scop, tile_sizes: &[usize], guard_table: &mut
     out
 }
 
-// =============================================================================
 // §9. THREE-TIER HIERARCHICAL TILING
-// =============================================================================
 
 /// Generates a three-tier loop nest: L3/L2 macro → L1 midi → register micro.
 ///
@@ -1927,7 +1905,7 @@ pub fn generate_hierarchical_tiled_loops(
         out.push(Instr::Move(l3_lim, tmp));
         out.push(Instr::Move(l1_iv, l3_iv));
 
-        // ── Tier 2: L1 Midi loop ──────────────────────────────────────────
+        // ── Tier 2: L1 Midi loop
         let l1_header = out.len();
         out.push(Instr::BinOp(cond, BinOpKind::Ge, l1_iv, l3_lim));
         out.push(Instr::JumpTrue(cond, 0));
@@ -1942,7 +1920,7 @@ pub fn generate_hierarchical_tiled_loops(
         out.push(Instr::Move(l1_lim, tmp2));
         out.push(Instr::Move(reg_iv, l1_iv));
 
-        // ── Tier 3: Register micro-kernel loop ────────────────────────────
+        // ── Tier 3: Register micro-kernel loop
         let reg_header = out.len();
         out.push(Instr::BinOp(cond, BinOpKind::Ge, reg_iv, l1_lim));
         out.push(Instr::JumpTrue(cond, 0));
@@ -2002,10 +1980,7 @@ pub fn generate_hierarchical_tiled_loops(
     out
 }
 
-// =============================================================================
 // §10. REGISTER-LOCKED MICRO-KERNEL EMISSION (AMX / AVX-512)
-// =============================================================================
-
 /// Represents a micro-kernel as an opaque intrinsic block within the IR.
 /// The register allocator treats these as atomic blocks: all declared
 /// clobbered registers are unavailable during the kernel's lifetime,
@@ -2337,9 +2312,7 @@ pub fn generate_simd_hints(scop: &Scop, tiled_instrs: &[Instr]) -> PolyhedralBlo
     PolyhedralBlock { instrs: tiled_instrs.to_vec(), hints, tiles: Vec::new() }
 }
 
-// =============================================================================
 // §12. SOFTWARE PIPELINING (Hiding L1 Latency)
-// =============================================================================
 //
 // Standard unrolling copies instructions linearly.  If an unrolled
 // instruction immediately relies on the output of the preceding instruction,
@@ -2402,7 +2375,7 @@ pub fn interleave_unroll_pipelined(instrs: &mut Vec<Instr>) -> bool {
         // If there are no loads to overlap with arithmetic, skip.
         if load_instrs.is_empty() || arith_instrs.is_empty() { continue; }
 
-        // ── Find induction variable for the pipeline ───────────────────────
+        // ── Find induction variable for the pipeline 
         let mut iv_slot: Option<u16> = None;
         let mut step_val: i64 = 1;
         for (i, instr) in body.iter().enumerate() {
@@ -2433,7 +2406,7 @@ pub fn interleave_unroll_pipelined(instrs: &mut Vec<Instr>) -> bool {
 
         let mut next_slot = (max_slot + 1) as u16;
 
-        // ── Allocate next-iteration load slots ─────────────────────────────
+        // ── Allocate next-iteration load slots 
         // For each Load instruction, create a "next iteration" version that
         // will be executed before the arithmetic of the current iteration.
         let mut load_next_slots: Vec<(usize, u16, u16)> = Vec::new(); // (orig_idx, orig_dst, next_dst)
@@ -2444,7 +2417,7 @@ pub fn interleave_unroll_pipelined(instrs: &mut Vec<Instr>) -> bool {
             }
         }
 
-        // ── Reassemble the loop body in pipelined order ────────────────────
+        // ── Reassemble the loop body in pipelined order
         let before = instrs[..loop_start].to_vec();
         let after  = instrs[loop_end + 1..].to_vec();
         *instrs = before;
@@ -2513,9 +2486,7 @@ pub fn interleave_unroll_pipelined(instrs: &mut Vec<Instr>) -> bool {
     changed
 }
 
-// =============================================================================
 // §13. FAST-MATH PRIMITIVES
-// =============================================================================
 //
 // Two algebraic relaxations that are safe for ML workloads:
 //
@@ -2697,9 +2668,7 @@ pub fn reciprocal_multiply(instrs: &mut Vec<Instr>) -> bool {
     changed
 }
 
-// =============================================================================
 // §14. ROOFLINE POWER MODEL
-// =============================================================================
 //
 // Determines whether a SCoP is compute-bound or memory-bound using the
 // roofline model:
@@ -2766,9 +2735,7 @@ pub fn calculate_roofline_bottleneck(scop: &Scop, profile: &HardwareProfile) -> 
     }
 }
 
-// =============================================================================
 // §15. MEMORY PADDING & ALIGNMENT
-// =============================================================================
 //
 // Modern CPUs fetch memory in 64-byte cache lines.  If a tensor's innermost
 // dimension is not a multiple of the SIMD register width, every vector load
@@ -2793,9 +2760,7 @@ pub fn pad_to_cache_line(byte_size: usize) -> usize {
     ((byte_size + CACHE_LINE_BYTES - 1) / CACHE_LINE_BYTES) * CACHE_LINE_BYTES
 }
 
-// =============================================================================
 // §15b. CACHE-LINE CONFLICT PADDING
-// =============================================================================
 //
 // When matrix dimensions or tile strides are exact powers of two, parallel
 // memory accesses can hit the same cache set, causing severe conflict misses.
@@ -2986,9 +2951,7 @@ pub fn strength_reduce_poly(instrs: &mut Vec<Instr>) -> bool {
     changed
 }
 
-// =============================================================================
 // §17. INTERLEAVE UNROLL WITH CONFIGURABLE FACTOR & REGISTER RENAMING
-// =============================================================================
 //
 /// Unrolls a loop body by `factor` (default 4, configurable up to 16 for
 /// AVX-512) with **software register renaming** for the induction variable,
@@ -3181,9 +3144,7 @@ fn remap_instr(instr: &mut Instr, remap: &[u16; MAX_TRACKED_SLOTS]) {
     }
 }
 
-// =============================================================================
 // §18. PUBLIC TRANSFORMATION SERVICE (Top-Level Pipeline)
-// =============================================================================
 
 /// Main polyhedral optimization pipeline.
 ///
@@ -3318,7 +3279,7 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
                         }
                     }
 
-                    // ── N-dimensional intersection test ──────────────────────
+                    // ── N-dimensional intersection test
                     if tac_i.rank == tac_j.rank {
                         let mut all_dims_conflict = true;
                         let mut combined_dep: Option<Dependency> = None;
@@ -3379,7 +3340,7 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
             }
         }
 
-        // ── Apply transformations ──────────────────────────────────────────────
+        // ── Apply transformations
         let mut global_transform = TransformMatrix::identity(arena.max_depth.max(1));
 
         if needs_skewing && arena.max_depth >= 2 {
@@ -3474,13 +3435,13 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
         generate_tiled_loops(&scop, &tile_sizes, guard_table)
     };
 
-    // ── Stage 9: Strength Reduction ───────────────────────────────────────
+    // ── Stage 9: Strength Reduction 
     strength_reduce_poly(&mut tiled_ir);
 
-    // ── Stage 10: Software Pipelining ─────────────────────────────────────
+    // ── Stage 10: Software Pipelining 
     interleave_unroll_pipelined(&mut tiled_ir);
 
-    // ── Stage 11: Interleave Unrolling with Register Renaming ─────────────
+    // ── Stage 11: Interleave Unrolling with Register Renaming 
     // Use the hardware target's unroll factor and the roofline attainable_gflops
     // to make informed unrolling decisions.
     let target = HardwareTarget::detect();
@@ -3495,11 +3456,11 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
     let _ = attainable_gflops; // Used by downstream code generators for scheduling
     interleave_unroll_with_factor(&mut tiled_ir, unroll_factor);
 
-    // ── Stage 12: Fast-Math Primitives ────────────────────────────────────
+    // ── Stage 12: Fast-Math Primitives 
     associative_reorder_reduction(&mut tiled_ir);
     reciprocal_multiply(&mut tiled_ir);
 
-    // ── Stage 14: SIMD/AMX Hint Emission ──────────────────────────────────
+    // ── Stage 14: SIMD/AMX Hint Emission 
     let mut block = generate_simd_hints(&scop, &tiled_ir);
 
     // Populate tile info from tiling configuration for cache-conflict analysis.
@@ -3528,7 +3489,7 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
         });
     }
 
-    // ── Stage 15b: Cache-line conflict padding ───────────────────────────
+    // ── Stage 15b: Cache-line conflict padding 
     let cache_pads = apply_cache_padding(&mut block);
     if cache_pads > 0 {
         poly_trace!("[POLY] Applied {} cache-line conflict paddings", cache_pads);
@@ -3575,10 +3536,7 @@ pub fn optimize_trace_polyhedral_with_profile_and_guards(
     block
 }
 
-// =============================================================================
 // §19. ML TUNING ADDITIONS
-// =============================================================================
-
 /// Recommended hotness threshold for ML workloads: trigger JIT compilation
 /// after 16 iterations (ML loops reveal themselves quickly).
 pub const ML_HOTNESS_THRESHOLD: u64 = 16;
@@ -3658,10 +3616,7 @@ pub fn validate_polyhedral_result(_original: &[Instr], _optimized: &[Instr]) -> 
     }
 }
 
-// =============================================================================
 // §20. MATH DOMAIN & FIELD FRACTION (EXACT RATIONAL ARITHMETIC)
-// =============================================================================
-
 /// Represents the fundamental mathematical ring/field element the engine processes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MathDomain {
@@ -3746,10 +3701,7 @@ fn gcd128(mut a: u128, mut b: u128) -> u128 {
     a
 }
 
-// =============================================================================
 // §21. PARAMETRIC POLYHEDRAL BOUNDARIES (DYNAMIC SHAPES FOR ML)
-// =============================================================================
-
 /// Maximum number of symbolic context constants (e.g., B=batch, S=seq_len, N=hidden_dim)
 pub const MAX_SYMBOLIC_CONSTANTS: usize = 8;
 
@@ -3848,10 +3800,7 @@ impl SymbolicContext {
     }
 }
 
-// =============================================================================
 // §22. SPECIALIZED MATHEMATICAL SCoP
-// =============================================================================
-
 /// Extends the SCoP to handle dynamic ML shapes and algebraic expressions.
 #[derive(Debug, Clone)]
 pub struct SpecializedMathematicalSCoP {
@@ -3872,10 +3821,7 @@ pub struct SpecializedMathematicalSCoP {
     pub element_bytes: usize,
 }
 
-// =============================================================================
 // §23. NON-AFFINE & TRANSCENDENTAL FUNCTION FUSION
-// =============================================================================
-
 /// Classification of transcendental function types for fusion
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscendentalKind {
@@ -3937,10 +3883,7 @@ pub fn fuse_transcendentals_into_microkernel(
     true
 }
 
-// =============================================================================
 // §24. RAGGED TENSORS & SPARSITY MAPPING
-// =============================================================================
-
 /// Non-linear guard relation for sparse/ragged tensor access.
 /// Upgrades Index Set Splitting to compile conditional unrolling
 /// for patterns like A[B[i]] or for j in 0..row_ptr[i].
@@ -3971,10 +3914,7 @@ pub fn apply_ragged_tensor_splitting(
     instrs
 }
 
-// =============================================================================
 // §25. POLYHEDRAL REVERSE-MODE AD ENGINE
-// =============================================================================
-
 /// Adjoint SCoP for reverse-mode automatic differentiation.
 /// For every extracted SCoP, the engine automatically constructs its
 /// mathematical dual (the Adjoint SCoP). Because it understands loop
@@ -4090,10 +4030,7 @@ pub fn optimize_adjoint(adjoint: &mut AdjointSCoP) -> PolyhedralBlock {
     optimize_trace_polyhedral(&adjoint.grad_instrs)
 }
 
-// =============================================================================
 // §26. TIME-SPACE WAVEFRONT TILING (PDE/STENCIL)
-// =============================================================================
-
 /// Wavefront tiling configuration for stencil computations.
 /// When solving differential equations across a spatial grid over time,
 /// time acts as an outer loop dependent on inner spatial parameters.
@@ -4200,10 +4137,7 @@ pub fn optimize_stochastic_bounds(
     changed
 }
 
-// =============================================================================
 // §28. FLASHATTENTION-STYLE ONLINE SOFTMAX REDUCTIONS
-// =============================================================================
-
 /// Online reduction statistics for FlashAttention-style tiled softmax.
 /// When the engine detects a Softmax pattern, it splits the iteration space
 /// into blocks that track running statistics (local maximum mᵢ and running
@@ -4335,10 +4269,7 @@ pub fn generate_flash_attention_tiles(
     instrs
 }
 
-// =============================================================================
 // §29. MIXED-PRECISION POLYHEDRAL SPACES
-// =============================================================================
-
 /// Element type classification for mixed-precision support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementType {
@@ -4420,10 +4351,7 @@ pub fn emit_quantization_pack_instrs(
     instrs
 }
 
-// =============================================================================
 // §30. MICRO-KERNEL CONFIG (HARDWARE-NATIVE EXECUTION)
-// =============================================================================
-
 /// Target register geometry definitions for extreme ML execution speeds.
 /// Configures the JIT micro-kernel to match physical hardware tiles.
 #[derive(Debug, Clone, Copy)]
@@ -4494,10 +4422,7 @@ pub fn configure_extreme_ml_kernel(target: &HardwareTarget, element_bytes: usize
     }
 }
 
-// =============================================================================
 // §31. ASYNCHRONOUS DATA COPY & DOUBLE BUFFERING
-// =============================================================================
-
 /// Double buffering configuration for software pipelining.
 /// While the CPU/GPU is calculating execution tile (i, j) in the register
 /// file, the loop generator issues asynchronous prefetch commands for tile
@@ -4558,10 +4483,7 @@ pub fn generate_double_buffered_loop(
 
 // §32. Extended SIMD Hint Kinds — already added to SimdHintKind enum above.
 
-// =============================================================================
 // §33. UPDATED PIPELINE INTEGRATION
-// =============================================================================
-
 /// Specialized optimization pipeline for ML and mathematical workloads.
 /// Detects the math domain, applies domain-specific transformations,
 /// then falls through to the standard polyhedral pipeline.
@@ -4795,10 +4717,7 @@ pub fn optimize_trace_polyhedral_specialized(
     block
 }
 
-// =============================================================================
 // §34. EXTENDED HardwareTarget WITH MicroKernelConfig
-// =============================================================================
-
 impl HardwareTarget {
     /// Get the MicroKernelConfig for this hardware target
     pub fn micro_kernel_config(&self, element_bytes: usize) -> MicroKernelConfig {
