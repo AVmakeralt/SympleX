@@ -2222,7 +2222,7 @@ pub struct Emitter {
     /// was actually used. Previously, vzeroupper was either always
     /// emitted (hurting scalar workloads) or always disabled (hurting
     /// mixed scalar+SIMD workloads). This flag gives the best of both.
-    emitted_simd: bool,
+    pub(crate) emitted_simd: bool,
     /// Tracks whether any AMX tile instruction has been emitted.
     /// Used to emit TILERELEASE in the function epilogue and to
     /// conditionally emit LDTILECFG in the prologue. When AMX is used
@@ -2273,14 +2273,14 @@ impl Emitter {
     }
 
     #[inline(always)]
-    fn pos(&self) -> usize {
+    pub(crate) fn pos(&self) -> usize {
         unsafe { self.write_ptr.offset_from(self.base) as usize }
     }
 
     /// Emit a single byte — zero-overhead raw pointer write.
     /// No bounds check. Safety guaranteed by the 64 KiB safety margin.
     #[inline(always)]
-    fn b(&mut self, v: u8) {
+    pub(crate) fn b(&mut self, v: u8) {
         unsafe {
             std::ptr::write(self.write_ptr, v);
             self.write_ptr = self.write_ptr.add(1);
@@ -2288,7 +2288,7 @@ impl Emitter {
     }
 
     #[inline(always)]
-    fn emit2(&mut self, b0: u8, b1: u8) {
+    pub(crate) fn emit2(&mut self, b0: u8, b1: u8) {
         unsafe {
             let p = self.write_ptr;
             std::ptr::write(p, b0);
@@ -2298,7 +2298,7 @@ impl Emitter {
     }
 
     #[inline(always)]
-    fn emit3(&mut self, b0: u8, b1: u8, b2: u8) {
+    pub(crate) fn emit3(&mut self, b0: u8, b1: u8, b2: u8) {
         unsafe {
             let p = self.write_ptr;
             std::ptr::write(p, b0);
@@ -2309,7 +2309,7 @@ impl Emitter {
     }
 
     #[inline(always)]
-    fn emit4(&mut self, b0: u8, b1: u8, b2: u8, b3: u8) {
+    pub(crate) fn emit4(&mut self, b0: u8, b1: u8, b2: u8, b3: u8) {
         unsafe {
             let p = self.write_ptr;
             std::ptr::write(p, b0);
@@ -2321,7 +2321,7 @@ impl Emitter {
     }
 
     #[inline(always)]
-    fn d(&mut self, v: i32) {
+    pub(crate) fn d(&mut self, v: i32) {
         unsafe {
             let p = self.write_ptr;
             let bytes = v.to_le_bytes();
@@ -2359,7 +2359,7 @@ impl Emitter {
     /// Return the emitted code as a mutable byte slice.
     /// Valid until the Emitter is dropped or `reset()` is called.
     #[inline]
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         let len = self.pos();
         unsafe { std::slice::from_raw_parts_mut(self.base, len) }
     }
@@ -2419,7 +2419,7 @@ impl Emitter {
 
     /// Emit a ModRM byte
     #[inline(always)]
-    fn emit_modrm(&mut self, mode: u8, reg: u8, rm: u8) {
+    pub(crate) fn emit_modrm(&mut self, mode: u8, reg: u8, rm: u8) {
         let modrm = (mode << 6) | ((reg & 0x7) << 3) | (rm & 0x7);
         self.b(modrm);
     }
@@ -2427,7 +2427,7 @@ impl Emitter {
     // ── Immediate loads ──────────────────────────────────────────────────────
 
     /// Full 64-bit immediate into rax (10 bytes).
-    fn mov_rax_imm64(&mut self, v: i64) {
+    pub(crate) fn mov_rax_imm64(&mut self, v: i64) {
         self.emit_rex(true, false, false, false); // REX.W for 64-bit operand
         self.b(0xB8);
         self.q(v);
@@ -2437,7 +2437,7 @@ impl Emitter {
     ///  v ≥ 0 and fits i32 → MOV EAX, imm32 (5 B, zero-extends)
     ///  v <  0 and fits i32 → REX.W MOV RAX, sign-ext imm32 (7 B)
     ///  otherwise           → MOV RAX, imm64 (10 B)
-    fn mov_rax_imm_opt(&mut self, v: i64) {
+    pub(crate) fn mov_rax_imm_opt(&mut self, v: i64) {
         if let Ok(v32) = i32::try_from(v) {
             if v32 >= 0 {
                 self.b(0xB8);
@@ -2530,13 +2530,13 @@ impl Emitter {
     fn inc_rax(&mut self) {
         self.emit3(0x48, 0xFF, 0xC0);
     }
-    fn dec_rax(&mut self) {
+    pub(crate) fn dec_rax(&mut self) {
         self.emit3(0x48, 0xFF, 0xC8);
     }
     fn neg_rax(&mut self) {
         self.emit3(0x48, 0xF7, 0xD8);
     }
-    fn shl_rax_imm8(&mut self, v: u8) {
+    pub(crate) fn shl_rax_imm8(&mut self, v: u8) {
         self.emit4(0x48, 0xC1, 0xE0, v);
     }
 
@@ -2598,7 +2598,7 @@ impl Emitter {
         self.emit3(0x48, 0xD3, 0xE8); // SHR r/m64, CL → REX.W D3 /5, ModRM=11 101 000
     }
     /// AND RAX, imm32
-    fn and_rax_imm32(&mut self, v: i32) {
+    pub(crate) fn and_rax_imm32(&mut self, v: i32) {
         if let Ok(v8) = i8::try_from(v) {
             self.emit3(0x48, 0x83, 0xE0);
             self.b(v8 as u8); // AND RAX, imm8
@@ -2652,10 +2652,10 @@ impl Emitter {
 
     // ── Division ─────────────────────────────────────────────────────────────
 
-    fn cqo(&mut self) {
+    pub(crate) fn cqo(&mut self) {
         self.emit2(0x48, 0x99);
     }
-    fn idiv_rcx(&mut self) {
+    pub(crate) fn idiv_rcx(&mut self) {
         self.emit3(0x48, 0xF7, 0xF9);
     }
     fn mov_rax_rdx(&mut self) {
@@ -2724,7 +2724,7 @@ impl Emitter {
     /// TEST RAX, RAX — 3 bytes. Tests all 64 bits for zero.
     /// Previously used TEST EAX,EAX (2 bytes) which only checked the low 32 bits,
     /// causing values like 0x1_0000_0000 to be incorrectly treated as zero.
-    fn test_rax_rax(&mut self) {
+    pub(crate) fn test_rax_rax(&mut self) {
         // TEST RAX, RAX — checks all 64 bits. Required for i64 branch conditions
         // where the value may have non-zero upper 32 bits (e.g., i64 values > 2^32).
         self.emit3(0x48, 0x85, 0xC0); // TEST RAX, RAX
@@ -2894,7 +2894,7 @@ impl Emitter {
         p
     }
 
-    fn ret(&mut self) {
+    pub(crate) fn ret(&mut self) {
         self.b(0xC3);
     }
 
@@ -3665,7 +3665,7 @@ impl Emitter {
 
     /// vpbroadcastd ymm_dst, xmm_src — broadcast 32-bit int to all 8 lanes.
     /// Uses VEX.256.66.0F38.WIG 58 /r.  Requires VEX3 for 0F38 escape.
-    fn vpbroadcastd_ymm_xmm(&mut self, dst: u8, src: u8) {
+    pub(crate) fn vpbroadcastd_ymm_xmm(&mut self, dst: u8, src: u8) {
         // ModRM: reg=dst, rm=src. R~ from dst high bit, B~ from src high bit.
         let r_inv = !(dst >= 8) as u8;
         let b_inv = !(src >= 8) as u8;
@@ -3680,7 +3680,7 @@ impl Emitter {
 
     /// vmovd xmm_dst, r32 — move 32-bit GPR value to low XMM lane.
     /// Uses VEX.128.66.0F.WIG 6E /r.
-    fn vmovd_xmm_r32(&mut self, dst: u8, src_gpr: u8) {
+    pub(crate) fn vmovd_xmm_r32(&mut self, dst: u8, src_gpr: u8) {
         let byte1 = (!(dst >= 8) as u8) << 7
             | (0xF << 3)    // vvvv=1111 (unused)
             | (0 << 2)      // L=0 for 128-bit
@@ -3765,13 +3765,13 @@ impl Emitter {
     // Short-form PUSH/POP r64: 0x50+rd  (rd = reg & 7)
     // r8-r15 require REX.B prefix (0x41).
 
-    fn push_reg(&mut self, reg: u8) {
+    pub(crate) fn push_reg(&mut self, reg: u8) {
         if reg >= 8 {
             self.b(0x41);
         }
         self.b(0x50 + (reg & 7));
     }
-    fn pop_reg(&mut self, reg: u8) {
+    pub(crate) fn pop_reg(&mut self, reg: u8) {
         if reg >= 8 {
             self.b(0x41);
         }
@@ -16110,8 +16110,8 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
             let vid_u32 = chordal_ra.value_ids.get(node_idx).copied();
             if let Some(vid) = vid_u32 {
                 // Map abstract color → physical register from the pool
-                if (color as usize) < gpr_pool.len() {
-                    let phys_reg = gpr_pool[color as usize];
+                if (*color as usize) < gpr_pool.len() {
+                    let phys_reg = gpr_pool[*color as usize];
                     value_to_reg.insert(ValueId(vid), phys_reg);
                 }
             }
@@ -20035,7 +20035,7 @@ impl Emitter {
 
     /// Emit kmovw k1, eax — load 16-bit mask from EAX to opmask register.
     /// Encoding: VEX.NDS.LIG.0F.W0 92 /r  (C5 F8 92 C8 for k1)
-    fn emit_kmovw_k_eax(&mut self, mask_reg: u8) {
+    pub(crate) fn emit_kmovw_k_eax(&mut self, mask_reg: u8) {
         self.emit3(0xC5, 0xF8, 0x92);
         self.b(0xC0 | ((mask_reg & 7) << 3)); // ModRM: mod=11, reg=k, rm=eax
     }
@@ -20099,7 +20099,7 @@ impl Emitter {
     /// Handles register numbers 0-31 for dst, src1, src2.
     /// pp = mandatory prefix: 00=none, 01=66, 10=F3, 11=F2
     /// mask_reg = opmask register (0 = k0 = no masking)
-    fn emit_evex_prefix_512(&mut self, dst: u8, src1: u8, src2: u8, pp: u8, mm: u8, mask_reg: u8) {
+    pub(crate) fn emit_evex_prefix_512(&mut self, dst: u8, src1: u8, src2: u8, pp: u8, mm: u8, mask_reg: u8) {
         self.emitted_simd = true; // EVEX-encoded instructions are SIMD (AVX-512)
         self.b(0x62); // EVEX byte 0
         // P0: [R~][X~][B~][R'][0][m][m][m]
@@ -20153,7 +20153,7 @@ impl Emitter {
     /// Fused multiply-add: dst = src1 * src2 + dst  (IEEE 754 compliant, single rounding)
     /// Encoding: EVEX.512.66.0F38.W0 B8 /r
     /// This is the core instruction for high-performance matmul on AVX-512.
-    fn emit_vfmadd231ps_zmm(&mut self, dst: u8, src1: u8, src2: u8) {
+    pub(crate) fn emit_vfmadd231ps_zmm(&mut self, dst: u8, src1: u8, src2: u8) {
         self.emit_evex_prefix_512(dst, src1, src2, 1, 0b10, 0); // pp=66, mm=0F38
         self.b(0xB8); // VFMADD231PS opcode
         self.emit_modrm(3, dst & 7, src2 & 7);
@@ -20176,7 +20176,7 @@ impl Emitter {
 
     /// VBROADCASTSS zmm_dst, [mem] — broadcast a single f32 to all 16 lanes of ZMM.
     /// Encoding: EVEX.512.66.0F38.W0 18 /r
-    fn emit_vbroadcastss_zmm_mem(&mut self, dst: u8, base: u8, disp: i32) {
+    pub(crate) fn emit_vbroadcastss_zmm_mem(&mut self, dst: u8, base: u8, disp: i32) {
         self.emit_evex_prefix_512_mem(dst, 0, base, 1, 0b10, 0); // vvvv=0, pp=66, mm=0F38
         self.b(0x18); // VBROADCASTSS opcode
         self.emit_modrm(2, dst & 7, base & 7);
@@ -20220,7 +20220,7 @@ impl Emitter {
 
     /// VADDPS zmm_dst, zmm_src1, zmm_src2 — packed f32 add (16 lanes).
     /// Encoding: EVEX.512.66.0F.W0 58 /r
-    fn emit_vaddps_zmm(&mut self, dst: u8, src1: u8, src2: u8) {
+    pub(crate) fn emit_vaddps_zmm(&mut self, dst: u8, src1: u8, src2: u8) {
         self.emit_evex_prefix_512(dst, src1, src2, 1, 0b01, 0);
         self.b(0x58); // VADDPS opcode
         self.emit_modrm(3, dst & 7, src2 & 7);
@@ -20228,7 +20228,7 @@ impl Emitter {
 
     /// VMULPS zmm_dst, zmm_src1, zmm_src2 — packed f32 multiply (16 lanes).
     /// Encoding: EVEX.512.66.0F.W0 59 /r
-    fn emit_vmulps_zmm(&mut self, dst: u8, src1: u8, src2: u8) {
+    pub(crate) fn emit_vmulps_zmm(&mut self, dst: u8, src1: u8, src2: u8) {
         self.emit_evex_prefix_512(dst, src1, src2, 1, 0b01, 0);
         self.b(0x59); // VMULPS opcode
         self.emit_modrm(3, dst & 7, src2 & 7);
@@ -20237,7 +20237,7 @@ impl Emitter {
     /// VMOVUPS zmm_dst, [mem] — unaligned load 64 bytes (16 × f32) into ZMM.
     /// Encoding: EVEX.512.66.0F.W0 10 /r
     /// mask_reg: opmask register (0 = k0 = no masking)
-    fn emit_vmovups_zmm_load(&mut self, dst: u8, base: u8, disp: i32, mask_reg: u8) {
+    pub(crate) fn emit_vmovups_zmm_load(&mut self, dst: u8, base: u8, disp: i32, mask_reg: u8) {
         self.emit_evex_prefix_512_mem(dst, 0, base, 1, 0b01, mask_reg);
         self.b(0x10); // VMOVUPS opcode
         self.emit_modrm(2, dst & 7, base & 7);
@@ -20249,7 +20249,7 @@ impl Emitter {
 
     /// VMOVUPS [mem], zmm_src — unaligned store 64 bytes from ZMM to memory.
     /// Encoding: EVEX.512.66.0F.W0 11 /r
-    fn emit_vmovups_zmm_store(&mut self, base: u8, disp: i32, src: u8) {
+    pub(crate) fn emit_vmovups_zmm_store(&mut self, base: u8, disp: i32, src: u8) {
         self.emit_evex_prefix_512_mem(src, 0, base, 1, 0b01, 0);
         self.b(0x11); // VMOVUPS opcode
         self.emit_modrm(2, src & 7, base & 7);
@@ -21471,7 +21471,7 @@ impl Emitter {
     ///
     /// Encoding: 0F 18 /1 (PREFETCHT0 = ModRM reg field = 1)
     /// For [RDI + disp32]: 0F 18 8F [disp32]
-    fn emit_prefetcht0_rdi(&mut self, offset: i32) {
+    pub(crate) fn emit_prefetcht0_rdi(&mut self, offset: i32) {
         self.b(0x0F);
         self.b(0x18);
         // ModRM: mod=10 (disp32), reg=1 (PREFETCHT0), rm=7 (RDI)
@@ -21489,7 +21489,7 @@ impl Emitter {
     /// Emit a PREFETCHT1 instruction (prefetch into L2/L3, not L1).
     /// Useful for streaming access patterns where data won't be reused soon.
     /// Encoding: 0F 18 /2
-    fn emit_prefetcht1_rdi(&mut self, offset: i32) {
+    pub(crate) fn emit_prefetcht1_rdi(&mut self, offset: i32) {
         self.b(0x0F);
         self.b(0x18);
         // ModRM: mod=10 (disp32), reg=2 (PREFETCHT1), rm=7 (RDI)

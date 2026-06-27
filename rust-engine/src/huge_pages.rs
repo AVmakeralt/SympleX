@@ -281,21 +281,29 @@ impl HugePageBuffer {
 
         // Parallel first touch for large allocations using rayon
         // Each thread touches pages that it will later process
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-        rayon::scope(|s| {
-            let num_threads = rayon::current_num_threads().max(1);
-            let pages_per_thread = (num_pages + num_threads - 1) / num_threads;
+        // We split the slice into per-thread chunks to avoid move issues
+        // with the mutable reference across rayon closures.
+        let num_threads = rayon::current_num_threads().max(1);
+        let pages_per_thread = (num_pages + num_threads - 1) / num_threads;
+        let chunk_bytes = pages_per_thread * page_size;
 
+        // Use atomic writes through raw pointer to avoid borrow splitting
+        // Cast to usize before spawning threads — usize is Send, *mut u8 is not.
+        let ptr_start = ptr as usize;
+        rayon::scope(|s| {
             for thread_id in 0..num_threads {
-                let start_page = thread_id * pages_per_thread;
-                let end_page = ((thread_id + 1) * pages_per_thread).min(num_pages);
+                let start_byte = thread_id * chunk_bytes;
+                let end_byte = ((thread_id + 1) * chunk_bytes).min(len);
+                let thread_ptr_val = ptr_start + start_byte;
 
                 s.spawn(move |_| {
-                    for page_idx in start_page..end_page {
-                        let offset = page_idx * page_size;
-                        if offset < len {
-                            slice[offset] = 0;
+                    let thread_ptr = thread_ptr_val as *mut u8;
+                    let mut offset = 0;
+                    while offset + start_byte < end_byte {
+                        if offset + start_byte < len {
+                            unsafe { *thread_ptr.add(offset) = 0; }
                         }
+                        offset += page_size;
                     }
                 });
             }

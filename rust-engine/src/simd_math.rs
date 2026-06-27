@@ -484,22 +484,22 @@ fn emit_simd_exp_avx2(em: &mut Emitter) -> bool {
     load_f32_imm_to_xmm(em, 5, EXP_COEFFS[0] as f32); // c0
     load_f32_imm_to_xmm(em, 6, EXP_COEFFS[1] as f32); // c1
     em.emit4(0xF3, 0x0F, 0x59, 0xF0); // MULSS xmm6, xmm0  → c1*r
-    em.emit4(0x0F, 0x58, 0xF5);         // ADDSS xmm6, xmm5  → c0+c1*r
+    em.emit3(0x0F, 0x58, 0xF5);         // ADDSS xmm6, xmm5  → c0+c1*r
 
     load_f32_imm_to_xmm(em, 5, EXP_COEFFS[2] as f32); // c2
     load_f32_imm_to_xmm(em, 7, EXP_COEFFS[3] as f32); // c3
     em.emit4(0xF3, 0x0F, 0x59, 0xF8); // MULSS xmm7, xmm0  → c3*r
-    em.emit4(0x0F, 0x58, 0xFD);         // ADDSS xmm7, xmm5  → c2+c3*r
+    em.emit3(0x0F, 0x58, 0xFD);         // ADDSS xmm7, xmm5  → c2+c3*r
 
     // xmm7 = xmm4 * xmm7  (r^2 * (c2+c3*r))
     em.emit4(0xF3, 0x0F, 0x59, 0xFC); // MULSS xmm7, xmm4
     // xmm6 = xmm6 + xmm7  (low + mid*r^2)
-    em.emit4(0x0F, 0x58, 0xF7);         // ADDSS xmm6, xmm7
+    em.emit3(0x0F, 0x58, 0xF7);         // ADDSS xmm6, xmm7
 
     load_f32_imm_to_xmm(em, 5, EXP_COEFFS[4] as f32); // c4
     load_f32_imm_to_xmm(em, 7, EXP_COEFFS[5] as f32); // c5
     em.emit4(0xF3, 0x0F, 0x59, 0xF8); // MULSS xmm7, xmm0  → c5*r
-    em.emit4(0x0F, 0x58, 0xFD);         // ADDSS xmm7, xmm5  → c4+c5*r
+    em.emit3(0x0F, 0x58, 0xFD);         // ADDSS xmm7, xmm5  → c4+c5*r
 
     load_f32_imm_to_xmm(em, 5, EXP_COEFFS[6] as f32); // c6
     em.emit4(0xF3, 0x0F, 0x59, 0xE8); // MULSS xmm5, xmm0  → c6*r
@@ -509,7 +509,7 @@ fn emit_simd_exp_avx2(em: &mut Emitter) -> bool {
     // Actually: xmm5 = c6*r, xmm4 = r^2 → xmm5 = xmm4 * xmm5 = r^3*c6
     em.emit4(0xF3, 0x0F, 0x59, 0xEC); // MULSS xmm5, xmm4 → r^2 * (c6*r)
     // xmm7 = xmm7 + xmm5  ((c4+c5*r) + r^2*c6*r)
-    em.emit4(0x0F, 0x58, 0xFD);         // ADDSS xmm7, xmm5
+    em.emit3(0x0F, 0x58, 0xFD);         // ADDSS xmm7, xmm5
 
     // Need r^4: we computed r^2 in xmm4 earlier, but we just multiplied it.
     // Let's recompute: xmm4 = r^2
@@ -518,14 +518,14 @@ fn emit_simd_exp_avx2(em: &mut Emitter) -> bool {
     // xmm7 = xmm7 * xmm4  (high * r^4)
     em.emit4(0xF3, 0x0F, 0x59, 0xFC); // MULSS xmm7, xmm4
     // xmm6 = xmm6 + xmm7  (full polynomial)
-    em.emit4(0x0F, 0x58, 0xF7);         // ADDSS xmm6, xmm7
+    em.emit3(0x0F, 0x58, 0xF7);         // ADDSS xmm6, xmm7
 
     // xmm6 now = exp(r)
     // Reconstruct: 2^k * exp(r)
     // k is in xmm2 as float. Compute 2^k via bit manipulation.
     // Add 127, convert to int, shift left 23, reinterpret as float
     load_f32_imm_to_xmm(em, 1, 127.0f32);
-    em.emit4(0x0F, 0x58, 0xD1);         // ADDSS xmm2, xmm1  → k + 127
+    em.emit3(0x0F, 0x58, 0xD1);         // ADDSS xmm2, xmm1  → k + 127
     // CVTTSS2SI eax, xmm2
     em.emit4(0xF3, 0x0F, 0x2C, 0xC2); // CVTTSS2SI eax, xmm2
     // Shift left 23
@@ -543,7 +543,7 @@ fn emit_simd_exp_avx2(em: &mut Emitter) -> bool {
     em.emit4(0x48, 0x83, 0xC6, 4); // ADD RSI, 4
 
     // Decrement scalar counter (R12)
-    em.emit4(0x49, 0xFF, 0xCC); // DEC R12
+    em.emit3(0x49, 0xFF, 0xCC); // DEC R12
 
     // Loop back if R12 > 0
     em.emit3(0x4D, 0x85, 0xE4); // TEST R12, R12
@@ -597,7 +597,7 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     let vec_loop_start = em.pos();
 
     // Load 4 f32 from [RSI]: MOVAPS xmm0, [rsi]
-    em.emit4(0x0F, 0x28, 0x06); // MOVAPS xmm0, [rsi]
+    em.emit3(0x0F, 0x28, 0x06); // MOVAPS xmm0, [rsi]
 
     // Range reduction: k = round(x * (1/ln2)), r = x - k*ln2
     // Broadcast 1/ln2 into xmm1
@@ -607,7 +607,7 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     em.emit4(0x0F, 0xC6, 0xC9, 0x00); // SHUFPS xmm1, xmm1, 0
 
     // xmm2 = x * (1/ln2)
-    em.emit4(0x0F, 0x59, 0xD1); // MULPS xmm2, xmm1, xmm0
+    em.emit3(0x0F, 0x59, 0xD1); // MULPS xmm2, xmm1, xmm0
 
     // Round: use VROUNDPS if AVX available, otherwise use a floor+0.5 trick
     // Since SSE2 doesn't have VROUNDPS, we use: round(x) = floor(x + 0.5)
@@ -615,7 +615,7 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     // CVTPS2DQ xmm3, xmm2 (round to nearest, convert to int)
     em.emit4(0x66, 0x0F, 0x5B, 0xDA); // CVTPS2DQ xmm3, xmm2
     // CVTDQ2PS xmm3, xmm3 (convert back to float — this is k)
-    em.emit4(0x0F, 0x5B, 0xDB); // CVTDQ2PS xmm3, xmm3
+    em.emit3(0x0F, 0x5B, 0xDB); // CVTDQ2PS xmm3, xmm3
 
     // Broadcast ln2 into xmm4
     em.mov_rax_imm64((LN2_F64 as f32).to_bits() as i64);
@@ -623,14 +623,14 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     em.emit4(0x0F, 0xC6, 0xE4, 0x00); // SHUFPS xmm4, xmm4, 0
 
     // xmm5 = k * ln2
-    em.emit4(0x0F, 0x59, 0xEB); // MULPS xmm5, xmm3, xmm4
+    em.emit3(0x0F, 0x59, 0xEB); // MULPS xmm5, xmm3, xmm4
 
     // xmm6 = r = x - k*ln2
-    em.emit4(0x0F, 0x5C, 0xF0); // SUBPS xmm6, xmm0, xmm5
+    em.emit3(0x0F, 0x5C, 0xF0); // SUBPS xmm6, xmm0, xmm5
 
     // ── Polynomial: same as AVX2 but XMM ──
     // xmm7 = r^2
-    em.emit4(0x0F, 0x59, 0xFE); // MULPS xmm7, xmm6, xmm6
+    em.emit3(0x0F, 0x59, 0xFE); // MULPS xmm7, xmm6, xmm6
 
     // c0 + r*c1
     em.mov_rax_imm64((EXP_COEFFS[0] as f32).to_bits() as i64);
@@ -639,8 +639,8 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     em.mov_rax_imm64((EXP_COEFFS[1] as f32).to_bits() as i64);
     em.vmovd_xmm_r32(1, 0);
     em.emit4(0x0F, 0xC6, 0xC9, 0x00); // SHUFPS xmm1, xmm1, 0
-    em.emit4(0x0F, 0x59, 0xCE); // MULPS xmm1, xmm1, xmm6 → c1*r
-    em.emit4(0x0F, 0x58, 0xC1); // ADDPS xmm0, xmm1 → c0+c1*r → xmm0
+    em.emit3(0x0F, 0x59, 0xCE); // MULPS xmm1, xmm1, xmm6 → c1*r
+    em.emit3(0x0F, 0x58, 0xC1); // ADDPS xmm0, xmm1 → c0+c1*r → xmm0
 
     // c2 + r*c3
     em.mov_rax_imm64((EXP_COEFFS[2] as f32).to_bits() as i64);
@@ -649,12 +649,12 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     em.mov_rax_imm64((EXP_COEFFS[3] as f32).to_bits() as i64);
     em.vmovd_xmm_r32(2, 0);
     em.emit4(0x0F, 0xC6, 0xD2, 0x00); // SHUFPS xmm2, xmm2, 0
-    em.emit4(0x0F, 0x59, 0xD6); // MULPS xmm2, xmm2, xmm6 → c3*r
-    em.emit4(0x0F, 0x58, 0xD1); // ADDPS xmm2, xmm1 → c2+c3*r → xmm2
+    em.emit3(0x0F, 0x59, 0xD6); // MULPS xmm2, xmm2, xmm6 → c3*r
+    em.emit3(0x0F, 0x58, 0xD1); // ADDPS xmm2, xmm1 → c2+c3*r → xmm2
 
     // c2+c3*r times r^2
-    em.emit4(0x0F, 0x59, 0xD7); // MULPS xmm2, xmm7 → r^2*(c2+c3*r)
-    em.emit4(0x0F, 0x58, 0xC2); // ADDPS xmm0, xmm2 → low+mid
+    em.emit3(0x0F, 0x59, 0xD7); // MULPS xmm2, xmm7 → r^2*(c2+c3*r)
+    em.emit3(0x0F, 0x58, 0xC2); // ADDPS xmm0, xmm2 → low+mid
 
     // c4 + r*c5
     em.mov_rax_imm64((EXP_COEFFS[4] as f32).to_bits() as i64);
@@ -663,43 +663,43 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     em.mov_rax_imm64((EXP_COEFFS[5] as f32).to_bits() as i64);
     em.vmovd_xmm_r32(2, 0);
     em.emit4(0x0F, 0xC6, 0xD2, 0x00); // SHUFPS
-    em.emit4(0x0F, 0x59, 0xD6); // MULPS xmm2, xmm6 → c5*r
-    em.emit4(0x0F, 0x58, 0xD1); // ADDPS xmm2, xmm1 → c4+c5*r
+    em.emit3(0x0F, 0x59, 0xD6); // MULPS xmm2, xmm6 → c5*r
+    em.emit3(0x0F, 0x58, 0xD1); // ADDPS xmm2, xmm1 → c4+c5*r
 
     // c6*r
     em.mov_rax_imm64((EXP_COEFFS[6] as f32).to_bits() as i64);
     em.vmovd_xmm_r32(1, 0);
     em.emit4(0x0F, 0xC6, 0xC9, 0x00); // SHUFPS
-    em.emit4(0x0F, 0x59, 0xCE); // MULPS xmm1, xmm6 → c6*r
+    em.emit3(0x0F, 0x59, 0xCE); // MULPS xmm1, xmm6 → c6*r
 
     // high = (c4+c5*r) + r^2*(c6*r)
-    em.emit4(0x0F, 0x59, 0xCF); // MULPS xmm1, xmm7 → r^2*(c6*r)
-    em.emit4(0x0F, 0x58, 0xD1); // ADDPS xmm2, xmm1 → high
+    em.emit3(0x0F, 0x59, 0xCF); // MULPS xmm1, xmm7 → r^2*(c6*r)
+    em.emit3(0x0F, 0x58, 0xD1); // ADDPS xmm2, xmm1 → high
 
     // r^4 = r^2 * r^2
-    em.emit4(0x0F, 0x59, 0xFF); // MULPS xmm7, xmm7 → r^4
+    em.emit3(0x0F, 0x59, 0xFF); // MULPS xmm7, xmm7 → r^4
     // xmm2 = high * r^4
-    em.emit4(0x0F, 0x59, 0xD7); // MULPS xmm2, xmm7
+    em.emit3(0x0F, 0x59, 0xD7); // MULPS xmm2, xmm7
     // xmm0 = low+mid + high*r^4
-    em.emit4(0x0F, 0x58, 0xC2); // ADDPS xmm0, xmm2
+    em.emit3(0x0F, 0x58, 0xC2); // ADDPS xmm0, xmm2
 
     // ── Reconstruct ──
     // k+127, convert to int, shift 23, reinterpret
     em.mov_rax_imm64((127.0f32).to_bits() as i64);
     em.vmovd_xmm_r32(1, 0);
     em.emit4(0x0F, 0xC6, 0xC9, 0x00); // SHUFPS xmm1, xmm1, 0
-    em.emit4(0x0F, 0x58, 0xD9); // ADDPS xmm3, xmm1 → k+127
+    em.emit3(0x0F, 0x58, 0xD9); // ADDPS xmm3, xmm1 → k+127
     em.emit4(0x66, 0x0F, 0x5B, 0xDB); // CVTPS2DQ xmm3, xmm3
     // Shift each dword left 23 using PSLLD
     em.emit4(0x66, 0x0F, 0x72, 0xF3); // PSLLD xmm3, 23
     em.b(0x17);
     // Convert back to float: CVTDQ2PS xmm3, xmm3
-    em.emit4(0x0F, 0x5B, 0xDB); // CVTDQ2PS xmm3, xmm3
+    em.emit3(0x0F, 0x5B, 0xDB); // CVTDQ2PS xmm3, xmm3
     // Multiply: xmm0 = exp(r) * 2^k
-    em.emit4(0x0F, 0x59, 0xC3); // MULPS xmm0, xmm3
+    em.emit3(0x0F, 0x59, 0xC3); // MULPS xmm0, xmm3
 
     // Store 4 f32 to [RDI]
-    em.emit4(0x0F, 0x29, 0x07); // MOVAPS [rdi], xmm0
+    em.emit3(0x0F, 0x29, 0x07); // MOVAPS [rdi], xmm0
 
     // Advance pointers: RDI += 16, RSI += 16
     em.emit4(0x48, 0x83, 0xC7, 16); // ADD RDI, 16
@@ -747,7 +747,7 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     em.emit4(0xF3, 0x0F, 0x59, 0xC8); // MULSS xmm1, xmm0
     // Round: CVTSS2SI + CVTSI2SS
     em.emit4(0xF3, 0x0F, 0x2C, 0xD1); // CVTTSS2SI edx, xmm1
-    em.emit4(0x0F, 0x2D, 0xD2);         // CVTSI2SS xmm2, edx  → k
+    em.emit3(0x0F, 0x2D, 0xD2);         // CVTSI2SS xmm2, edx  → k
     // r = x - k*ln2
     load_f32_imm_to_xmm(em, 3, LN2_F64 as f32);
     em.emit4(0xF3, 0x0F, 0x59, 0xD3); // MULSS xmm3, xmm2  → k*ln2
@@ -762,12 +762,12 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     load_f32_imm_to_xmm(em, 5, 0.041666667f32); // 1/24
     load_f32_imm_to_xmm(em, 6, 0.166666667f32); // 1/6
     em.emit4(0xF3, 0x0F, 0x59, 0xE8); // MULSS xmm5, xmm0 → r/24
-    em.emit4(0x0F, 0x58, 0xEE);         // ADDSS xmm5, xmm6 → 1/6 + r/24
+    em.emit3(0x0F, 0x58, 0xEE);         // ADDSS xmm5, xmm6 → 1/6 + r/24
     em.emit4(0xF3, 0x0F, 0x59, 0xE8); // MULSS xmm5, xmm0 → r*(1/6+r/24)
-    em.emit4(0x0F, 0x58, 0xE9);         // ADDSS xmm5, xmm1 → 1/2 + r*(1/6+r/24)
+    em.emit3(0x0F, 0x58, 0xE9);         // ADDSS xmm5, xmm1 → 1/2 + r*(1/6+r/24)
     em.emit4(0xF3, 0x0F, 0x59, 0xE8); // MULSS xmm5, xmm0 → r*(...)
     load_f32_imm_to_xmm(em, 6, 1.0f32);
-    em.emit4(0x0F, 0x58, 0xEE);         // ADDSS xmm5, xmm6 → 1 + r*(...)
+    em.emit3(0x0F, 0x58, 0xEE);         // ADDSS xmm5, xmm6 → 1 + r*(...)
     em.emit4(0xF3, 0x0F, 0x59, 0xE8); // MULSS xmm5, xmm0? No...
     // Let me simplify: just use the degree-4 polynomial directly
     // xmm5 = 1 + r + r^2/2 + r^3/6 + r^4/24 via Horner
@@ -777,13 +777,13 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     load_f32_imm_to_xmm(em, 1, 0.041666667f32); // 1/24
     em.emit4(0xF3, 0x0F, 0x59, 0xC8); // MULSS xmm1, xmm0 → r/24
     load_f32_imm_to_xmm(em, 6, 0.166666667f32); // 1/6
-    em.emit4(0x0F, 0x58, 0xCE);         // ADDSS xmm1, xmm6 → 1/6+r/24
+    em.emit3(0x0F, 0x58, 0xCE);         // ADDSS xmm1, xmm6 → 1/6+r/24
     em.emit4(0xF3, 0x0F, 0x59, 0xC8); // MULSS xmm1, xmm0 → r*(1/6+r/24)
     load_f32_imm_to_xmm(em, 6, 0.5f32);       // 1/2
-    em.emit4(0x0F, 0x58, 0xCE);         // ADDSS xmm1, xmm6 → 1/2+r*(1/6+r/24)
+    em.emit3(0x0F, 0x58, 0xCE);         // ADDSS xmm1, xmm6 → 1/2+r*(1/6+r/24)
     em.emit4(0xF3, 0x0F, 0x59, 0xC8); // MULSS xmm1, xmm0 → r*(1/2+r*(1/6+r/24))
     load_f32_imm_to_xmm(em, 6, 1.0f32);       // 1
-    em.emit4(0x0F, 0x58, 0xCE);         // ADDSS xmm1, xmm6 → 1+r*(1/2+r*(1/6+r/24))
+    em.emit3(0x0F, 0x58, 0xCE);         // ADDSS xmm1, xmm6 → 1+r*(1/2+r*(1/6+r/24))
     em.emit4(0xF3, 0x0F, 0x59, 0xC8); // MULSS xmm1, xmm0? No, we want 1+r+...
     // Wait: Horner gives P = c0 + r*(c1 + r*(c2 + r*(c3 + r*c4)))
     // = 1 + r*(1 + r*(0.5 + r*(0.1667 + r*0.0417)))
@@ -794,7 +794,7 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
     // Reconstruct 2^k
     // k is in xmm2. Add 127, convert to int, shift 23, reinterpret
     load_f32_imm_to_xmm(em, 3, 127.0f32);
-    em.emit4(0x0F, 0x58, 0xD3);         // ADDSS xmm2, xmm3 → k+127
+    em.emit3(0x0F, 0x58, 0xD3);         // ADDSS xmm2, xmm3 → k+127
     em.emit4(0xF3, 0x0F, 0x2C, 0xC2); // CVTTSS2SI eax, xmm2
     em.shl_rax_imm8(23);
     em.vmovd_xmm_r32(3, 0); // MOVD xmm3, eax
@@ -805,7 +805,7 @@ fn emit_simd_exp_sse2(em: &mut Emitter) -> bool {
 
     em.emit4(0x48, 0x83, 0xC7, 4); // ADD RDI, 4
     em.emit4(0x48, 0x83, 0xC6, 4); // ADD RSI, 4
-    em.emit4(0x49, 0xFF, 0xCC); // DEC R12
+    em.emit3(0x49, 0xFF, 0xCC); // DEC R12
     em.emit3(0x4D, 0x85, 0xE4); // TEST R12, R12
     let sback = (scalar_loop as i32) - (em.pos() as i32 + 2);
     if sback >= -128 {
