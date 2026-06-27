@@ -16094,37 +16094,15 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
     let mut chordal_ra = ChordalGraphColoringRA::new(gpr_pool.len(), 16);
     chordal_ra.build_interference_graph(func);
     chordal_ra.compute_mcs_ordering();
-    let chordal_colors = chordal_ra.color(gpr_pool.len());
+    let _chordal_colors = chordal_ra.color(gpr_pool.len());
+    // Note: chordal coloring is computed for potential future use, but the
+    // current interference graph lacks stable ValueId→node mapping and the
+    // allocator doesn't account for reserved registers (rax/rcx/rdx/rdi).
+    // The liveness-aware linear-scan below handles these correctly.
 
-    // Apply chordal graph coloring results: map each abstract color to a
-    // physical register from gpr_pool, and populate value_to_reg for
-    // values that were successfully colored. Values that couldn't be
-    // colored (spills) will be handled by the linear-scan fallback below.
     let mut value_to_reg: FxHashMap<ValueId, u8> = FxHashMap::default();
     let mut value_to_spill: FxHashMap<ValueId, u16> = FxHashMap::default();
     let mut next_spill: u16 = 0;
-
-    // Seed value_to_reg from chordal coloring (optimal for SSA)
-    for (node_idx, color_opt) in chordal_colors.iter().enumerate() {
-        if let Some(color) = color_opt {
-            let vid_u32 = chordal_ra.value_ids.get(node_idx).copied();
-            if let Some(vid) = vid_u32 {
-                // Map abstract color → physical register from the pool
-                if (*color as usize) < gpr_pool.len() {
-                    let phys_reg = gpr_pool[*color as usize];
-                    value_to_reg.insert(ValueId(vid), phys_reg);
-                }
-            }
-        } else {
-            // Spill: record in value_to_spill for linear-scan to pick up
-            let vid_u32 = chordal_ra.value_ids.get(node_idx).copied();
-            if let Some(vid) = vid_u32 {
-                let spill = next_spill;
-                next_spill += 1;
-                value_to_spill.insert(ValueId(vid), spill);
-            }
-        }
-    }
 
     // Track which value currently owns each register, and when it expires
     let mut reg_owner: [Option<ValueId>; 16] = [None; 16];
@@ -16140,12 +16118,6 @@ pub fn translate_ssa(func: &mut FlatIrFunction) -> Option<NativeCode> {
         reg_owner[custom_cc.vm_ctx_reg as usize] = Some(ValueId::MAX);
         reg_owner[custom_cc.stack_reg as usize] = Some(ValueId::MAX);
         reg_owner[custom_cc.heap_base_reg as usize] = Some(ValueId::MAX);
-    }
-
-    // Seed reg_owner from chordal coloring assignments so the linear-scan
-    // knows which registers are already taken by optimally-colored values.
-    for (&vid, &reg) in &value_to_reg {
-        reg_owner[reg as usize] = Some(vid);
     }
 
     // Free registers whose values have expired (last_use < current position)
